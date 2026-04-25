@@ -8,9 +8,9 @@ This DD is the source of truth for everything user-facing: subcommand surface, e
 
 ## 1. Goal and scope
 
-`niri-activities` is the CLI surface for Activities — a workspace-grouping abstraction landed compositor-side in Phases 1–2. Each invocation makes one or more sequential niri IPC calls, then exits. **No daemon, no persistent state, no event-stream subscription** in v1; those would be justified only by a UX bottleneck the per-invocation model can't meet (live activity indicator in a panel, pre-loaded picker state). The built-in multi-select picker for `assign-workspace` (§4.4) is also a one-shot per-invocation process — same execution model as fuzzel, just our own binary providing the UI.
+`niri-activities` is the CLI surface for Activities — a workspace-grouping abstraction landed compositor-side in Phases 1–2. Each invocation makes one or more sequential niri IPC calls, then exits. **No daemon, no persistent state, no event-stream subscription** in v1; those would be justified only by a UX bottleneck the per-invocation model can't meet (live activity indicator in a panel, pre-loaded picker state). Pickers (`fuzzel` for single-select, `rofi` for multi-select per §4.4) are external binaries spawned per invocation — same Unix-philosophy idiom as the rest of the niri ecosystem (anyrun, niri-ror, etc.); no Rust GUI code in this crate.
 
-Out of scope for v1, parked for v2: daemon mode, D-Bus interface, save-to-config-on-exit semantics beyond the explicit `save` subcommand, generalizing the built-in picker to single-select subcommands (switch / move-* stay on fuzzel in v1; the abstraction extends only if fuzzel proves limiting).
+Out of scope for v1, parked for v2: daemon mode, D-Bus interface, save-to-config-on-exit semantics beyond the explicit `save` subcommand, picker fallbacks beyond fuzzel/rofi (yad / zenity / built-in layer-shell parked unless distros lacking rofi 2.0+ become a real constraint).
 
 ## 2. Source-of-truth split
 
@@ -43,7 +43,7 @@ Lifted from compositor DD §8.2; refined here per the error/exit-code spec in §
 - Picker variant when no arg.
 
 ### `niri-activities assign-workspace`
-- Opens a built-in gtk4-layer-shell multi-select popup (search + checkboxes + bulk actions per §4.4) showing every activity, with the focused workspace's current memberships pre-checked. Save commits the diff via `Action::SetWorkspaceActivities`; cancel exits with no changes. Exit 0 either way.
+- Spawns `rofi -dmenu -multi-select` (per §4.4) with the activity list, the focused workspace's current memberships pre-marked. The user toggles rows; bulk actions (`« Select all »` / `« Select none »`) are sentinel rows. Confirm commits the diff via `Action::SetWorkspaceActivities`; cancel exits with no changes. Exit 0 either way.
 
 ### `niri-activities create <name>`
 - IPC: `Action::CreateActivity { name }`. Errors: name collision → `EX_CANTCREAT` (73).
@@ -113,13 +113,13 @@ Subcommand logic takes `&mut dyn NiriClient`. Tests inject `MockClient` (with a 
 
 `MockClient::expect(req, reply)` and `assert_consumed_in_order()` form the test-level contract; the trait surface stays minimal (one method).
 
-### 4.4 Picker contracts (two-tier: fuzzel + built-in multi-select)
+### 4.4 Picker contracts (two-tier: fuzzel for single-select, rofi for multi-select)
 
-**Proposed:** two pickers, chosen per subcommand by the shape of the selection.
+**Proposed:** two external pickers, chosen per subcommand by the shape of the selection. Both spawned per invocation via `std::process::Command`; no Rust GUI code in this crate.
 
 #### Single-select subcommands → fuzzel
 
-`switch`, `move-window`, `move-workspace` spawn `fuzzel --dmenu --prompt <subcommand-prompt>`, write items to stdin (newline-separated), read selected line from stdout. Cancellation (fuzzel exits non-zero with empty stdout) → exit 0 silently. fuzzel is the default niri-ecosystem picker (cf. anyrun, the niri-ror examples); no fallback to rofi/dmenu in v1.
+`switch`, `move-window`, `move-workspace` spawn `fuzzel --dmenu --prompt <subcommand-prompt>`, write items to stdin (newline-separated), read selected line from stdout. Cancellation (fuzzel exits non-zero with empty stdout) → exit 0 silently. fuzzel is the default niri-ecosystem picker (cf. anyrun, niri-ror examples).
 
 | Subcommand (no arg) | Picker prompt | Items |
 |---|---|---|
@@ -127,28 +127,51 @@ Subcommand logic takes `&mut dyn NiriClient`. Tests inject `MockClient` (with a 
 | `move-window` | `Move window to activity:` | activity names |
 | `move-workspace` | `Move workspace to activity:` | activity names |
 
-#### Multi-select with bulk actions → built-in gtk4-layer-shell popup
+#### Multi-select with bulk actions → rofi
 
-`assign-workspace` is the key user-facing flow for activities (per compositor DD §3.2 it edits the workspace's activity-membership set, which is fundamentally a multi-select operation). fuzzel's single-select model can't express it cleanly: looping per-activity prompts is clunky, and reducing it to non-interactive `--add`/`--remove` flags strips the agency of "see all state, decide, commit." Deferring to v2 alongside a generalized picker rejects too much agency on the central activities UX.
+`assign-workspace` is fundamentally a multi-select operation (per compositor DD §3.2 it edits the workspace's activity-membership set). fuzzel **does not and will not** support multi-select — issue [dnkl/fuzzel#244](https://codeberg.org/dnkl/fuzzel/issues/244) is labeled `wontfix`, no PRs, no roadmap. We do not wait on this.
 
-**Resolution: ship a built-in gtk4-layer-shell multi-select popup in v1, scope-limited to `assign-workspace`.** Other subcommands stay on fuzzel; the picker module does not become a generic abstraction in v1.
+**Resolution: spawn `rofi -dmenu -multi-select` for `assign-workspace`.** Mainline rofi 2.0.0 merged the `lbonn/rofi-wayland` fork; rofi is now Wayland-layer-shell-native and packaged in Debian testing/sid. Other Wayland launchers were canvassed (walker, tofi, wofi, anyrun) — none have multi-select. Custom gtk4-layer-shell popup was the previous proposal; rofi supersedes it and removes a module of Rust GTK code.
 
-UI shape:
-- **Search input** at the top filters the activity list as you type (case-insensitive substring; future fuzzy-match if useful).
-- **Checkbox list** — every activity, with the focused workspace's current memberships pre-checked. Click or `Space` toggles a row; arrow keys navigate.
-- **Bulk-action buttons / shortcuts:**
-  - **Select all** (assigns to every activity).
-  - **Select none** (unassigns from every activity — destructive but reversible by re-checking; **no confirmation prompt** per the user's UX call, since the action is reversible inside the same popup before save).
-  - **Only this** — a per-row affordance (button or keyboard shortcut, e.g. `!`) that pivots: keeps that row checked and unchecks every other.
-- **Save** button (or `Enter`) commits the diff via `Action::SetWorkspaceActivities { workspace, activities }`; **Cancel / Escape** exits without changes (exit 0).
+Invocation:
 
-Implementation: `gtk4` + `gtk4-layer-shell` Rust deps; a self-contained module at `src/picker/multi_select.rs`; one-shot lifecycle (process exits when window closes — same per-invocation model as the rest of the CLI). The picker is internal to `assign-workspace` in v1; no public abstraction. If v2 brings other subcommands onto the same picker, that becomes a refactor sub-phase then.
+```sh
+rofi -dmenu -multi-select \
+     -p 'Activities' \
+     -ballot-selected-str '[x] ' \
+     -ballot-unselected-str '[ ] '
+```
 
-#### Why this shape
+Stdin: one activity name per line, plus two sentinel rows at the top (see "Bulk actions" below). Stdout: the selected lines, one per line. Cancellation (Escape, or rofi non-zero exit) → exit 0 silently, no IPC dispatched.
 
-Layer-shell popup over rofi `-multi-select`: gtk4-layer-shell is the dominant UI stack across the niri ecosystem (Waybar, vibepanel, several niri-* panels — per `de/CLAUDE.md`'s cross-cutting patterns), so adding it is following precedent rather than introducing a new toolkit; rofi is heavier as a runtime dep, isn't the niri-ecosystem default, and doesn't support custom action buttons (Select all / Only this) — those would have to be encoded as magic items in the list, which dilutes the UX.
+**Pre-check current memberships.** rofi accepts a `-selected-row` flag for single-select but not a multi-row pre-selection for `-multi-select` (verified against rofi 2.0.0 docs). To pre-mark current memberships we render activity names with the `[x] ` prefix already baked into the input line for activities the workspace is currently in, and `[ ] ` for ones it is not. The user toggles via rofi's normal multi-select keybind (default `Ctrl+Space`); `Enter` confirms; we parse the returned lines and strip the prefix.
 
-Layer-shell popup over a custom TUI: a TUI requires spawning a terminal window from within a Wayland session that may not have a terminal currently in focus; the layer-shell popup integrates with the compositor directly the same way fuzzel does.
+This means the on-screen ballot character (the one rofi adds via `-ballot-selected-str`) and our pre-marker prefix coexist visually — slightly redundant but unambiguous, and the alternative is a runtime patch to rofi we won't ship. Documented as a UX nit; replaceable in v2 if rofi grows multi-row pre-selection.
+
+**Bulk actions.** Two sentinel rows at the top of the input list:
+
+- `« Select all »` — when present in the returned selection, the saved state becomes "every activity"; any other selected rows are ignored.
+- `« Select none »` — when present in the returned selection, the saved state becomes "no activities"; any other selected rows are ignored. Reversible inside the same picker invocation (the user re-runs and re-checks); **no confirmation prompt**.
+
+If both sentinels are returned, `« Select none »` wins (safer default — the user explicitly unchecked everything most recently). If neither is returned, the saved state is the literal selection.
+
+The previous proposal also had an `Only this` per-row affordance; that doesn't translate cleanly to rofi's row model (would require doubling the list with `Only Foo` companion rows). It's dropped from v1 — the same end state is reachable by selecting `« Select none »` in one invocation, then re-running and checking the single target. Bulk-action UX growth tracked as a v2 question if users complain.
+
+**Magic-item naming.** The `« … »` Unicode brackets (U+00AB, U+00BB) are unlikely to collide with niri activity names by convention, but the compositor permits arbitrary strings. Disambiguation: at startup, validate that no real activity name equals one of our sentinel strings; if collision detected, fall back to a less collision-prone name (`__niri_activities_select_all__`) and log a debug note. This is a corner-case guard, not the main path.
+
+#### Why rofi over the alternatives canvassed
+
+| Candidate | Verdict | Why |
+|---|---|---|
+| **fuzzel** | out | dnkl/fuzzel#244 wontfix; no multi-select on roadmap |
+| **rofi 2.0+** | **chosen** | native multi-select + filter + Wayland layer-shell + Debian-packaged + parseable stdout |
+| walker / tofi / wofi / anyrun | out | no multi-select; anyrun#78 unimplemented |
+| zenity `--list --checklist` | out | GTK checkbox list works on Wayland but no live filter / search input |
+| yad `--list --checklist --search-column=N` | viable plan B | GTK3 + Wayland + filter; documented as a v2 fallback if rofi unavailable on a target distro |
+| gum `choose --no-limit` | out | TUI-only; would require spawning a terminal window |
+| custom gtk4-layer-shell popup | out | superseded — rofi covers the requirement with zero new Rust GUI code |
+
+**Runtime dep contract.** rofi is required at runtime for `assign-workspace`, the same way fuzzel is required for the single-select subcommands. Detection: at the top of the `assign-workspace` flow, `which rofi` (or equivalent) → if missing, exit 69 (`EX_UNAVAILABLE`) with a stderr message naming the binary and pointing at the README's install section. README documents both `fuzzel` and `rofi` as runtime deps.
 
 ### 4.5 `list` output format
 
@@ -215,7 +238,7 @@ Each box is a human-gated decision. The architect refuses to plan Phase 3.1+ unt
 - [ ] Error model & exit codes — see §4.1. **Proposed:** anyhow + sysexits.h mapping per the table.
 - [ ] IPC strategy — see §4.2. **Proposed:** fork's `niri-ipc` via git+rev (pin TBD in 3.1).
 - [ ] IPC client trait — see §4.3. **Proposed:** `NiriClient` trait, `SocketClient` + `MockClient` impls.
-- [ ] Picker contracts — see §4.4. **Proposed:** two-tier — fuzzel `--dmenu` for single-select (`switch` / `move-*`); built-in gtk4-layer-shell multi-select popup for `assign-workspace` (search + checkboxes + bulk actions: Select all / Select none / Only this; one-shot lifecycle, scope-limited to this subcommand in v1).
+- [ ] Picker contracts — see §4.4. **Proposed:** two-tier external pickers — fuzzel `--dmenu` for single-select (`switch` / `move-*`); `rofi -dmenu -multi-select` for `assign-workspace` with `« Select all »` / `« Select none »` sentinel rows for bulk actions. Both runtime deps documented in the README; no Rust GUI code in v1. (Supersedes the prior gtk4-layer-shell built-in proposal; rationale: fuzzel multi-select is `wontfix` per dnkl/fuzzel#244, but rofi 2.0+ ships native multi-select on Wayland-layer-shell and is Debian-packaged.)
 - [ ] `list` output format — see §4.5. **Proposed:** default plain / `--json` / `--format=<spec>`.
 - [ ] Test strategy — see §4.6. **Proposed:** unit + MockClient/assert_cmd integration + ignored e2e smoke.
 
@@ -258,18 +281,18 @@ Each box is a human-gated decision. The architect refuses to plan Phase 3.1+ unt
 - [ ] Integration test: shim binary on `PATH` overrides `fuzzel` for the test process; reads stdin, writes a fixed line to stdout, exits 0. Tests the full pipe-and-read flow.
 - [ ] `which fuzzel` failure → `EX_UNAVAILABLE` with a stderr message naming the binary.
 
-### Phase 3.5b — Built-in multi-select picker (gtk4-layer-shell)
+### Phase 3.5b — `assign-workspace` multi-select picker (rofi)
 
-Lands the `assign-workspace` UI per §4.4. Distinct sub-phase because it adds GUI deps (`gtk4`, `gtk4-layer-shell`), establishes a new module shape (`src/picker/multi_select.rs`), and is the only subcommand using this picker — keeping it bundled with the fuzzel landing or with the §3.6 action wrappers would conflate two unrelated review surfaces.
+Lands the `assign-workspace` UI per §4.4. Distinct from Phase 3.5 (fuzzel) because the picker tool, semantics (multi-select), and selection-parsing logic differ; bundling would conflate two review surfaces. Smaller than the prior gtk4-layer-shell variant of this phase — no Rust GUI code.
 
-- [ ] Add deps: `gtk4` and `gtk4-layer-shell` Rust bindings; pin versions; record in commit message. Document the runtime system deps (gtk4 + gtk4-layer-shell C libraries) in the README.
-- [ ] `src/picker/multi_select.rs` — layer-shell window scaffolding: prompt label, search entry, scrollable checkbox list, bulk-action row (`Select all` / `Select none` / `Only this`), Save / Cancel.
-- [ ] Search filter: case-insensitive substring against activity names; updates the list live as the user types.
-- [ ] Keyboard shortcuts: `Space` toggles the focused row; `Enter` saves; `Esc` cancels; arrow keys navigate; the `Only this` per-row affordance has a keyboard binding too (e.g. `!` while focused on a row).
-- [ ] Save dispatches `Action::SetWorkspaceActivities { workspace, activities }` via `NiriClient`; cancel/Escape exits with code 0 and no IPC call.
-- [ ] Wire to `assign-workspace` subcommand: query current memberships of the focused workspace, present the picker pre-checked, dispatch the diff on save.
-- [ ] Tests: the diff-computation helper (initial-membership-set vs. saved-membership-set → IPC payload) is pure and unit-tested. The GUI itself is not unit-testable; the integration layer is exercised manually in the §4.6 e2e smoke test layer.
-- [ ] Stretch: handle live activity changes during the picker's lifetime (an external `niri-activities create` while the popup is open). v1 takes a snapshot at popup-open; if the snapshot is stale at save, the IPC error surfaces normally per §4.1. Document this; defer reactive refresh to v2.
+- [ ] `src/picker/multi_select.rs` — `which rofi` detection (→ `EX_UNAVAILABLE` if missing), spawn `rofi -dmenu -multi-select -p Activities -ballot-selected-str '[x] ' -ballot-unselected-str '[ ] '`, write activity list (with `« Select all »` / `« Select none »` sentinel rows + `[x] `/`[ ] ` pre-marker prefixes) to stdin, read newline-separated selection from stdout.
+- [ ] Selection parsing: strip the `[x] `/`[ ] ` prefix; recognize sentinel rows; collision-guard sentinel names against real activity names (rename to `__niri_activities_*__` if collision, log debug).
+- [ ] Sentinel precedence: `« Select none »` > `« Select all »` > literal selection (documented in §4.4).
+- [ ] Wire to `assign-workspace` subcommand: query current memberships, build pre-marked input, present picker, compute the diff (initial set vs. saved set), dispatch `Action::SetWorkspaceActivities { workspace, activities }` only if diff is non-empty (no IPC if user pressed Enter without changes).
+- [ ] Cancellation (rofi non-zero exit, empty stdout) → exit 0 silently, no IPC.
+- [ ] Tests: integration test via shim binary on `PATH` overriding `rofi` for the test process (same pattern as Phase 3.5's fuzzel shim) — reads stdin, writes a fixed selection, exits 0. Unit tests for the diff helper, sentinel-precedence logic, and pre-marker prefix parsing (pure functions, no fixtures).
+- [ ] README updated: rofi listed as a runtime dep alongside fuzzel; install hint for Debian (`apt install rofi`).
+- [ ] Stretch: handle stale snapshot — an external `niri-activities create` while the picker is open. v1 takes a snapshot at picker-open; if stale at save, the IPC error surfaces normally per §4.1. Document; defer reactive refresh to v2 (Appendix B).
 
 ### Phase 3.6 — Action subcommands
 
@@ -297,8 +320,11 @@ Populated as files land. Initial state: `src/main.rs` is the stub from the boots
 
 ## Appendix B: Open questions parked for v2
 
-- **Generalize the multi-select picker to single-select subcommands.** The gtk4-layer-shell picker landing in Phase 3.5b is scope-limited to `assign-workspace` in v1. If fuzzel proves limiting for `switch` / `move-window` / `move-workspace` (e.g., users want previews, richer rendering, or activity icons), the same picker module can be extended to single-select mode and replace fuzzel for those subcommands. v2 work, behind real UX evidence — not speculative.
-- **Reactive refresh of the multi-select picker** on external activity changes. v1 takes a snapshot at popup-open; an external `niri-activities create` while the popup is open does not refresh the list. Save-against-stale-snapshot surfaces the IPC error normally per §4.1. v2 could subscribe to the activities event stream while the popup is open and live-update the checkbox list.
+- **Picker fallbacks if rofi unavailable on a target distro.** Strongest fallback identified: `yad --list --checklist --search-column=N` (GTK3 + Wayland-native + filter input + Debian-packaged). Park unless distros lacking rofi 2.0+ become a real constraint; Debian testing/sid currently ships it.
+- **Multi-row pre-selection in rofi.** Current workaround is the `[x] `/`[ ] ` prefix baked into input lines (§4.4). If rofi grows multi-row pre-selection (open-ended; not on the rofi roadmap as of writing), drop the prefix workaround and rely on rofi's ballot character alone.
+- **`Only this` per-row affordance.** Dropped from v1 because it doesn't translate cleanly to rofi's row model. v2 candidates: a sentinel row per activity (`Only Foo`, doubling list size — clunky) or migration to a richer picker. Behind real user complaints, not speculative.
+- **Reactive refresh of the multi-select picker** on external activity changes during a picker invocation. v1 takes a snapshot at picker-open; stale-at-save surfaces as a normal IPC error per §4.1. v2 could subscribe to the activities event stream and live-update; requires either daemon mode or a sidecar process feeding rofi via its dynamic-update protocol.
+- **Generalized multi-select replacement for fuzzel** on `switch` / `move-window` / `move-workspace`. The current two-tier split (fuzzel vs. rofi) is by selection cardinality. If users find fuzzel limiting on the single-select subcommands (previews, richer rendering, activity icons), `rofi -dmenu` (single-select mode) is a drop-in replacement. v2 question, behind real UX evidence.
 - **Daemon mode** (event-stream-driven; required for live activity indicator in panels). Not justified for v1 — per-invocation IPC overhead is sub-millisecond.
 - **D-Bus interface** (panel integration via D-Bus instead of CLI calls). Premature; no panel currently consumes it.
 - **Save-to-config-on-exit** semantics beyond the explicit `save` subcommand (e.g., auto-save runtime activities at shutdown). Out of scope; the compositor already discards runtime activities at restart per design.
