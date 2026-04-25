@@ -8,9 +8,9 @@ This DD is the source of truth for everything user-facing: subcommand surface, e
 
 ## 1. Goal and scope
 
-`niri-activities` is the CLI surface for Activities — a workspace-grouping abstraction landed compositor-side in Phases 1–2. Each invocation makes one or more sequential niri IPC calls, then exits. **No daemon, no persistent state, no event-stream subscription** in v1; those would be justified only by a UX bottleneck the per-invocation model can't meet (live activity indicator in a panel, built-in layer-shell picker with pre-loaded state).
+`niri-activities` is the CLI surface for Activities — a workspace-grouping abstraction landed compositor-side in Phases 1–2. Each invocation makes one or more sequential niri IPC calls, then exits. **No daemon, no persistent state, no event-stream subscription** in v1; those would be justified only by a UX bottleneck the per-invocation model can't meet (live activity indicator in a panel, pre-loaded picker state). The built-in multi-select picker for `assign-workspace` (§4.4) is also a one-shot per-invocation process — same execution model as fuzzel, just our own binary providing the UI.
 
-Out of scope for v1, parked for v2: built-in gtk4-layer-shell picker (Option A from compositor DD §8.3), daemon mode, D-Bus interface, save-to-config-on-exit semantics beyond the explicit `save` subcommand.
+Out of scope for v1, parked for v2: daemon mode, D-Bus interface, save-to-config-on-exit semantics beyond the explicit `save` subcommand, generalizing the built-in picker to single-select subcommands (switch / move-* stay on fuzzel in v1; the abstraction extends only if fuzzel proves limiting).
 
 ## 2. Source-of-truth split
 
@@ -43,7 +43,7 @@ Lifted from compositor DD §8.2; refined here per the error/exit-code spec in §
 - Picker variant when no arg.
 
 ### `niri-activities assign-workspace`
-- Edits the activity-membership set of the focused workspace. UX is the open question parked in Phase 3.0 — see §4.4.
+- Opens a built-in gtk4-layer-shell multi-select popup (search + checkboxes + bulk actions per §4.4) showing every activity, with the focused workspace's current memberships pre-checked. Save commits the diff via `Action::SetWorkspaceActivities`; cancel exits with no changes. Exit 0 either way.
 
 ### `niri-activities create <name>`
 - IPC: `Action::CreateActivity { name }`. Errors: name collision → `EX_CANTCREAT` (73).
@@ -113,9 +113,13 @@ Subcommand logic takes `&mut dyn NiriClient`. Tests inject `MockClient` (with a 
 
 `MockClient::expect(req, reply)` and `assert_consumed_in_order()` form the test-level contract; the trait surface stays minimal (one method).
 
-### 4.4 Fuzzel picker contract
+### 4.4 Picker contracts (two-tier: fuzzel + built-in multi-select)
 
-**Proposed:** spawn `fuzzel --dmenu --prompt <subcommand-prompt>`, write items to stdin (newline-separated), read selected line from stdout. Cancellation (fuzzel exits non-zero with empty stdout) → exit 0 silently. No fallback to rofi/dmenu in v1; fuzzel is the default niri-ecosystem picker (cf. anyrun, the niri-ror examples), and adding a backend abstraction is premature.
+**Proposed:** two pickers, chosen per subcommand by the shape of the selection.
+
+#### Single-select subcommands → fuzzel
+
+`switch`, `move-window`, `move-workspace` spawn `fuzzel --dmenu --prompt <subcommand-prompt>`, write items to stdin (newline-separated), read selected line from stdout. Cancellation (fuzzel exits non-zero with empty stdout) → exit 0 silently. fuzzel is the default niri-ecosystem picker (cf. anyrun, the niri-ror examples); no fallback to rofi/dmenu in v1.
 
 | Subcommand (no arg) | Picker prompt | Items |
 |---|---|---|
@@ -123,13 +127,28 @@ Subcommand logic takes `&mut dyn NiriClient`. Tests inject `MockClient` (with a 
 | `move-window` | `Move window to activity:` | activity names |
 | `move-workspace` | `Move workspace to activity:` | activity names |
 
-**Open question for Phase 3.0** (`assign-workspace` UX): per compositor DD §3.2, `assign-workspace` is a *checkbox* UI — the user picks the subset of activities that own a workspace. fuzzel `--dmenu` is single-select. Three candidate paths:
+#### Multi-select with bulk actions → built-in gtk4-layer-shell popup
 
-- **(A) Loop one fuzzel prompt per activity** ("Add to Work? yes / no", repeat for each). Clunky; ships in v1.
-- **(B) Non-interactive flags only** — `niri-activities assign-workspace --add Work --remove Personal`. Clean for scripting; no interactive UX.
-- **(C) Defer `assign-workspace` to v2** alongside the built-in gtk4-layer-shell picker (Option A in compositor DD §8.3).
+`assign-workspace` is the key user-facing flow for activities (per compositor DD §3.2 it edits the workspace's activity-membership set, which is fundamentally a multi-select operation). fuzzel's single-select model can't express it cleanly: looping per-activity prompts is clunky, and reducing it to non-interactive `--add`/`--remove` flags strips the agency of "see all state, decide, commit." Deferring to v2 alongside a generalized picker rejects too much agency on the central activities UX.
 
-This is a UX decision where the user's preference matters. Phase 3.0 has an explicit ratification box for it.
+**Resolution: ship a built-in gtk4-layer-shell multi-select popup in v1, scope-limited to `assign-workspace`.** Other subcommands stay on fuzzel; the picker module does not become a generic abstraction in v1.
+
+UI shape:
+- **Search input** at the top filters the activity list as you type (case-insensitive substring; future fuzzy-match if useful).
+- **Checkbox list** — every activity, with the focused workspace's current memberships pre-checked. Click or `Space` toggles a row; arrow keys navigate.
+- **Bulk-action buttons / shortcuts:**
+  - **Select all** (assigns to every activity).
+  - **Select none** (unassigns from every activity — destructive but reversible by re-checking; **no confirmation prompt** per the user's UX call, since the action is reversible inside the same popup before save).
+  - **Only this** — a per-row affordance (button or keyboard shortcut, e.g. `!`) that pivots: keeps that row checked and unchecks every other.
+- **Save** button (or `Enter`) commits the diff via `Action::SetWorkspaceActivities { workspace, activities }`; **Cancel / Escape** exits without changes (exit 0).
+
+Implementation: `gtk4` + `gtk4-layer-shell` Rust deps; a self-contained module at `src/picker/multi_select.rs`; one-shot lifecycle (process exits when window closes — same per-invocation model as the rest of the CLI). The picker is internal to `assign-workspace` in v1; no public abstraction. If v2 brings other subcommands onto the same picker, that becomes a refactor sub-phase then.
+
+#### Why this shape
+
+Layer-shell popup over rofi `-multi-select`: gtk4-layer-shell is the dominant UI stack across the niri ecosystem (Waybar, vibepanel, several niri-* panels — per `de/CLAUDE.md`'s cross-cutting patterns), so adding it is following precedent rather than introducing a new toolkit; rofi is heavier as a runtime dep, isn't the niri-ecosystem default, and doesn't support custom action buttons (Select all / Only this) — those would have to be encoded as magic items in the list, which dilutes the UX.
+
+Layer-shell popup over a custom TUI: a TUI requires spawning a terminal window from within a Wayland session that may not have a terminal currently in focus; the layer-shell popup integrates with the compositor directly the same way fuzzel does.
 
 ### 4.5 `list` output format
 
@@ -196,8 +215,7 @@ Each box is a human-gated decision. The architect refuses to plan Phase 3.1+ unt
 - [ ] Error model & exit codes — see §4.1. **Proposed:** anyhow + sysexits.h mapping per the table.
 - [ ] IPC strategy — see §4.2. **Proposed:** fork's `niri-ipc` via git+rev (pin TBD in 3.1).
 - [ ] IPC client trait — see §4.3. **Proposed:** `NiriClient` trait, `SocketClient` + `MockClient` impls.
-- [ ] Fuzzel picker contract — see §4.4. **Proposed:** `--dmenu` single-select, no rofi fallback in v1.
-- [ ] **Open:** `assign-workspace` UX — see §4.4 sub-question. Pick (A) loop, (B) flags-only, or (C) defer to v2.
+- [ ] Picker contracts — see §4.4. **Proposed:** two-tier — fuzzel `--dmenu` for single-select (`switch` / `move-*`); built-in gtk4-layer-shell multi-select popup for `assign-workspace` (search + checkboxes + bulk actions: Select all / Select none / Only this; one-shot lifecycle, scope-limited to this subcommand in v1).
 - [ ] `list` output format — see §4.5. **Proposed:** default plain / `--json` / `--format=<spec>`.
 - [ ] Test strategy — see §4.6. **Proposed:** unit + MockClient/assert_cmd integration + ignored e2e smoke.
 
@@ -232,7 +250,7 @@ Each box is a human-gated decision. The architect refuses to plan Phase 3.1+ unt
 - [ ] Already-active name → no-op silently, exit 0 (verify against compositor DD §5.3 — switching to the active activity is a documented no-op).
 - [ ] Integration tests: golden, unknown name, already-active.
 
-### Phase 3.5 — fuzzel picker
+### Phase 3.5 — fuzzel picker (single-select)
 
 - [ ] Spawn fuzzel via `std::process::Command`, pipe items to stdin (one activity per line), read stdout selection.
 - [ ] Cancellation (non-zero exit + empty stdout) → exit 0 silently.
@@ -240,16 +258,28 @@ Each box is a human-gated decision. The architect refuses to plan Phase 3.1+ unt
 - [ ] Integration test: shim binary on `PATH` overrides `fuzzel` for the test process; reads stdin, writes a fixed line to stdout, exits 0. Tests the full pipe-and-read flow.
 - [ ] `which fuzzel` failure → `EX_UNAVAILABLE` with a stderr message naming the binary.
 
+### Phase 3.5b — Built-in multi-select picker (gtk4-layer-shell)
+
+Lands the `assign-workspace` UI per §4.4. Distinct sub-phase because it adds GUI deps (`gtk4`, `gtk4-layer-shell`), establishes a new module shape (`src/picker/multi_select.rs`), and is the only subcommand using this picker — keeping it bundled with the fuzzel landing or with the §3.6 action wrappers would conflate two unrelated review surfaces.
+
+- [ ] Add deps: `gtk4` and `gtk4-layer-shell` Rust bindings; pin versions; record in commit message. Document the runtime system deps (gtk4 + gtk4-layer-shell C libraries) in the README.
+- [ ] `src/picker/multi_select.rs` — layer-shell window scaffolding: prompt label, search entry, scrollable checkbox list, bulk-action row (`Select all` / `Select none` / `Only this`), Save / Cancel.
+- [ ] Search filter: case-insensitive substring against activity names; updates the list live as the user types.
+- [ ] Keyboard shortcuts: `Space` toggles the focused row; `Enter` saves; `Esc` cancels; arrow keys navigate; the `Only this` per-row affordance has a keyboard binding too (e.g. `!` while focused on a row).
+- [ ] Save dispatches `Action::SetWorkspaceActivities { workspace, activities }` via `NiriClient`; cancel/Escape exits with code 0 and no IPC call.
+- [ ] Wire to `assign-workspace` subcommand: query current memberships of the focused workspace, present the picker pre-checked, dispatch the diff on save.
+- [ ] Tests: the diff-computation helper (initial-membership-set vs. saved-membership-set → IPC payload) is pure and unit-tested. The GUI itself is not unit-testable; the integration layer is exercised manually in the §4.6 e2e smoke test layer.
+- [ ] Stretch: handle live activity changes during the picker's lifetime (an external `niri-activities create` while the popup is open). v1 takes a snapshot at popup-open; if the snapshot is stale at save, the IPC error surfaces normally per §4.1. Document this; defer reactive refresh to v2.
+
 ### Phase 3.6 — Action subcommands
 
-Group landings — most of these are 1–2 line wrappers around a single `Action` variant, plus a small bit of arg parsing. Group by shared scaffolding (the picker dance, the `<name>`-or-picker pattern).
+Group landings — most of these are 1–2 line wrappers around a single `Action` variant, plus a small bit of arg parsing. Group by shared scaffolding (the picker dance, the `<name>`-or-picker pattern). `assign-workspace` is **not** in this list — it landed in Phase 3.5b alongside its bespoke picker.
 
 - [ ] `switch-previous` / `toggle` (alias) — wraps `Action::SwitchActivityPrevious`.
 - [ ] `move-window <activity>` and `move-window` (picker variant) — wraps `Action::MoveWindowToActivity`.
 - [ ] `move-workspace <activity>` and `move-workspace` (picker variant) — wraps `Action::MoveWorkspaceToActivity`.
 - [ ] `create <name>` — wraps `Action::CreateActivity`. Name collision → exit 73 (EX_CANTCREAT).
 - [ ] `remove <name>` — wraps `Action::RemoveActivity`. Unknown name → exit 66; removing a config-declared activity surfaces the compositor's error verbatim.
-- [ ] `assign-workspace` — implements the path chosen in 3.0.
 - [ ] `save <name>` — non-IPC: edits user's `config.kdl` (appending `activity "name"`), then `Action::ReloadConfig`. Decide config-edit strategy: structured (`kdl` crate) vs. string-append heuristic. The structured path is safer (handles arbitrary existing config); the heuristic ships fast. Pick during this sub-phase based on `kdl` crate maturity.
 
 ### Phase 3.7 — Polish & v0.1.0
@@ -267,7 +297,8 @@ Populated as files land. Initial state: `src/main.rs` is the stub from the boots
 
 ## Appendix B: Open questions parked for v2
 
-- **Built-in gtk4-layer-shell picker** (Option A from compositor DD §8.3). Code-heavy; deferred until UX limits of fuzzel surface in real use.
+- **Generalize the multi-select picker to single-select subcommands.** The gtk4-layer-shell picker landing in Phase 3.5b is scope-limited to `assign-workspace` in v1. If fuzzel proves limiting for `switch` / `move-window` / `move-workspace` (e.g., users want previews, richer rendering, or activity icons), the same picker module can be extended to single-select mode and replace fuzzel for those subcommands. v2 work, behind real UX evidence — not speculative.
+- **Reactive refresh of the multi-select picker** on external activity changes. v1 takes a snapshot at popup-open; an external `niri-activities create` while the popup is open does not refresh the list. Save-against-stale-snapshot surfaces the IPC error normally per §4.1. v2 could subscribe to the activities event stream while the popup is open and live-update the checkbox list.
 - **Daemon mode** (event-stream-driven; required for live activity indicator in panels). Not justified for v1 — per-invocation IPC overhead is sub-millisecond.
 - **D-Bus interface** (panel integration via D-Bus instead of CLI calls). Premature; no panel currently consumes it.
 - **Save-to-config-on-exit** semantics beyond the explicit `save` subcommand (e.g., auto-save runtime activities at shutdown). Out of scope; the compositor already discards runtime activities at restart per design.
