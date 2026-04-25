@@ -262,12 +262,12 @@ Recognized fields: `name`, `kind`, `focused`, `workspace_count`, `window_count`.
 
 Each box is a human-gated decision. The architect refuses to plan Phase 3.1+ until every box is `[x]` or amended. **Proposed:** entries are agent recommendations; the human ratifies or amends in-place before the loop drives implementation.
 
-- [ ] Error model & exit codes — see §4.1. **Proposed:** anyhow + sysexits.h mapping per the table.
-- [ ] IPC strategy — see §4.2. **Proposed:** fork's `niri-ipc` via git+rev (pin TBD in 3.1).
-- [ ] IPC client trait — see §4.3. **Proposed:** `NiriClient` trait, `SocketClient` + `MockClient` impls.
-- [ ] Picker contracts — see §4.4. **Proposed:** two-tier external pickers — fuzzel `--dmenu` for single-select (`switch` / `move-*`); `rofi -dmenu -multi-select` for `assign-workspace` with `« Select all »` / `« Select none »` / `« Only one… »` sentinel rows for bulk actions; `« Only one… »` chains a follow-up single-select rofi for the "unassign from all except this one" path. Save semantics are full-replacement (returned rows = saved set), not diff. Rofi prompt names the multi-select keybind (`Ctrl+Space`) for discoverability. Both runtime deps documented in the README; no Rust GUI code in v1. **PoC-quality** — see §1 caveat and §4.4 PoC note; v2 picker overhaul (track rofi PR #1809 for proper pre-check, evaluate alternative launchers) parked in Appendix B.
-- [ ] `list` output format — see §4.5. **Proposed:** default plain / `--json` / `--format=<spec>`.
-- [ ] Test strategy — see §4.6. **Proposed:** unit + MockClient/assert_cmd integration + ignored e2e smoke.
+- [x] Error model & exit codes — see §4.1. **Proposed:** anyhow + sysexits.h mapping per the table.
+- [x] IPC strategy — see §4.2. **Proposed:** fork's `niri-ipc` via git+rev (pin TBD in 3.1).
+- [x] IPC client trait — see §4.3. **Proposed:** `NiriClient` trait, `SocketClient` + `MockClient` impls.
+- [x] Picker contracts — see §4.4. **Proposed:** two-tier external pickers — fuzzel `--dmenu` for single-select (`switch` / `move-*`); `rofi -dmenu -multi-select` for `assign-workspace` with `« Select all »` / `« Select none »` / `« Only one… »` sentinel rows for bulk actions; `« Only one… »` chains a follow-up single-select rofi for the "unassign from all except this one" path. Save semantics are full-replacement (returned rows = saved set), not diff. Rofi prompt names the multi-select keybind (`Ctrl+Space`) for discoverability. Both runtime deps documented in the README; no Rust GUI code in v1. **PoC-quality** — see §1 caveat and §4.4 PoC note; v2 picker overhaul (track rofi PR #1809 for proper pre-check, evaluate alternative launchers) parked in Appendix B.
+- [x] `list` output format — see §4.5. **Proposed:** default plain / `--json` / `--format=<spec>`.
+- [x] Test strategy — see §4.6. **Proposed:** unit + MockClient/assert_cmd integration + ignored e2e smoke.
 
 ### Phase 3.1 — Skeleton & error machinery
 
