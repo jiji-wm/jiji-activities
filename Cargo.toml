@@ -1,0 +1,14 @@
+[package]
+name = "niri-activities"
+version = "0.1.0"
+description = "KDE-style Activities for the niri wayland compositor (CLI)"
+authors = ["Petr Gajdůšek"]
+license = "GPL-3.0-or-later"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "niri-activities"
+path = "src/main.rs"
+
+[dependencies]
