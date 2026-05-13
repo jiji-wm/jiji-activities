@@ -40,6 +40,7 @@ Lifted from compositor DD §8.2; refined here per the error/exit-code spec in §
 ### `niri-activities move-window [<name>]`
 - IPC: `Action::MoveWindowToActivity { name }`. Operates on focused window.
 - Picker variant when no arg.
+- **Fork-side variant TBD; Phase 3.6 prerequisite — see Appendix C.** `Action::MoveWindowToActivity` is not present at the niri-ipc rev pinned in Phase 3.1 (`54aee6582cbfc11b4e69fa8a602cf2653e29df4a`); either the compositor loop lands it before Phase 3.6, or Phase 3.6 absorbs the rev-bump.
 
 ### `niri-activities move-workspace [<name>]`
 - IPC: `Action::MoveWorkspaceToActivity { name }`. Operates on focused workspace.
@@ -93,6 +94,8 @@ Each subsection has a **Proposed:** lead sentence stating the agent recommendati
 [dependencies]
 niri-ipc = { git = "https://github.com/gajdusek/niri", rev = "<pin>" }
 ```
+
+**niri-ipc dep stopgap (Phase 3.1):** the dep is currently `path = "../../niri/niri/gajdusek/niri-ipc"` (tracked rev: `54aee6582cbfc11b4e69fa8a602cf2653e29df4a`). The `feature/activities` branch is local-only and does not resolve via a git+rev URL. Switch to `git = "https://github.com/gajdusek/niri", rev = "<sha>"` once the branch is pushed. Pin rev rather than branch so IPC bumps are deliberate and reviewable.
 
 **Why not shell out to `niri msg`?** Two reasons that compound:
 - `niri msg` is the fork binary's own CLI, which forwards to the same IPC types we'd link. Going through a process boundary means parsing stringified JSON (brittle), and re-discovering structured errors that the typed Request/Response already gives us. We pay the brittleness cost without the abstraction win.
@@ -248,7 +251,7 @@ Recognized fields: `name`, `kind`, `focused`, `workspace_count`, `window_count`.
 
 **Pure-function unit tests** in each module — parsing, formatting, error mapping. Fastest feedback, no fixtures. Live `#[cfg(test)] mod tests` in the same source file as the function under test.
 
-**Subcommand integration tests via `MockClient`** (per §4.3) plus `assert_cmd` for the binary boundary. Each subcommand has at minimum a golden-path test, an error-path test, and (where applicable) a picker-cancellation test. `MockClient` is wired into the binary via a test-only factory: a `#[cfg(test)]` `pub fn make_client()` that the test overrides via a thread-local, or via an env var the binary checks first. Decided concretely in Phase 3.2.
+**Subcommand integration tests via `MockClient`** (per §4.3) plus `assert_cmd` for the binary boundary. (`assert_cmd` introduced in Phase 3.1 as a dev-dep alongside the binary skeleton.) Each subcommand has at minimum a golden-path test, an error-path test, and (where applicable) a picker-cancellation test. `MockClient` is wired into the binary via a test-only factory: a `#[cfg(test)]` `pub fn make_client()` that the test overrides via a thread-local, or via an env var the binary checks first. Decided concretely in Phase 3.2.
 
 **End-to-end smoke test against a real niri**, gated `#[ignore]`. Manual run (`cargo test -- --ignored`); not part of `cargo test` default. Asserts side effects (post-action workspace state via `niri msg`) rather than process exit codes.
 
@@ -271,11 +274,13 @@ Each box is a human-gated decision. The architect refuses to plan Phase 3.1+ unt
 
 ### Phase 3.1 — Skeleton & error machinery
 
-- [ ] Add Cargo deps ratified in 3.0: `clap` (derive), `niri-ipc` (git+rev — pin to fork HEAD at the time the box is landed and record the rev in the commit message), `serde`, `serde_json`, `anyhow`. **Lock the rev to the actual fork HEAD; do not invent a rev.**
-- [ ] `clap`-based subcommand dispatch matching §3. Each subcommand stub prints `not implemented` to stderr and exits 70 (EX_SOFTWARE). Top-level binary still produces useful `--help`.
-- [ ] `CliError` enum (typed: `SocketUnavailable`, `ActivityNotFound`, `MalformedResponse`, `CantCreate`, `Usage`) with rustdoc on each variant naming the trigger condition. `main()` dispatcher maps via `downcast_ref` to exit codes per §4.1.
-- [ ] `--version` prints `env!("CARGO_PKG_VERSION")`.
-- [ ] Unit tests for the error → exit code mapping (one test per code). Pin clippy baseline (likely zero).
+- [x] Add Cargo deps ratified in 3.0: `clap` (derive), `niri-ipc` (git+rev — pin to fork HEAD at the time the box is landed and record the rev in the commit message), `serde`, `serde_json`, `anyhow`. **Lock the rev to the actual fork HEAD; do not invent a rev.** Landed as `413b49d` (`cargo: add clap, niri-ipc, serde, anyhow deps`).
+- [x] `clap`-based subcommand dispatch matching §3. Each subcommand stub prints `not implemented` to stderr and exits 70 (EX_SOFTWARE). Top-level binary still produces useful `--help`. Landed as `e7d6743` (`cli: skeleton subcommand dispatch + typed error enum`).
+- [x] `CliError` enum (typed: `SocketUnavailable`, `ActivityNotFound`, `MalformedResponse`, `CantCreate`, `Usage`) with rustdoc on each variant naming the trigger condition. `main()` dispatcher maps via `downcast_ref` to exit codes per §4.1. Landed as `e7d6743`.
+- [x] `--version` prints `env!("CARGO_PKG_VERSION")`. Landed as `e7d6743`.
+- [x] Unit tests for the error → exit code mapping (one test per code). Pinned at 0 warnings as of `e7d6743`.
+
+**Reviewed:** 2026-05-14 (`413b49d`, `e7d6743`). Phase 3.1 — `413b49d` adds the dependency surface (clap, niri-ipc via path stopgap, serde, serde_json, anyhow, assert_cmd + predicates as dev-deps); `e7d6743` lands the skeleton: nine-subcommand clap dispatch, six-variant `CliError` typed enum with `map_exit`, manual clap-error routing for help/version, and four `assert_cmd` integration smoke tests. Reviewed across four review aspects (general code quality, silent-failure surface, comment accuracy, test coverage) via two `/pr-review-toolkit:review-pr` passes (initial + targeted re-review of fixer's amendments); re-review was clean. **Finding worth surfacing (niri-ipc path stopgap):** `413b49d` uses `path = "../../niri/niri/gajdusek/niri-ipc"` rather than the spec's `git+rev` because `feature/activities` is local-only and a git URL would not resolve. The tracked rev (`54aee6582cbfc11b4e69fa8a602cf2653e29df4a`) is recorded in the commit body; the migration trigger is "once the branch is pushed." See §4.2 stopgap note. **Finding worth surfacing (`NotImplemented` as the sixth variant):** the DD's §4.1 table has five exit codes for the non-stub path; `e7d6743` adds `NotImplemented` (exit 70, `EX_SOFTWARE`) as the sixth variant powering the stub arms. This variant is expected to disappear as sub-phases land real implementations; tracking it here so Phase 3.6's cleanup reviewer knows to look for lingering stubs. **Finding worth surfacing (fuzzel-cancellation exit 0 contract):** §4.1's "picker cancellation is exit 0" rule has no variant in the Phase 3.1 enum — the non-IPC cancellation path will be represented as `Ok(())` return from the picker fn (no `CliError` involved). Confirmed at review; no follow-up needed for Phase 3.1, but Phase 3.5 must not introduce a `PickerCancelled` variant that would exit non-zero. Post-review fixes squashed into `e7d6743`: three escalations triaged to Appendix C (typed source carriers on `SocketUnavailable`/`MalformedResponse`, struct variants for all five string-shaped variants, `map_exit` chain-walk doc trim); `toggle` alias routing confirmed clean (`toggle_alias_routes_to_switch_previous` test). DD amended in this commit: §3 `move-window` IPC-gap note; §4.2 stopgap paragraph; §4.6 `assert_cmd` introduction parenthetical; Phase 3.1 boxes flipped to `[x]` with landing notes; Box 5 wording updated to "Pinned at 0 warnings as of `e7d6743`"; Appendix A extended with Phase 3.1 files; Appendix C opened with four entries (fork-side `MoveWindowToActivity`, typed source carriers, struct variants, chain-walk doc trim). Same 16 tests green (11 before Phase 3.1, delta +5: `socket_unavailable_survives_context_wrap`, `cli_error_survives_context_wrap_in_alternate_format`, `toggle_alias_routes_to_switch_previous`, `no_args_exits_64`, `list_json_and_format_conflict_exits_64`); `cargo clippy --all --all-targets` 0 warnings — Phase 3.1 commits pin the project clippy baseline at zero. Proceed to Phase 3.2 (IPC adapter) with the reviewed base.
 
 ### Phase 3.2 — IPC adapter
 
@@ -347,6 +352,12 @@ Group landings — most of these are 1–2 line wrappers around a single `Action
 
 Populated as files land. Initial state: `src/main.rs` is the stub from the bootstrap commit (`92e26ef`).
 
+**After Phase 3.1 (`413b49d`, `e7d6743`):**
+- `src/main.rs` — entry point; clap `try_parse()` + manual clap-error routing (help/version → exit 0, parse errors → exit 64) + `map_exit` dispatch; prints full anyhow chain via `{:#}`.
+- `src/cli.rs` — clap-derive `Cli` + `Cmd` enum with all nine subcommands; `dispatch()` routes to per-subcommand stub fns returning `CliError::NotImplemented` (exit 70).
+- `src/error.rs` — `CliError` six-variant typed enum (Usage 64, MalformedResponse 65, ActivityNotFound 66, SocketUnavailable 69, NotImplemented 70, CantCreate 73) with rustdoc trigger conditions; `map_exit()` downcasts `anyhow::Error` via `downcast_ref`; un-typed errors fall through to exit 1.
+- `tests/cli.rs` — `assert_cmd` integration smoke tests pinning the CLI surface: `--version`, `--help`, unknown-subcommand → exit 64, switch stub → exit 70.
+
 ## Appendix B: Open questions parked for v2
 
 ### Picker UX overhaul (whole subsection — track this together)
@@ -368,4 +379,10 @@ The v1 picker integration is PoC-quality (§1 caveat). Once the binary is functi
 
 ## Appendix C: Deferred Suggestions (review-surfaced parked items)
 
-*(no entries yet)*
+- **Fork-side `Action::MoveWindowToActivity`** — required by the `move-window` subcommand; not present at the niri-ipc rev pinned in Phase 3.1 (`54aee6582cbfc11b4e69fa8a602cf2653e29df4a`); either a compositor-loop sub-phase lands it before Phase 3.6, or Phase 3.6 absorbs the rev-bump. From review of `e7d6743` (2026-05-14). IPC variant was out of scope for Phase 3.1 (skeleton-only commit); recorded here so Phase 3.6 planning has a concrete prerequisite to resolve.
+
+- **Typed source carriers on `CliError` variants** — Convert `SocketUnavailable(String)` → `SocketUnavailable(io::Error)` and `MalformedResponse(String)` → `MalformedResponse(serde_json::Error)`. Rationale: encodes the error producer in the type so a future call site cannot accidentally route the wrong error class through the wrong variant. Cost: every call site that constructs these variants in Phase 3.2+ must take the typed source rather than stringify. From review of `e7d6743` (2026-05-14). Fixer escalated rather than folded because the shape change propagates through every future call site — architect decision. Consider as Phase 3.1.1 polish before Phase 3.2 wires the first IPC call, or accept the stringly-typed contract permanently.
+
+- **Struct variants for `CliError`** — Convert `String`-shaped variants (`Usage`, `MalformedResponse`, `ActivityNotFound`, `SocketUnavailable`, `CantCreate`) to struct variants with named fields (e.g., `Usage { message: String }`). Rationale: all five variants are type-interchangeable today, so a copy-paste error producing `CliError::Usage("connect refused: ...")` compiles cleanly and exits 64 instead of 69; named-field syntax makes the wrong choice visible in review. Cost: every construction site updates. From review of `e7d6743` (2026-05-14). Bundle with the typed-source-carriers entry above if both are accepted.
+
+- **`map_exit` chain-walk doc trim** — The `socket_unavailable_survives_context_wrap` test (in `src/error.rs::tests`) and the `map_exit` rustdoc both reference "chain walk" as the pinned contract. anyhow's `downcast_ref` already walks the chain, so the test pins the observable contract (`CliError` survives `.context()` wrapping → correct typed exit code), not the iteration strategy. Trim "chain-walk" wording to "context-wrap survival" the next time these comments are touched. From review of `e7d6743` (2026-05-14). Non-blocking — the contract pinned is correct, only the description of the mechanism is imprecise.
