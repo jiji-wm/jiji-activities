@@ -99,7 +99,7 @@ fn cmd_switch(name: Option<String>) -> Result<()> {
             // hit this via `pick_one`'s internal re-check, but only
             // after the Activities IPC call — which is the wrong order
             // for diagnostics.
-            picker::ensure_available().context("running switch picker")?;
+            picker::ensure_available().context("verifying switch picker availability")?;
             let mut client = ipc::make_client();
             switch::run_picker(client.as_mut(), picker::pick_one).context("running switch picker")
         }
