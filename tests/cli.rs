@@ -82,7 +82,7 @@ fn switch_no_arg_no_socket_exits_69() {
     //    fails on the missing socket → `SocketUnavailable` with the IPC
     //    stderr message.
     // 2. If `fuzzel` is NOT installed, `which fuzzel` short-circuits to
-    //    `SocketUnavailable` with the missing-fuzzel stderr message.
+    //    `PickerUnavailable` with the missing-fuzzel stderr message.
     //
     // Both routes share exit code 69. We deliberately do not assert the
     // stderr text — the assertion target is the wire-up (no-arg branch

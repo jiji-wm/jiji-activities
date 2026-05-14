@@ -13,6 +13,7 @@
 //! | `MalformedResponse`  |   65 | compositor returned an unexpected shape  |
 //! | `ActivityNotFound`   |   66 | named activity does not exist            |
 //! | `SocketUnavailable`  |   69 | `$NIRI_SOCKET` unreachable / IPC failed  |
+//! | `PickerUnavailable`  |   69 | external picker missing / spawn failed   |
 //! | `NotImplemented`     |   70 | subcommand stub not yet wired            |
 //! | `CantCreate`         |   73 | `create`/`save` could not produce target |
 //! | `OutputPipeClosed`   |    0 | stdout write hit EPIPE (e.g. `| head`); suppressed to exit 0 |
@@ -102,6 +103,15 @@ pub(crate) enum CliError {
     /// remains reachable via [`std::error::Error::source`].
     SocketUnavailable(std::io::Error),
 
+    /// A `$PATH` lookup or spawn of an external picker (e.g. `fuzzel`)
+    /// failed. Carries the original `io::Error` so the underlying
+    /// `ErrorKind` remains reachable via
+    /// [`std::error::Error::source`]. Exit code 69
+    /// (`EX_UNAVAILABLE`) — shared with [`Self::SocketUnavailable`];
+    /// the user-visible distinction is the `Display` prefix
+    /// (`picker unavailable:` vs `niri socket unavailable:`).
+    PickerUnavailable(std::io::Error),
+
     /// Subcommand stub has not been wired to its IPC call yet.
     /// Carries the subcommand name so the stderr message names the
     /// gap. Exit code 70 (`EX_SOFTWARE`).
@@ -135,6 +145,7 @@ impl CliError {
             CliError::MalformedResponse(_) => 65,
             CliError::ActivityNotFound(_) => 66,
             CliError::SocketUnavailable(_) => 69,
+            CliError::PickerUnavailable(_) => 69,
             CliError::NotImplemented(_) => 70,
             CliError::CantCreate(_) => 73,
             // Suppressed to 0 by main() before exit_code() is consulted.
@@ -150,6 +161,7 @@ impl fmt::Display for CliError {
             CliError::MalformedResponse(src) => write!(f, "malformed compositor response: {src}"),
             CliError::ActivityNotFound(name) => write!(f, "no such activity: {name}"),
             CliError::SocketUnavailable(io) => write!(f, "niri socket unavailable: {io}"),
+            CliError::PickerUnavailable(io) => write!(f, "picker unavailable: {io}"),
             CliError::NotImplemented(name) => write!(f, "subcommand not yet implemented: {name}"),
             CliError::CantCreate(msg) => write!(f, "cannot create activity: {msg}"),
             CliError::OutputPipeClosed => write!(f, "stdout pipe closed"),
@@ -161,6 +173,7 @@ impl std::error::Error for CliError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             CliError::SocketUnavailable(io) => Some(io),
+            CliError::PickerUnavailable(io) => Some(io),
             CliError::MalformedResponse(MalformedResponseSource::Decode(e)) => Some(e),
             // `Server` and `WrongVariant` carry only strings — the
             // message IS the leaf, no nested error to expose.
@@ -249,6 +262,20 @@ mod tests {
         assert_eq!(
             CliError::SocketUnavailable(sample_io_error()).exit_code(),
             69,
+        );
+    }
+
+    #[test]
+    fn picker_unavailable_is_69() {
+        // `PickerUnavailable` shares exit code 69 with `SocketUnavailable`:
+        // both signal "an external dependency required for this command
+        // is unavailable." The Display prefix is what disambiguates them
+        // for the user — pin that contract here.
+        let err = CliError::PickerUnavailable(sample_io_error());
+        assert_eq!(err.exit_code(), 69);
+        assert!(
+            format!("{err}").starts_with("picker unavailable:"),
+            "Display must use the picker-unavailable prefix",
         );
     }
 

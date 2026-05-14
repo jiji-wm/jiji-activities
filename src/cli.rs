@@ -94,7 +94,7 @@ fn cmd_switch(name: Option<String>) -> Result<()> {
         None => {
             // Verify `fuzzel` is on $PATH BEFORE any IPC round-trip so a
             // missing-dep failure surfaces with a fuzzel-naming stderr
-            // message ("...command not found on $PATH...") rather than
+            // message ("fuzzel: not on $PATH (...)") rather than
             // the generic "niri socket unavailable" the IPC layer would
             // produce on a disconnected socket. `run_picker` would also
             // hit this via `pick_one`'s internal re-check, but only

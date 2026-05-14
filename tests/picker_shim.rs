@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 
 const BIN: &str = "niri-activities";
@@ -265,7 +266,7 @@ fn fuzzel_prompt_arg_is_switch_prompt() {
 fn fuzzel_missing_from_path_exits_69() {
     // `$PATH` points at an empty tempdir — no `fuzzel` binary there.
     // `ensure_available()` (called from `cmd_switch` BEFORE any IPC
-    // round-trip) returns SocketUnavailable with the canonical
+    // round-trip) returns PickerUnavailable with the canonical
     // missing-fuzzel message. Exit code 69 with stderr naming `fuzzel`.
     //
     // `$NIRI_SOCKET` is unset deliberately: even with a missing socket,
@@ -282,5 +283,79 @@ fn fuzzel_missing_from_path_exits_69() {
         .env_remove("NIRI_SOCKET")
         .assert()
         .code(69)
-        .stderr(contains("fuzzel"));
+        .stderr(contains("picker unavailable").and(contains("fuzzel")));
+}
+
+#[test]
+fn run_picker_empty_activities_warns_and_exits_zero() {
+    // End-to-end pin of the empty-list UX: the one-shot listener replies
+    // with an empty `Activities` payload; `run_picker` must short-circuit
+    // before spawning the picker (the shim touches a sentinel file on
+    // entry, and the test asserts the sentinel does NOT exist afterward).
+    // Exit 0 + stderr diagnostic naming the empty-list cause.
+    let shim = ShimDir::new("empty-activities");
+    let sentinel = shim.as_path().join("shim-invoked.sentinel");
+    // Sentinel-file strategy: if the shim is ever reached it creates
+    // `$SHIM_INVOKED` before doing anything else. The post-run assertion
+    // that the sentinel is absent fires before any stderr/exit analysis,
+    // so a regression in the short-circuit is caught even if the shim
+    // later exits non-zero with empty stdout (which classify_output would
+    // fold into Cancelled, masking the bug).
+    shim.install_fuzzel(
+        ": > \"$SHIM_INVOKED\"\nprintf 'niri-activities BUG: picker spawned for empty list\\n' >&2\nexit 99\n",
+    );
+    let sock = spawn_one_shot_activities_listener_empty("empty-activities");
+
+    Command::cargo_bin(BIN)
+        .unwrap()
+        .arg("switch")
+        .env_clear()
+        .env("PATH", shim.as_path())
+        .env("NIRI_SOCKET", &sock)
+        .env("SHIM_INVOKED", &sentinel)
+        .assert()
+        .code(0)
+        .stderr(contains("no activities configured"));
+
+    assert!(
+        !sentinel.exists(),
+        "fuzzel shim must NOT be invoked when the activity list is empty \
+         (sentinel file {:?} was created — the empty-list short-circuit regressed)",
+        sentinel,
+    );
+}
+
+/// Sibling of [`spawn_one_shot_activities_listener`] that replies with an
+/// empty `Activities` payload. Used by the empty-list short-circuit
+/// integration test.
+fn spawn_one_shot_activities_listener_empty(tag: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "niri-activities-shim-sock-empty-{}-{}-{}.sock",
+        std::process::id(),
+        n,
+        tag,
+    ));
+    let _ = fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).expect("bind one-shot socket");
+    let path_clone = path.clone();
+    thread::spawn(move || {
+        if let Ok((mut sock, _)) = listener.accept() {
+            let read_clone = sock.try_clone().expect("clone socket");
+            let mut reader = BufReader::new(read_clone);
+            let mut req = String::new();
+            let _ = reader.read_line(&mut req);
+            let reply = "{\"Ok\":{\"Activities\":[]}}\n";
+            let _ = sock.write_all(reply.as_bytes());
+        }
+        let _ = fs::remove_file(&path_clone);
+    });
+    for _ in 0..50 {
+        if path.exists() {
+            break;
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    path
 }

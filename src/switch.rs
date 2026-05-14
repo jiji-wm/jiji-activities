@@ -156,8 +156,11 @@ pub(crate) fn names_focused_first(activities: &[Activity]) -> Vec<String> {
 ///
 /// **Contract:**
 /// - Issues `Request::Activities` first.
-/// - If the activity list is empty, returns `Ok(())` silently — there
-///   is nothing to pick and the picker would only display an empty menu.
+/// - If the activity list is empty, writes a single-line diagnostic to
+///   stderr (`niri-activities: no activities configured; nothing to
+///   switch to`) and returns `Ok(())` — exit 0. The picker is never
+///   spawned because an empty menu is worse UX than a no-op; the
+///   stderr line tells the user *why* nothing happened.
 /// - Otherwise reorders names with [`names_focused_first`] so the
 ///   currently-focused activity is the default highlight, calls `pick`,
 ///   and on `Selected(name)` delegates to [`run`] (which issues a second
@@ -173,8 +176,10 @@ where
 {
     let activities = send_expect_activities(client).context("requesting activities")?;
     if activities.is_empty() {
-        // Nothing to pick. Exit silently — `fuzzel` would just show an
-        // empty menu, which is worse UX than a no-op.
+        // Nothing to pick. Skip the picker spawn — an empty `fuzzel`
+        // menu is worse UX than a no-op — and tell the user why nothing
+        // happened so the silence is diagnosable.
+        eprintln!("niri-activities: no activities configured; nothing to switch to");
         return Ok(());
     }
     let names = names_focused_first(&activities);
@@ -433,9 +438,12 @@ mod tests {
     }
 
     #[test]
-    fn run_picker_empty_activities_short_circuits_silently() {
+    fn run_picker_empty_activities_warns_and_exits_zero() {
         // Empty activity list: exactly one IPC call (Activities), no
-        // pick invocation, no Switch dispatch. Exits Ok silently.
+        // pick invocation, no Switch dispatch. Exits Ok. (The stderr
+        // diagnostic is asserted by the integration test in
+        // `tests/picker_shim.rs`; this unit test pins the no-pick /
+        // no-second-IPC / Ok(()) contract.)
         let mut client = MockClient::new();
         client.expect(Request::Activities, Reply::Ok(Response::Activities(vec![])));
 
@@ -443,7 +451,7 @@ mod tests {
             panic!("pick must not be called when activity list is empty");
         };
 
-        run_picker(&mut client, pick).expect("empty list short-circuits Ok");
+        run_picker(&mut client, pick).expect("empty list exits Ok");
         client.assert_consumed_in_order();
     }
 
