@@ -181,6 +181,87 @@ fn fuzzel_select_then_second_ipc_fails_exits_69() {
 }
 
 #[test]
+fn fuzzel_stdin_payload_reaches_shim() {
+    // Pins that `pick_one` actually writes the activity-name payload to
+    // fuzzel's stdin. A regression that dropped `stdin.write_all(...)` or
+    // replaced stdin with `Stdio::null()` would produce an empty capture
+    // file and fail this test.
+    //
+    // Strategy: the shim reads its stdin and writes it to
+    // `$SHIM_STDIN_CAPTURE` (a sidecar file the test provides via env).
+    // The shim then cancels (exit 1 + no stdout) so the CLI exits 0
+    // cleanly without needing a second IPC call. The test reads the
+    // capture file and asserts the payload matches the expected format:
+    // one name per line, trailing newline, focused activity first.
+    let shim = ShimDir::new("stdin-capture");
+    let capture = shim.as_path().join("stdin.cap");
+    // Write stdin to $SHIM_STDIN_CAPTURE using a shell read-loop so the
+    // shim needs no external commands (PATH is restricted to the shim dir,
+    // so `cat` and friends are unavailable). Then cancel (exit 1).
+    shim.install_fuzzel(
+        "while IFS= read -r line; do printf '%s\\n' \"$line\"; done > \"$SHIM_STDIN_CAPTURE\"\nexit 1\n",
+    );
+    let sock = spawn_one_shot_activities_listener("stdin-capture");
+
+    Command::cargo_bin(BIN)
+        .unwrap()
+        .arg("switch")
+        .env_clear()
+        .env("PATH", shim.as_path())
+        .env("NIRI_SOCKET", &sock)
+        .env("SHIM_STDIN_CAPTURE", &capture)
+        .assert()
+        .code(0);
+
+    // The one-shot listener sends Work (focused) + Personal.
+    // `names_focused_first` hoists Work to position 0.
+    let payload = fs::read_to_string(&capture)
+        .expect("shim must have written stdin capture file (file missing)");
+    assert_eq!(
+        payload, "Work\nPersonal\n",
+        "stdin payload must list activity names, focused first, one per line with trailing newline; got: {payload:?}",
+    );
+}
+
+#[test]
+fn fuzzel_prompt_arg_is_switch_prompt() {
+    // Pins that `pick_one` passes `--prompt "Switch to activity:"` to
+    // fuzzel. A regression that dropped or misspelled the prompt would
+    // not be caught by the cancel/select tests (which ignore args). The
+    // shim writes `$@` to `$SHIM_ARGS_CAPTURE`, then cancels.
+    let shim = ShimDir::new("args-capture");
+    let capture = shim.as_path().join("args.cap");
+    shim.install_fuzzel("printf '%s\\n' \"$@\" > \"$SHIM_ARGS_CAPTURE\"\nexit 1\n");
+    let sock = spawn_one_shot_activities_listener("args-capture");
+
+    Command::cargo_bin(BIN)
+        .unwrap()
+        .arg("switch")
+        .env_clear()
+        .env("PATH", shim.as_path())
+        .env("NIRI_SOCKET", &sock)
+        .env("SHIM_ARGS_CAPTURE", &capture)
+        .assert()
+        .code(0);
+
+    let args = fs::read_to_string(&capture).expect("shim must have written args capture file");
+    // fuzzel is called as: fuzzel --dmenu --prompt "Switch to activity:"
+    // The shim writes each arg on its own line via `printf '%s\n' "$@"`.
+    assert!(
+        args.contains("--dmenu"),
+        "--dmenu flag must be present in fuzzel args: {args:?}",
+    );
+    assert!(
+        args.contains("--prompt"),
+        "--prompt flag must be present in fuzzel args: {args:?}",
+    );
+    assert!(
+        args.contains("Switch to activity:"),
+        "prompt value must be 'Switch to activity:' in fuzzel args: {args:?}",
+    );
+}
+
+#[test]
 fn fuzzel_missing_from_path_exits_69() {
     // `$PATH` points at an empty tempdir — no `fuzzel` binary there.
     // `ensure_available()` (called from `cmd_switch` BEFORE any IPC
