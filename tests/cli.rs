@@ -4,10 +4,55 @@
 //! regression in the clap-derive surface (dropped subcommand,
 //! changed exit code, broken `--version`) surfaces immediately.
 
+use std::io::{BufRead, BufReader, Write as _};
+use std::os::unix::net::UnixListener;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+
 use assert_cmd::Command;
 use predicates::str::contains;
 
 const BIN: &str = "niri-activities";
+
+/// One-shot Unix-socket listener that accepts one connection, reads one
+/// request line, writes a `Reply::Ok(Response::Handled)` reply, and
+/// captures the raw request JSON to `capture_path`. Used to pin the
+/// IPC request shape emitted by a subcommand without a full compositor.
+fn spawn_one_shot_handled_listener(tag: &str, capture_path: PathBuf) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let sock_path = std::env::temp_dir().join(format!(
+        "niri-activities-cli-test-{}-{}-{}.sock",
+        std::process::id(),
+        n,
+        tag,
+    ));
+    let _ = std::fs::remove_file(&sock_path);
+    let listener = UnixListener::bind(&sock_path).expect("bind one-shot socket");
+    let sock_path_clone = sock_path.clone();
+    thread::spawn(move || {
+        if let Ok((mut sock, _)) = listener.accept() {
+            let read_clone = sock.try_clone().expect("clone socket");
+            let mut reader = BufReader::new(read_clone);
+            let mut req_line = String::new();
+            let _ = reader.read_line(&mut req_line);
+            // Capture the raw request JSON so the test can inspect it.
+            let _ = std::fs::write(&capture_path, req_line.as_bytes());
+            // Reply Handled unconditionally.
+            let _ = sock.write_all(b"{\"Ok\":\"Handled\"}\n");
+        }
+        let _ = std::fs::remove_file(&sock_path_clone);
+    });
+    // Spin until the socket file appears (up to ~500 ms).
+    for _ in 0..50 {
+        if sock_path.exists() {
+            break;
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    sock_path
+}
 
 #[test]
 fn version_prints_pkg_version() {
@@ -212,4 +257,38 @@ fn list_unknown_format_field_exits_64() {
         .assert()
         .code(64)
         .stderr(contains("unknown field: bogus"));
+}
+
+#[test]
+fn toggle_alias_routes_to_switch_activity_previous() {
+    // Pins that `toggle` dispatches `SwitchActivityPrevious`, not
+    // `Switch { name: None }` (which would issue `Activities` first).
+    // A clap regression that mis-routed `toggle` to `Cmd::Switch { .. }`
+    // would still exit 69 on a dead socket, making exit-code tests
+    // unable to detect it. This test inspects the actual request JSON.
+    let capture = std::env::temp_dir().join(format!(
+        "niri-activities-cli-toggle-req-{}.json",
+        std::process::id(),
+    ));
+    let sock = spawn_one_shot_handled_listener("toggle-shape", capture.clone());
+
+    Command::cargo_bin(BIN)
+        .unwrap()
+        .arg("toggle")
+        .env("NIRI_SOCKET", &sock)
+        .assert()
+        .success();
+
+    let req_json = std::fs::read_to_string(&capture)
+        .expect("one-shot listener must have written the request capture file");
+    let _ = std::fs::remove_file(&capture);
+
+    assert!(
+        req_json.contains("SwitchActivityPrevious"),
+        "toggle must emit SwitchActivityPrevious, not Switch or Activities; got: {req_json:?}",
+    );
+    assert!(
+        !req_json.contains("Activities"),
+        "toggle must NOT emit Activities (picker path); got: {req_json:?}",
+    );
 }
