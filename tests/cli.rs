@@ -126,13 +126,70 @@ fn assign_workspace_no_socket_exits_69() {
 }
 
 #[test]
-fn toggle_alias_routes_to_switch_previous() {
+fn switch_previous_no_socket_exits_69() {
+    // Pins the binary-boundary wiring: `switch-previous` dispatches
+    // through switch_previous::run (not the NotImplemented stub), which
+    // hits the IPC factory. With $NIRI_SOCKET unset the factory returns
+    // SocketUnavailable (exit 69) — proving the wired path replaced the
+    // stub. A regression to exit 70 would mean it fell back to
+    // NotImplemented.
+    Command::cargo_bin(BIN)
+        .unwrap()
+        .args(["switch-previous"])
+        .env_remove("NIRI_SOCKET")
+        .assert()
+        .code(69);
+}
+
+#[test]
+fn toggle_alias_no_socket_exits_69() {
+    // The `toggle` alias must reach the same wired switch-previous
+    // path. Exit 69 (not 70) proves the alias is not silently falling
+    // through to the NotImplemented stub it used to.
     Command::cargo_bin(BIN)
         .unwrap()
         .arg("toggle")
+        .env_remove("NIRI_SOCKET")
         .assert()
-        .code(70)
-        .stderr(contains("subcommand not yet implemented: switch-previous"));
+        .code(69);
+}
+
+#[test]
+fn move_workspace_named_no_socket_exits_69() {
+    // Pins the binary-boundary wiring: `move-workspace <name>`
+    // dispatches through move_workspace::run (not NotImplemented),
+    // hitting the IPC factory. With $NIRI_SOCKET unset the factory
+    // returns SocketUnavailable (exit 69).
+    Command::cargo_bin(BIN)
+        .unwrap()
+        .args(["move-workspace", "Work"])
+        .env_remove("NIRI_SOCKET")
+        .assert()
+        .code(69);
+}
+
+#[test]
+fn move_workspace_no_arg_no_socket_exits_69() {
+    // `move-workspace` with no arg now opens the fuzzel picker. With
+    // `$NIRI_SOCKET` unset, two distinct paths can produce exit 69:
+    //
+    // 1. If `fuzzel` IS installed on this host, `which fuzzel` succeeds
+    //    but `Request::Activities` fails on the missing socket →
+    //    `SocketUnavailable`.
+    // 2. If `fuzzel` is NOT installed, `which fuzzel` short-circuits to
+    //    `PickerUnavailable`.
+    //
+    // Both routes share exit code 69. We deliberately do not assert the
+    // stderr text — the assertion target is the wire-up (no-arg branch
+    // routed through the picker/IPC path, not NotImplemented). A
+    // regression to exit 70 would mean the no-arg branch silently fell
+    // back to the stub.
+    Command::cargo_bin(BIN)
+        .unwrap()
+        .args(["move-workspace"])
+        .env_remove("NIRI_SOCKET")
+        .assert()
+        .code(69);
 }
 
 #[test]

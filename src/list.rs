@@ -22,6 +22,7 @@ use serde::Serialize;
 
 use crate::error::{CliError, MalformedResponseSource};
 use crate::ipc::NiriClient;
+use crate::ipc_helpers::variant_name;
 
 /// Options threaded from [`crate::cli::dispatch`].
 pub(crate) struct ListOpts<'a> {
@@ -126,33 +127,6 @@ fn send_expect_windows(client: &mut dyn NiriClient) -> Result<Vec<Window>> {
     match resp {
         Response::Windows(v) => Ok(v),
         other => Err(wrong_variant("Response::Windows", &other).into()),
-    }
-}
-
-/// Returns the variant name of `r` as a `&'static str`.
-///
-/// Avoids formatting the full Debug payload (which can be arbitrarily
-/// large for e.g. `Response::Windows(vec![...10_000 windows...])`)
-/// into a `WrongVariant::got` string.
-fn variant_name(r: &Response) -> &'static str {
-    match r {
-        Response::Handled => "Response::Handled",
-        Response::Version(_) => "Response::Version",
-        Response::Outputs(_) => "Response::Outputs",
-        Response::Workspaces(_) => "Response::Workspaces",
-        Response::Windows(_) => "Response::Windows",
-        Response::Layers(_) => "Response::Layers",
-        Response::KeyboardLayouts(_) => "Response::KeyboardLayouts",
-        Response::FocusedOutput(_) => "Response::FocusedOutput",
-        Response::Activities(_) => "Response::Activities",
-        Response::FocusedActivity(_) => "Response::FocusedActivity",
-        Response::FocusedWindow(_) => "Response::FocusedWindow",
-        Response::PickedWindow(_) => "Response::PickedWindow",
-        Response::PickedColor(_) => "Response::PickedColor",
-        Response::OutputConfigChanged(_) => "Response::OutputConfigChanged",
-        Response::OverviewState(_) => "Response::OverviewState",
-        Response::Casts(_) => "Response::Casts",
-        _ => "Response::<unknown>",
     }
 }
 

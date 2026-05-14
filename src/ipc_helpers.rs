@@ -1,0 +1,302 @@
+//! Shared IPC plumbing reused across subcommand modules.
+//!
+//! Three helpers live here:
+//!
+//! - [`variant_name`] — static name for a [`Response`] variant, used
+//!   by every `Response::Handled`-or-mismatch site to populate the
+//!   `WrongVariant::got` field without dragging the full Debug payload
+//!   (which can be arbitrarily large for e.g. `Response::Windows(...)`).
+//! - [`send_expect_handled`] — wraps a `client.send(req)` call that
+//!   expects `Response::Handled`, routing the compositor's
+//!   `"activity not found"` wire string to the typed
+//!   [`CliError::ActivityNotFound`] when an activity name is in scope.
+//! - [`names_focused_first`] — pure helper that reorders an
+//!   [`Activity`] slice's names so the focused activity (if any) is
+//!   first; remaining names preserve their compositor-supplied order.
+//!
+//! Centralising these avoids three-way duplication between
+//! `crate::switch`, `crate::switch_previous`, and
+//! `crate::move_workspace`, and closes the latent risk that two
+//! independent `variant_name` definitions drift apart.
+
+use niri_ipc::{Activity, Request, Response};
+
+use crate::error::{CliError, MalformedResponseSource};
+use crate::ipc::{IpcError, NiriClient};
+
+/// Static variant name for a [`Response`].
+///
+/// Returns a `&'static str` matching the variant constructor name
+/// (`"Response::Handled"`, `"Response::Activities"`, ...). Avoids
+/// formatting the full Debug payload — for variants that carry large
+/// vectors this would otherwise produce arbitrarily large
+/// `WrongVariant::got` strings. The catch-all arm
+/// (`"Response::<unknown>"`) accommodates `#[non_exhaustive]` additions
+/// to `Response` without breaking the build.
+pub(crate) fn variant_name(r: &Response) -> &'static str {
+    match r {
+        Response::Handled => "Response::Handled",
+        Response::Version(_) => "Response::Version",
+        Response::Outputs(_) => "Response::Outputs",
+        Response::Workspaces(_) => "Response::Workspaces",
+        Response::Windows(_) => "Response::Windows",
+        Response::Layers(_) => "Response::Layers",
+        Response::KeyboardLayouts(_) => "Response::KeyboardLayouts",
+        Response::FocusedOutput(_) => "Response::FocusedOutput",
+        Response::Activities(_) => "Response::Activities",
+        Response::FocusedActivity(_) => "Response::FocusedActivity",
+        Response::FocusedWindow(_) => "Response::FocusedWindow",
+        Response::PickedWindow(_) => "Response::PickedWindow",
+        Response::PickedColor(_) => "Response::PickedColor",
+        Response::OutputConfigChanged(_) => "Response::OutputConfigChanged",
+        Response::OverviewState(_) => "Response::OverviewState",
+        Response::Casts(_) => "Response::Casts",
+        _ => "Response::<unknown>",
+    }
+}
+
+/// Sends `req`, expects `Response::Handled`, and routes the
+/// compositor's `"activity not found"` wire string to the typed
+/// [`CliError::ActivityNotFound`] when an activity name is in scope.
+///
+/// **Contract:**
+/// - `Ok(Response::Handled)` → `Ok(())`.
+/// - `Ok(other)` →
+///   `CliError::MalformedResponse(WrongVariant { expected: "Response::Handled", got: variant_name(&other) })`.
+/// - `Err(IpcError::Server("activity not found"))` →
+///   `CliError::ActivityNotFound(name)` when `activity_name` is
+///   `Some(name)`; falls through to
+///   `CliError::MalformedResponse(Server)` when `activity_name` is
+///   `None` (the caller has no name in scope to attach — e.g.
+///   `switch-previous`, where the compositor implicitly picks the
+///   previous activity).
+/// - Other `Err(IpcError::*)` flow through the existing
+///   `IpcError → CliError` `From` mapping unchanged.
+///
+/// The match is strict equality on `"activity not found"` — any
+/// drift (suffix, case, trailing punct) falls through to
+/// `MalformedResponse(Server)`, matching the existing
+/// `crate::switch` contract.
+pub(crate) fn send_expect_handled(
+    client: &mut dyn NiriClient,
+    req: Request,
+    activity_name: Option<&str>,
+) -> anyhow::Result<()> {
+    debug_assert!(
+        activity_name.is_none_or(|n| !n.is_empty()),
+        "send_expect_handled: activity_name must be non-empty when Some",
+    );
+    match client.send(req) {
+        Ok(Response::Handled) => Ok(()),
+        Ok(other) => Err(
+            CliError::MalformedResponse(MalformedResponseSource::WrongVariant {
+                expected: "Response::Handled",
+                got: variant_name(&other).into(),
+            })
+            .into(),
+        ),
+        Err(IpcError::Server(msg)) if msg == "activity not found" => match activity_name {
+            Some(name) => Err(CliError::ActivityNotFound(name.to_owned()).into()),
+            None => Err(CliError::MalformedResponse(MalformedResponseSource::Server(msg)).into()),
+        },
+        Err(other) => Err(CliError::from(other).into()),
+    }
+}
+
+/// Returns activity names with the focused one (if any) hoisted to the
+/// front; remaining names preserve their compositor-supplied order.
+///
+/// Pure helper, no IPC. The first `is_active` activity wins; the
+/// compositor invariant is that at most one activity is active at a
+/// time, but defensively coping with multiple keeps the helper total.
+pub(crate) fn names_focused_first(activities: &[Activity]) -> Vec<String> {
+    let mut focused: Option<String> = None;
+    let mut rest: Vec<String> = Vec::with_capacity(activities.len());
+    for a in activities {
+        if a.is_active && focused.is_none() {
+            focused = Some(a.name.clone());
+        } else {
+            rest.push(a.name.clone());
+        }
+    }
+    let mut out = Vec::with_capacity(activities.len());
+    if let Some(f) = focused {
+        out.push(f);
+    }
+    out.extend(rest);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use niri_ipc::{Activity, Reply, Request, Response};
+
+    use super::*;
+    use crate::error::{CliError, MalformedResponseSource};
+    use crate::ipc::MockClient;
+
+    fn act(id: u64, name: &str, is_active: bool) -> Activity {
+        Activity {
+            id,
+            name: name.into(),
+            is_active,
+            is_config_declared: true,
+            ..Default::default()
+        }
+    }
+
+    // ---- variant_name ----
+
+    #[test]
+    fn variant_name_recognises_handled() {
+        assert_eq!(variant_name(&Response::Handled), "Response::Handled");
+    }
+
+    #[test]
+    fn variant_name_recognises_activities() {
+        assert_eq!(
+            variant_name(&Response::Activities(vec![])),
+            "Response::Activities",
+        );
+    }
+
+    #[test]
+    fn variant_name_recognises_workspaces() {
+        assert_eq!(
+            variant_name(&Response::Workspaces(vec![])),
+            "Response::Workspaces",
+        );
+    }
+
+    // ---- send_expect_handled ----
+
+    #[test]
+    fn send_expect_handled_handled_is_ok() {
+        let mut client = MockClient::new();
+        client.expect(Request::Version, Reply::Ok(Response::Handled));
+        send_expect_handled(&mut client, Request::Version, Some("Work"))
+            .expect("Handled reply must succeed");
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn send_expect_handled_wrong_variant_is_malformed() {
+        let mut client = MockClient::new();
+        client.expect(Request::Version, Reply::Ok(Response::Version("v".into())));
+        let err = send_expect_handled(&mut client, Request::Version, Some("Work"))
+            .expect_err("wrong variant must fail");
+        let cli_err = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<CliError>())
+            .expect("CliError must be in chain");
+        match cli_err {
+            CliError::MalformedResponse(MalformedResponseSource::WrongVariant {
+                expected,
+                got,
+            }) => {
+                assert_eq!(*expected, "Response::Handled");
+                assert_eq!(got, "Response::Version");
+            }
+            other => panic!("expected WrongVariant, got {other:?}"),
+        }
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn send_expect_handled_with_name_routes_not_found_to_typed_error() {
+        let mut client = MockClient::new();
+        client.expect(Request::Version, Err("activity not found".to_owned()));
+        let err = send_expect_handled(&mut client, Request::Version, Some("Work"))
+            .expect_err("not-found must fail");
+        let cli_err = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<CliError>())
+            .expect("CliError must be in chain");
+        match cli_err {
+            CliError::ActivityNotFound(name) => assert_eq!(name, "Work"),
+            other => panic!("expected ActivityNotFound, got {other:?}"),
+        }
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn send_expect_handled_without_name_routes_not_found_to_malformed() {
+        // No activity name in scope (the `switch-previous` shape). The
+        // "activity not found" wire string MUST fall through to
+        // MalformedResponse(Server) rather than fabricating an
+        // ActivityNotFound with an empty name.
+        let mut client = MockClient::new();
+        client.expect(Request::Version, Err("activity not found".to_owned()));
+        let err = send_expect_handled(&mut client, Request::Version, None)
+            .expect_err("not-found must fail");
+        let cli_err = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<CliError>())
+            .expect("CliError must be in chain");
+        match cli_err {
+            CliError::MalformedResponse(MalformedResponseSource::Server(msg)) => {
+                assert_eq!(msg, "activity not found");
+            }
+            other => panic!("expected MalformedResponse(Server), got {other:?}"),
+        }
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn send_expect_handled_other_server_error_routes_to_malformed() {
+        let mut client = MockClient::new();
+        client.expect(Request::Version, Err("some other failure".to_owned()));
+        let err = send_expect_handled(&mut client, Request::Version, Some("Work"))
+            .expect_err("server error must fail");
+        let cli_err = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<CliError>())
+            .expect("CliError must be in chain");
+        match cli_err {
+            CliError::MalformedResponse(MalformedResponseSource::Server(msg)) => {
+                assert_eq!(msg, "some other failure");
+            }
+            other => panic!("expected MalformedResponse(Server), got {other:?}"),
+        }
+        client.assert_consumed_in_order();
+    }
+
+    // ---- names_focused_first ----
+
+    #[test]
+    fn names_focused_first_hoists_focused_to_front() {
+        let acts = vec![
+            act(1, "Work", false),
+            act(2, "Personal", true),
+            act(3, "Gaming", false),
+        ];
+        let names = names_focused_first(&acts);
+        assert_eq!(names, vec!["Personal", "Work", "Gaming"]);
+    }
+
+    #[test]
+    fn names_focused_first_no_focused_passes_through_unchanged() {
+        let acts = vec![act(1, "Work", false), act(2, "Personal", false)];
+        let names = names_focused_first(&acts);
+        assert_eq!(names, vec!["Work", "Personal"]);
+    }
+
+    #[test]
+    fn names_focused_first_empty_is_empty() {
+        let names = names_focused_first(&[]);
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn names_focused_first_multi_active_hoists_first_only() {
+        // Defensive: compositor invariant says at most one activity is
+        // active, but if multiple arrive only the first is hoisted.
+        let acts = vec![
+            act(1, "Work", true),
+            act(2, "Personal", true),
+            act(3, "Gaming", false),
+        ];
+        let names = names_focused_first(&acts);
+        assert_eq!(names, vec!["Work", "Personal", "Gaming"]);
+    }
+}

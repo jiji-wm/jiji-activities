@@ -12,9 +12,12 @@ mod assign_workspace;
 mod cli;
 mod error;
 mod ipc;
+mod ipc_helpers;
 mod list;
+mod move_workspace;
 mod picker;
 mod switch;
+mod switch_previous;
 
 fn main() -> ExitCode {
     let parsed = match cli::Cli::try_parse() {

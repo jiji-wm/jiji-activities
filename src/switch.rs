@@ -22,7 +22,8 @@ use anyhow::{Context, Result};
 use niri_ipc::{Action, Activity, ActivityReferenceArg, Request, Response};
 
 use crate::error::{CliError, MalformedResponseSource};
-use crate::ipc::{IpcError, NiriClient};
+use crate::ipc::NiriClient;
+use crate::ipc_helpers::{names_focused_first, send_expect_handled, variant_name};
 use crate::picker::PickerOutcome;
 
 /// Switches to the activity named `name` over IPC.
@@ -49,62 +50,7 @@ pub(crate) fn run(client: &mut dyn NiriClient, name: &str) -> Result<()> {
     let req = Request::Action(Action::SwitchActivity {
         activity: ActivityReferenceArg::Name(name.to_owned()),
     });
-    send_expect_handled(client, req, name).context("switching activity")
-}
-
-/// Sends `req`, expects `Response::Handled`, and routes the
-/// compositor's `"activity not found"` wire string to the typed
-/// [`CliError::ActivityNotFound`].
-///
-/// `activity_name` is forwarded into the typed not-found error so the
-/// stderr message names the activity the caller asked for. Other
-/// `IpcError::Server(msg)` payloads fall through to the existing
-/// `IpcError` → `CliError` mapping (which routes to
-/// `MalformedResponse(Server)`).
-fn send_expect_handled(
-    client: &mut dyn NiriClient,
-    req: Request,
-    activity_name: &str,
-) -> Result<()> {
-    match client.send(req) {
-        Ok(Response::Handled) => Ok(()),
-        Ok(other) => Err(
-            CliError::MalformedResponse(MalformedResponseSource::WrongVariant {
-                expected: "Response::Handled",
-                got: variant_name(&other).into(),
-            })
-            .into(),
-        ),
-        Err(IpcError::Server(msg)) if msg == "activity not found" => {
-            Err(CliError::ActivityNotFound(activity_name.to_owned()).into())
-        }
-        Err(other) => Err(CliError::from(other).into()),
-    }
-}
-
-/// Static variant name for `Response`. Mirrors the helper in
-/// [`crate::list`]; kept local rather than shared to avoid widening
-/// `list`'s public surface for a single re-use.
-fn variant_name(r: &Response) -> &'static str {
-    match r {
-        Response::Handled => "Response::Handled",
-        Response::Version(_) => "Response::Version",
-        Response::Outputs(_) => "Response::Outputs",
-        Response::Workspaces(_) => "Response::Workspaces",
-        Response::Windows(_) => "Response::Windows",
-        Response::Layers(_) => "Response::Layers",
-        Response::KeyboardLayouts(_) => "Response::KeyboardLayouts",
-        Response::FocusedOutput(_) => "Response::FocusedOutput",
-        Response::Activities(_) => "Response::Activities",
-        Response::FocusedActivity(_) => "Response::FocusedActivity",
-        Response::FocusedWindow(_) => "Response::FocusedWindow",
-        Response::PickedWindow(_) => "Response::PickedWindow",
-        Response::PickedColor(_) => "Response::PickedColor",
-        Response::OutputConfigChanged(_) => "Response::OutputConfigChanged",
-        Response::OverviewState(_) => "Response::OverviewState",
-        Response::Casts(_) => "Response::Casts",
-        _ => "Response::<unknown>",
-    }
+    send_expect_handled(client, req, Some(name)).context("switching activity")
 }
 
 /// Sends [`Request::Activities`] and unwraps the expected
@@ -128,29 +74,6 @@ fn send_expect_activities(client: &mut dyn NiriClient) -> Result<Vec<Activity>> 
     }
 }
 
-/// Returns activity names with the focused one (if any) hoisted to the
-/// front; remaining names preserve their compositor-supplied order.
-///
-/// Pure helper, no IPC. Exposed at module scope so the unit test can
-/// pin the ordering contract without spinning up a `MockClient`.
-pub(crate) fn names_focused_first(activities: &[Activity]) -> Vec<String> {
-    let mut focused: Option<String> = None;
-    let mut rest: Vec<String> = Vec::with_capacity(activities.len());
-    for a in activities {
-        if a.is_active && focused.is_none() {
-            focused = Some(a.name.clone());
-        } else {
-            rest.push(a.name.clone());
-        }
-    }
-    let mut out = Vec::with_capacity(activities.len());
-    if let Some(f) = focused {
-        out.push(f);
-    }
-    out.extend(rest);
-    out
-}
-
 /// Opens a single-select picker over the current activity list, then
 /// dispatches `switch::run` against the chosen name.
 ///
@@ -172,7 +95,7 @@ pub(crate) fn names_focused_first(activities: &[Activity]) -> Vec<String> {
 /// [`picker::pick_one`].
 pub(crate) fn run_picker<F>(client: &mut dyn NiriClient, pick: F) -> Result<()>
 where
-    F: Fn(&str, &[String]) -> Result<PickerOutcome, CliError>,
+    F: FnOnce(&str, &[String]) -> Result<PickerOutcome, CliError>,
 {
     let activities = send_expect_activities(client).context("requesting activities")?;
     if activities.is_empty() {
@@ -376,7 +299,7 @@ mod tests {
         client.assert_consumed_in_order();
     }
 
-    // ---- names_focused_first --------------------------------------------
+    // ---- run_picker -----------------------------------------------------
 
     fn act(id: u64, name: &str, is_active: bool) -> Activity {
         Activity {
@@ -387,30 +310,6 @@ mod tests {
             ..Default::default()
         }
     }
-
-    #[test]
-    fn names_focused_first_hoists_focused_to_front() {
-        // Default highlight in `fuzzel --dmenu` is the first line; pin
-        // that the focused activity is hoisted regardless of its
-        // compositor-supplied position.
-        let acts = vec![
-            act(1, "Work", false),
-            act(2, "Personal", true),
-            act(3, "Gaming", false),
-        ];
-        let names = names_focused_first(&acts);
-        assert_eq!(names, vec!["Personal", "Work", "Gaming"]);
-    }
-
-    #[test]
-    fn names_focused_first_no_focused_passes_through_unchanged() {
-        // With no `is_active=true` activity the order is preserved.
-        let acts = vec![act(1, "Work", false), act(2, "Personal", false)];
-        let names = names_focused_first(&acts);
-        assert_eq!(names, vec!["Work", "Personal"]);
-    }
-
-    // ---- run_picker -----------------------------------------------------
 
     #[test]
     fn run_picker_selects_and_dispatches_switch() {

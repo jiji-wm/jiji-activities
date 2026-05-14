@@ -30,6 +30,7 @@ use niri_ipc::{
 
 use crate::error::{CliError, MalformedResponseSource};
 use crate::ipc::{IpcError, NiriClient};
+use crate::ipc_helpers::variant_name;
 use crate::picker::PickerOutcome;
 use crate::picker::multi_select::{self, MultiPickerOutcome};
 
@@ -54,6 +55,14 @@ use crate::picker::multi_select::{self, MultiPickerOutcome};
 ///   `CliError::MalformedResponse(WrongVariant { .. })` (exit 65).
 /// - Other IPC failures flow through the existing `IpcError → CliError`
 ///   mapping (`SocketUnavailable`, `MalformedResponse(Server)`, etc.).
+///
+/// **Snapshot freshness.** The activities snapshot read here is
+/// point-in-time at picker open: a concurrent `niri-activities create`
+/// while the picker is open does not refresh the menu, and a stale
+/// snapshot at save surfaces the compositor's wire error through the
+/// `IpcError → CliError` mapping (typically
+/// `MalformedResponse(Server)` when the chosen name no longer
+/// resolves). Reactive refresh is deferred to v2.
 pub(crate) fn run(client: &mut dyn NiriClient) -> Result<()> {
     let activities = send_expect_activities(client).context("requesting activities")?;
     if activities.is_empty() {
@@ -140,6 +149,13 @@ fn dispatch_set(client: &mut dyn NiriClient, ws_id: u64, names: Vec<String>) -> 
 /// variants surface as `MalformedResponse(WrongVariant)`; transport
 /// and server errors flow through the existing `IpcError → CliError`
 /// mapping unchanged.
+///
+/// This is a local variant of `ipc_helpers::send_expect_handled`
+/// that omits the `activity_name` parameter — `assign-workspace`
+/// uses `SetWorkspaceActivities` (not an activity-by-name action),
+/// so the `"activity not found"` special-case routing never applies.
+/// `None` in the shared helper does the same thing, but keeping this
+/// local makes the absence of name-routing explicit at the call site.
 fn send_expect_handled(client: &mut dyn NiriClient, req: Request) -> Result<()> {
     match client.send(req) {
         Ok(Response::Handled) => Ok(()),
@@ -188,31 +204,6 @@ fn send_expect_workspaces(client: &mut dyn NiriClient) -> Result<Vec<Workspace>>
             })
             .into(),
         ),
-    }
-}
-
-/// Static variant name for `Response`. Local copy of the helper in
-/// `switch` and `list`; duplicated to avoid widening their public surface.
-// TODO: if a fourth copy appears, lift to `crate::ipc::variant_name`.
-fn variant_name(r: &Response) -> &'static str {
-    match r {
-        Response::Handled => "Response::Handled",
-        Response::Version(_) => "Response::Version",
-        Response::Outputs(_) => "Response::Outputs",
-        Response::Workspaces(_) => "Response::Workspaces",
-        Response::Windows(_) => "Response::Windows",
-        Response::Layers(_) => "Response::Layers",
-        Response::KeyboardLayouts(_) => "Response::KeyboardLayouts",
-        Response::FocusedOutput(_) => "Response::FocusedOutput",
-        Response::Activities(_) => "Response::Activities",
-        Response::FocusedActivity(_) => "Response::FocusedActivity",
-        Response::FocusedWindow(_) => "Response::FocusedWindow",
-        Response::PickedWindow(_) => "Response::PickedWindow",
-        Response::PickedColor(_) => "Response::PickedColor",
-        Response::OutputConfigChanged(_) => "Response::OutputConfigChanged",
-        Response::OverviewState(_) => "Response::OverviewState",
-        Response::Casts(_) => "Response::Casts",
-        _ => "Response::<unknown>",
     }
 }
 

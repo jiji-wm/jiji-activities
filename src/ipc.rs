@@ -264,6 +264,12 @@ impl MockClient {
     /// Queues a `(request, reply)` pair. The `request` must match
     /// (by JSON-round-trip equality) the next `send()` invocation, in
     /// the order they were queued.
+    ///
+    /// **Coverage limitation:** `reply` is `Reply`, which only carries
+    /// `Ok(Response)` or `Err(String)` (the `IpcError::Server` leg).
+    /// `IpcError::Transport` and `IpcError::Decode` are not injectable
+    /// through this interface — those paths in `send_expect_handled`
+    /// and related helpers are untested at the unit level.
     pub(crate) fn expect(&mut self, req: Request, reply: Reply) {
         self.queue.push_back((req, reply));
     }

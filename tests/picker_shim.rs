@@ -328,6 +328,89 @@ fn run_picker_empty_activities_warns_and_exits_zero() {
     );
 }
 
+// ---- move-workspace picker tests -------------------------------------------
+
+#[test]
+fn move_workspace_picker_cancel_exits_zero() {
+    // Sibling of `fuzzel_cancel_exits_0` for the `move-workspace`
+    // subcommand. The fuzzel shim simulates a user dismissal (exit 1,
+    // empty stdout). The CLI must classify as cancellation and exit 0
+    // silently.
+    let shim = ShimDir::new("mw-cancel");
+    shim.install_fuzzel("exit 1\n");
+    let sock = spawn_one_shot_activities_listener("mw-cancel");
+
+    Command::cargo_bin(BIN)
+        .unwrap()
+        .arg("move-workspace")
+        .env_clear()
+        .env("PATH", shim.as_path())
+        .env("NIRI_SOCKET", &sock)
+        .assert()
+        .code(0);
+}
+
+#[test]
+fn move_workspace_picker_select_then_second_ipc_fails_exits_69() {
+    // Sibling of `fuzzel_select_then_second_ipc_fails_exits_69`. The
+    // one-shot listener answers Activities; the picker spawns the
+    // shim, which prints "Work" and exits 0 → picker returns
+    // Selected("Work"). `run_picker` then dispatches a SECOND IPC call
+    // (MoveWorkspaceToActivity); the one-shot listener already closed,
+    // so that second call hits a dead socket and exit 69 surfaces.
+    // The exit-code contract is what's pinned: select + dead second
+    // IPC → 69.
+    let shim = ShimDir::new("mw-select");
+    shim.install_fuzzel("printf 'Work\\n'\nexit 0\n");
+    let sock = spawn_one_shot_activities_listener("mw-select");
+
+    Command::cargo_bin(BIN)
+        .unwrap()
+        .arg("move-workspace")
+        .env_clear()
+        .env("PATH", shim.as_path())
+        .env("NIRI_SOCKET", &sock)
+        .assert()
+        .code(69);
+}
+
+#[test]
+fn move_workspace_picker_prompt_arg_is_move_prompt() {
+    // Pins that `move_workspace::run_picker` passes
+    // `--prompt "Move workspace to activity:"` to fuzzel. A regression
+    // that re-used `switch`'s prompt would not be caught by the
+    // cancel/select tests (which ignore args). The shim writes `$@` to
+    // `$SHIM_ARGS_CAPTURE`, then cancels.
+    let shim = ShimDir::new("mw-args");
+    let capture = shim.as_path().join("args.cap");
+    shim.install_fuzzel("printf '%s\\n' \"$@\" > \"$SHIM_ARGS_CAPTURE\"\nexit 1\n");
+    let sock = spawn_one_shot_activities_listener("mw-args");
+
+    Command::cargo_bin(BIN)
+        .unwrap()
+        .arg("move-workspace")
+        .env_clear()
+        .env("PATH", shim.as_path())
+        .env("NIRI_SOCKET", &sock)
+        .env("SHIM_ARGS_CAPTURE", &capture)
+        .assert()
+        .code(0);
+
+    let args = fs::read_to_string(&capture).expect("shim must have written args capture file");
+    assert!(
+        args.contains("--dmenu"),
+        "--dmenu flag must be present in fuzzel args: {args:?}",
+    );
+    assert!(
+        args.contains("--prompt"),
+        "--prompt flag must be present in fuzzel args: {args:?}",
+    );
+    assert!(
+        args.contains("Move workspace to activity:"),
+        "prompt value must be 'Move workspace to activity:' in fuzzel args: {args:?}",
+    );
+}
+
 /// Sibling of [`spawn_one_shot_activities_listener`] that replies with an
 /// empty `Activities` payload. Used by the empty-list short-circuit
 /// integration test.
