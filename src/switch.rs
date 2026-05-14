@@ -19,10 +19,11 @@
 //! fail loudly.
 
 use anyhow::{Context, Result};
-use niri_ipc::{Action, ActivityReferenceArg, Request, Response};
+use niri_ipc::{Action, Activity, ActivityReferenceArg, Request, Response};
 
 use crate::error::{CliError, MalformedResponseSource};
 use crate::ipc::{IpcError, NiriClient};
+use crate::picker::PickerOutcome;
 
 /// Switches to the activity named `name` over IPC.
 ///
@@ -106,9 +107,86 @@ fn variant_name(r: &Response) -> &'static str {
     }
 }
 
+/// Sends [`Request::Activities`] and unwraps the expected
+/// [`Response::Activities`].
+///
+/// Mirrors `list::send_expect_activities`; kept local rather than shared
+/// because re-exporting that helper would widen `list`'s public surface
+/// for a single re-use. The mismatch path produces the same typed
+/// `WrongVariant` error so behavioural parity is preserved.
+fn send_expect_activities(client: &mut dyn NiriClient) -> Result<Vec<Activity>> {
+    let resp = client.send(Request::Activities).map_err(CliError::from)?;
+    match resp {
+        Response::Activities(v) => Ok(v),
+        other => Err(
+            CliError::MalformedResponse(MalformedResponseSource::WrongVariant {
+                expected: "Response::Activities",
+                got: variant_name(&other).into(),
+            })
+            .into(),
+        ),
+    }
+}
+
+/// Returns activity names with the focused one (if any) hoisted to the
+/// front; remaining names preserve their compositor-supplied order.
+///
+/// Pure helper, no IPC. Exposed at module scope so the unit test can
+/// pin the ordering contract without spinning up a `MockClient`.
+pub(crate) fn names_focused_first(activities: &[Activity]) -> Vec<String> {
+    let mut focused: Option<String> = None;
+    let mut rest: Vec<String> = Vec::with_capacity(activities.len());
+    for a in activities {
+        if a.is_active && focused.is_none() {
+            focused = Some(a.name.clone());
+        } else {
+            rest.push(a.name.clone());
+        }
+    }
+    let mut out = Vec::with_capacity(activities.len());
+    if let Some(f) = focused {
+        out.push(f);
+    }
+    out.extend(rest);
+    out
+}
+
+/// Opens a single-select picker over the current activity list, then
+/// dispatches `switch::run` against the chosen name.
+///
+/// **Contract:**
+/// - Issues `Request::Activities` first.
+/// - If the activity list is empty, returns `Ok(())` silently — there
+///   is nothing to pick and the picker would only display an empty menu.
+/// - Otherwise reorders names with [`names_focused_first`] so the
+///   currently-focused activity is the default highlight, calls `pick`,
+///   and on `Selected(name)` delegates to [`run`] (which issues a second
+///   IPC call: `Request::Action(SwitchActivity)`).
+/// - On `Cancelled`, returns `Ok(())` — user dismissal is exit 0.
+///
+/// The `pick` parameter is a closure so unit tests can inject a stub
+/// without spawning `fuzzel`; production wiring passes
+/// [`picker::pick_one`].
+pub(crate) fn run_picker<F>(client: &mut dyn NiriClient, pick: F) -> Result<()>
+where
+    F: Fn(&str, &[String]) -> Result<PickerOutcome, CliError>,
+{
+    let activities = send_expect_activities(client).context("requesting activities")?;
+    if activities.is_empty() {
+        // Nothing to pick. Exit silently — `fuzzel` would just show an
+        // empty menu, which is worse UX than a no-op.
+        return Ok(());
+    }
+    let names = names_focused_first(&activities);
+    match pick("Switch to activity:", &names)? {
+        PickerOutcome::Cancelled => Ok(()),
+        PickerOutcome::Selected(name) => run(client, &name),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use niri_ipc::{Action, ActivityReferenceArg, Reply, Request, Response};
+    use niri_ipc::{Action, Activity, ActivityReferenceArg, Reply, Request, Response};
 
     use super::*;
     use crate::error::{CliError, MalformedResponseSource};
@@ -290,6 +368,101 @@ mod tests {
             formatted.contains("no such activity: Work"),
             "ActivityNotFound Display missing from chain: {formatted}",
         );
+        client.assert_consumed_in_order();
+    }
+
+    // ---- names_focused_first --------------------------------------------
+
+    fn act(id: u64, name: &str, is_active: bool) -> Activity {
+        Activity {
+            id,
+            name: name.into(),
+            is_active,
+            is_config_declared: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn names_focused_first_hoists_focused_to_front() {
+        // Default highlight in `fuzzel --dmenu` is the first line; pin
+        // that the focused activity is hoisted regardless of its
+        // compositor-supplied position.
+        let acts = vec![
+            act(1, "Work", false),
+            act(2, "Personal", true),
+            act(3, "Gaming", false),
+        ];
+        let names = names_focused_first(&acts);
+        assert_eq!(names, vec!["Personal", "Work", "Gaming"]);
+    }
+
+    #[test]
+    fn names_focused_first_no_focused_passes_through_unchanged() {
+        // With no `is_active=true` activity the order is preserved.
+        let acts = vec![act(1, "Work", false), act(2, "Personal", false)];
+        let names = names_focused_first(&acts);
+        assert_eq!(names, vec!["Work", "Personal"]);
+    }
+
+    // ---- run_picker -----------------------------------------------------
+
+    #[test]
+    fn run_picker_selects_and_dispatches_switch() {
+        // Two IPC calls: Activities (for the menu), then SwitchActivity
+        // (after picker returns Selected). MockClient pins the order.
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![
+                act(1, "Work", true),
+                act(2, "Personal", false),
+            ])),
+        );
+        client.expect(switch_req("Personal"), Reply::Ok(Response::Handled));
+
+        let pick = |prompt: &str, items: &[String]| -> Result<PickerOutcome, CliError> {
+            assert_eq!(prompt, "Switch to activity:");
+            // Focused-first reordering: Work (focused) precedes Personal.
+            assert_eq!(items, &["Work".to_owned(), "Personal".to_owned()]);
+            Ok(PickerOutcome::Selected("Personal".to_owned()))
+        };
+
+        run_picker(&mut client, pick).expect("happy path succeeds");
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn run_picker_empty_activities_short_circuits_silently() {
+        // Empty activity list: exactly one IPC call (Activities), no
+        // pick invocation, no Switch dispatch. Exits Ok silently.
+        let mut client = MockClient::new();
+        client.expect(Request::Activities, Reply::Ok(Response::Activities(vec![])));
+
+        let pick = |_prompt: &str, _items: &[String]| -> Result<PickerOutcome, CliError> {
+            panic!("pick must not be called when activity list is empty");
+        };
+
+        run_picker(&mut client, pick).expect("empty list short-circuits Ok");
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn run_picker_cancellation_skips_switch_dispatch() {
+        // User dismisses the menu → no Switch IPC call. Only one
+        // queued reply (Activities); if `run_picker` dispatched a
+        // Switch the MockClient would panic on unexpected request.
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![act(1, "Work", true)])),
+        );
+
+        let pick = |_prompt: &str, _items: &[String]| -> Result<PickerOutcome, CliError> {
+            Ok(PickerOutcome::Cancelled)
+        };
+
+        run_picker(&mut client, pick).expect("cancellation is silent Ok");
         client.assert_consumed_in_order();
     }
 }

@@ -73,17 +73,28 @@ fn switch_named_no_socket_exits_69() {
 }
 
 #[test]
-fn switch_no_arg_picker_stub_exits_70() {
-    // `switch <name>` is now wired and would attempt to connect to
-    // $NIRI_SOCKET, so this test pins the still-stub picker path:
-    // `switch` with no arg keeps returning NotImplemented until the
-    // fuzzel picker lands.
+fn switch_no_arg_no_socket_exits_69() {
+    // `switch` with no arg now opens the fuzzel picker. With
+    // `$NIRI_SOCKET` unset, two distinct paths can produce exit 69:
+    //
+    // 1. If `fuzzel` IS installed on this host (the common case on dev
+    //    machines), `which fuzzel` succeeds but `Request::Activities`
+    //    fails on the missing socket → `SocketUnavailable` with the IPC
+    //    stderr message.
+    // 2. If `fuzzel` is NOT installed, `which fuzzel` short-circuits to
+    //    `SocketUnavailable` with the missing-fuzzel stderr message.
+    //
+    // Both routes share exit code 69. We deliberately do not assert the
+    // stderr text — the assertion target is the wire-up (no-arg branch
+    // is routed through the picker/IPC path, not the `NotImplemented`
+    // stub it used to fall through to). A regression to exit 70 would
+    // mean the no-arg branch silently fell back to the stub.
     Command::cargo_bin(BIN)
         .unwrap()
         .args(["switch"])
+        .env_remove("NIRI_SOCKET")
         .assert()
-        .code(70)
-        .stderr(contains("subcommand not yet implemented: switch"));
+        .code(69);
 }
 
 #[test]

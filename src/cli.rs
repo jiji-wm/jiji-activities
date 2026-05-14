@@ -7,12 +7,13 @@
 //! pinned by the integration tests in `tests/cli.rs` so accidental
 //! subcommand drops surface as test failures rather than silent regressions.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::error::CliError;
 use crate::ipc;
 use crate::list::{self, ListOpts};
+use crate::picker;
 use crate::switch;
 
 /// Top-level CLI entry. `--version` and `--help` are handled by clap
@@ -90,7 +91,19 @@ fn cmd_switch(name: Option<String>) -> Result<()> {
             let mut client = ipc::make_client();
             switch::run(client.as_mut(), &n)
         }
-        None => Err(CliError::NotImplemented("switch").into()),
+        None => {
+            // Verify `fuzzel` is on $PATH BEFORE any IPC round-trip so a
+            // missing-dep failure surfaces with a fuzzel-naming stderr
+            // message ("...command not found on $PATH...") rather than
+            // the generic "niri socket unavailable" the IPC layer would
+            // produce on a disconnected socket. `run_picker` would also
+            // hit this via `pick_one`'s internal re-check, but only
+            // after the Activities IPC call — which is the wrong order
+            // for diagnostics.
+            picker::ensure_available().context("running switch picker")?;
+            let mut client = ipc::make_client();
+            switch::run_picker(client.as_mut(), picker::pick_one).context("running switch picker")
+        }
     }
 }
 

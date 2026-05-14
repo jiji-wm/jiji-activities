@@ -12,6 +12,7 @@ mod cli;
 mod error;
 mod ipc;
 mod list;
+mod picker;
 mod switch;
 
 fn main() -> ExitCode {
