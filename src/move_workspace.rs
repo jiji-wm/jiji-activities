@@ -353,4 +353,38 @@ mod tests {
         run_picker(&mut client, pick).expect("cancellation is silent Ok");
         client.assert_consumed_in_order();
     }
+
+    #[test]
+    fn run_picker_wrong_activities_variant_is_malformed() {
+        // If the compositor replies with a non-Activities variant to the
+        // first IPC call, `run_picker` must surface WrongVariant (exit
+        // 65) before ever reaching the pick closure.
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Version("v".into())),
+        );
+
+        let pick = |_prompt: &str, _items: &[String]| -> Result<PickerOutcome, CliError> {
+            panic!("pick must not be called on a malformed Activities response");
+        };
+
+        let err = run_picker(&mut client, pick).expect_err("wrong variant must fail");
+        let cli_err = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<CliError>())
+            .expect("CliError must be in chain");
+        match cli_err {
+            CliError::MalformedResponse(MalformedResponseSource::WrongVariant {
+                expected,
+                got,
+            }) => {
+                assert_eq!(*expected, "Response::Activities");
+                assert_eq!(got, "Response::Version");
+            }
+            other => panic!("expected WrongVariant, got {other:?}"),
+        }
+        assert_eq!(cli_err.exit_code(), 65);
+        client.assert_consumed_in_order();
+    }
 }
