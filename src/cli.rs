@@ -1,15 +1,14 @@
-//! Clap-derive subcommand surface and per-subcommand stub dispatch.
+//! Clap-derive subcommand surface and per-subcommand dispatch.
 //!
-//! Each subcommand currently dispatches to a `cmd_<name>` stub that
-//! returns [`CliError::NotImplemented`] (exit code 70). Each stub body
-//! will be replaced with a real IPC call against `niri-ipc` as the
-//! subcommands are wired up; the dispatch shape and CLI surface are
-//! pinned by the integration tests in `tests/cli.rs` so accidental
-//! subcommand drops surface as test failures rather than silent regressions.
+//! Each subcommand routes to a `cmd_<name>` helper. Wired-up subcommands
+//! (`switch`, `list`, `assign-workspace`) issue real IPC; unwired ones
+//! return [`CliError::NotImplemented`] (exit 70). The dispatch shape and
+//! CLI surface are pinned by `tests/cli.rs`.
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+use crate::assign_workspace;
 use crate::error::CliError;
 use crate::ipc;
 use crate::list::{self, ListOpts};
@@ -120,7 +119,14 @@ fn cmd_move_workspace(_name: Option<String>) -> Result<()> {
 }
 
 fn cmd_assign_workspace() -> Result<()> {
-    Err(CliError::NotImplemented("assign-workspace").into())
+    // Verify `rofi` is on $PATH BEFORE any IPC round-trip so a
+    // missing-dep failure surfaces with a rofi-naming stderr message
+    // rather than the generic "niri socket unavailable" the IPC layer
+    // would produce on a disconnected socket.
+    picker::multi_select::ensure_available()
+        .context("verifying assign-workspace picker availability")?;
+    let mut client = ipc::make_client();
+    assign_workspace::run(client.as_mut()).context("running assign-workspace picker")
 }
 
 fn cmd_create(_name: String) -> Result<()> {

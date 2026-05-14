@@ -3,12 +3,14 @@
 //! This module wraps a `fuzzel --dmenu` invocation behind a small typed
 //! API: callers hand it a prompt and a slice of items, and receive either
 //! the user's selection or a cancellation signal. The intent is that the
-//! picker is a leaf module — no IPC, no clap surface, just stdio piping.
+//! single-select picker is a leaf module — no IPC, no clap surface, just
+//! stdio piping.
 //!
 //! ## Cancellation contract
 //!
 //! `fuzzel` exits non-zero with empty stdout when the user dismisses the
-//! menu (Escape, ctrl-C, etc.). The picker classifies that as
+//! menu (Escape, ctrl-C, etc.). The single-select picker classifies that
+//! as
 //! [`PickerOutcome::Cancelled`] — **not** an error. Defensive fallbacks
 //! (non-zero exit with stdout, exit 0 with empty stdout) are also folded
 //! into `Cancelled` so the caller never has to second-guess the wire-level
@@ -30,7 +32,7 @@ use std::process::{Command, Stdio};
 
 use crate::error::CliError;
 
-/// Outcome of a picker invocation.
+/// Outcome of a single-select picker invocation.
 ///
 /// Cancellation is **not** an error — see module docs.
 #[derive(Debug, PartialEq, Eq)]
@@ -38,7 +40,7 @@ pub(crate) enum PickerOutcome {
     /// User selected one item. The carried `String` is the first line of
     /// `fuzzel`'s stdout, trimmed of trailing whitespace.
     Selected(String),
-    /// User dismissed the picker without selecting anything.
+    /// User dismissed the single-select picker without selecting anything.
     Cancelled,
 }
 
@@ -373,9 +375,9 @@ mod tests {
 
     #[test]
     fn items_to_payload_empty_is_empty_string() {
-        // Caller short-circuits before invoking the picker for empty
-        // lists, but the helper still has to be well-defined on []
-        // because the contract is "pure transformation."
+        // Caller short-circuits before invoking the single-select picker
+        // for empty lists, but the helper still has to be well-defined on
+        // [] because the contract is "pure transformation."
         assert_eq!(items_to_payload(&[]), "");
     }
 

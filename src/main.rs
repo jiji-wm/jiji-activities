@@ -8,6 +8,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
+mod assign_workspace;
 mod cli;
 mod error;
 mod ipc;

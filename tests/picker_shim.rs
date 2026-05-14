@@ -1,4 +1,5 @@
-//! Integration tests for the `fuzzel`-backed picker via a shim binary.
+//! Integration tests for the `fuzzel`-backed **single-select** picker via
+//! a fuzzel shim binary.
 //!
 //! These tests prove the spawn-and-pipe flow end-to-end without
 //! depending on a real `fuzzel` install on the test host. The strategy:
@@ -10,13 +11,14 @@
 //!    (via `env_clear` + explicit `env("PATH", ...)`) so the shim is the
 //!    only `fuzzel` the binary can resolve.
 //! 4. For tests that need the IPC `Request::Activities` round-trip to
-//!    succeed (so the picker is actually reached), bind a one-shot
-//!    Unix listener and point `$NIRI_SOCKET` at it. The listener
+//!    succeed (so the single-select picker is actually reached), bind a
+//!    one-shot Unix listener and point `$NIRI_SOCKET` at it. The listener
 //!    replies with a fixed `Response::Activities` payload then exits.
 //!
 //! `env_clear` is load-bearing — leaving the parent's `$PATH` in place
 //! would let the real `fuzzel` on the developer's machine shadow the
 //! shim and turn these into integration tests against a live `fuzzel`.
+//! See `rofi_shim.rs` for the parallel multi-select picker tests.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write as _};
@@ -140,9 +142,9 @@ fn spawn_one_shot_activities_listener(tag: &str) -> PathBuf {
 #[test]
 fn fuzzel_cancel_exits_0() {
     // Full pipe-and-read flow: socket listener answers Activities, then
-    // the picker spawns the shim, which simulates a user dismissal
-    // (exit 1 with empty stdout). The CLI must classify that as
-    // cancellation and exit 0 silently.
+    // the single-select fuzzel shim simulates a user dismissal (exit 1
+    // with empty stdout). The CLI must classify that as cancellation and
+    // exit 0 silently.
     let shim = ShimDir::new("cancel");
     shim.install_fuzzel("exit 1\n");
     let sock = spawn_one_shot_activities_listener("cancel");
@@ -290,9 +292,10 @@ fn fuzzel_missing_from_path_exits_69() {
 fn run_picker_empty_activities_warns_and_exits_zero() {
     // End-to-end pin of the empty-list UX: the one-shot listener replies
     // with an empty `Activities` payload; `run_picker` must short-circuit
-    // before spawning the picker (the shim touches a sentinel file on
-    // entry, and the test asserts the sentinel does NOT exist afterward).
-    // Exit 0 + stderr diagnostic naming the empty-list cause.
+    // before spawning the single-select picker (the fuzzel shim touches a
+    // sentinel file on entry, and the test asserts the sentinel does NOT
+    // exist afterward). Exit 0 + stderr diagnostic naming the empty-list
+    // cause.
     let shim = ShimDir::new("empty-activities");
     let sentinel = shim.as_path().join("shim-invoked.sentinel");
     // Sentinel-file strategy: if the shim is ever reached it creates

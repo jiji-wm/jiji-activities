@@ -103,6 +103,29 @@ fn no_args_exits_64() {
 }
 
 #[test]
+fn assign_workspace_no_socket_exits_69() {
+    // Pins the wiring: `assign-workspace` dispatches through the picker
+    // availability check + IPC factory rather than the `NotImplemented`
+    // stub it used to fall back to. With `$NIRI_SOCKET` unset, two
+    // distinct routes can produce exit 69:
+    //
+    // 1. If `rofi` IS installed on this host, the availability check
+    //    passes and the first IPC call fails on the missing socket →
+    //    `SocketUnavailable`.
+    // 2. If `rofi` is NOT installed, the availability check
+    //    short-circuits to `PickerUnavailable`.
+    //
+    // Both share exit code 69. A regression to exit 70 would mean
+    // assign-workspace silently fell back to the NotImplemented stub.
+    Command::cargo_bin(BIN)
+        .unwrap()
+        .arg("assign-workspace")
+        .env_remove("NIRI_SOCKET")
+        .assert()
+        .code(69);
+}
+
+#[test]
 fn toggle_alias_routes_to_switch_previous() {
     Command::cargo_bin(BIN)
         .unwrap()
