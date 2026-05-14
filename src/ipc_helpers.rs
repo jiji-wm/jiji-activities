@@ -168,6 +168,60 @@ mod tests {
         );
     }
 
+    /// Pins every known [`Response`] variant so an upstream addition that
+    /// silently degrades to `"Response::<unknown>"` surfaces as a test
+    /// failure rather than a silent wrong-name in `WrongVariant::got`.
+    ///
+    /// When niri-ipc adds a new variant: add a row here and update the
+    /// `variant_name` match arm above. Both must move together.
+    #[test]
+    fn variant_name_covers_all_known_variants() {
+        use niri_ipc::{KeyboardLayouts, OutputConfigChanged, Overview, Response};
+        let cases: &[(&Response, &str)] = &[
+            (&Response::Handled, "Response::Handled"),
+            (&Response::Version("v".into()), "Response::Version"),
+            (
+                &Response::Outputs(std::collections::HashMap::new()),
+                "Response::Outputs",
+            ),
+            (&Response::Workspaces(vec![]), "Response::Workspaces"),
+            (&Response::Windows(vec![]), "Response::Windows"),
+            (&Response::Layers(vec![]), "Response::Layers"),
+            (
+                &Response::KeyboardLayouts(KeyboardLayouts {
+                    names: vec![],
+                    current_idx: 0,
+                }),
+                "Response::KeyboardLayouts",
+            ),
+            (&Response::FocusedOutput(None), "Response::FocusedOutput"),
+            (&Response::Activities(vec![]), "Response::Activities"),
+            (
+                &Response::FocusedActivity(niri_ipc::Activity::default()),
+                "Response::FocusedActivity",
+            ),
+            (&Response::FocusedWindow(None), "Response::FocusedWindow"),
+            (&Response::PickedWindow(None), "Response::PickedWindow"),
+            (&Response::PickedColor(None), "Response::PickedColor"),
+            (
+                &Response::OutputConfigChanged(OutputConfigChanged::Applied),
+                "Response::OutputConfigChanged",
+            ),
+            (
+                &Response::OverviewState(Overview { is_open: false }),
+                "Response::OverviewState",
+            ),
+            (&Response::Casts(vec![]), "Response::Casts"),
+        ];
+        for (resp, expected) in cases {
+            assert_eq!(
+                variant_name(resp),
+                *expected,
+                "variant_name mismatch for {resp:?}",
+            );
+        }
+    }
+
     // ---- send_expect_handled ----
 
     #[test]
