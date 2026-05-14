@@ -76,7 +76,7 @@ Each subsection has a **Proposed:** lead sentence stating the agent recommendati
 |---|---|---|
 | 0 | EX_OK | success, including silent picker cancellation |
 | 64 | EX_USAGE | clap argument errors, unknown subcommand |
-| 65 | EX_DATAERR | malformed or unintelligible IPC response (wrong variant, decode failure, or compositor returned `Err(String)`) |
+| 65 | EX_DATAERR | malformed IPC response: wrong `Response` variant (`MalformedResponseSource::WrongVariant`), wire JSON decode failure (`Decode`), or compositor returned `Reply::Err(String)` (`Server`) |
 | 66 | EX_NOINPUT | activity name not found |
 | 69 | EX_UNAVAILABLE | `$NIRI_SOCKET` unset; connect refused |
 | 70 | EX_SOFTWARE | panic, programming-error path (a stub left unimplemented, etc.) |
@@ -85,6 +85,8 @@ Each subsection has a **Proposed:** lead sentence stating the agent recommendati
 **Picker cancellation is exit 0**, not an error: fuzzel exiting non-zero with empty stdout means the user backed out, which is a normal outcome. Only IPC errors, type-mismatch errors, and explicit failures map to non-zero.
 
 `anyhow::Error` carries chained context for stderr; the `main()` dispatcher does `match err.downcast_ref::<CliError>()` against a typed enum (`SocketUnavailable`, `ActivityNotFound`, `MalformedResponse`, `CantCreate`, ...) to pick the exit code. Fallback for un-typed errors is exit 1.
+
+`MalformedResponse` carries a typed `MalformedResponseSource` with three variants — `Decode` (wire parse failure, holds the `serde_json::Error`), `Server` (compositor returned `Reply::Err(String)`), and `WrongVariant` (the wire parsed cleanly but the `Response` variant did not match the request that was sent). Splitting these typed-rather-than-stringified keeps the `serde_json::Error` chain reachable via `Error::source` for `{:#}` formatting, and lets stderr name the failure mode precisely (e.g. `expected Response::Activities, got Response::Workspaces(...)` for the `WrongVariant` case).
 
 ### 4.2 IPC strategy: fork's `niri-ipc` via git+rev
 

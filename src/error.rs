@@ -20,12 +20,14 @@ use std::fmt;
 
 /// Source carrier for [`CliError::MalformedResponse`].
 ///
-/// The compositor can return a malformed reply in two distinct ways:
+/// The compositor can return a malformed reply in three distinct ways:
 /// the line on the wire fails to deserialize as a `Reply` (`Decode`),
-/// or the `Reply::Err(String)` arm fires with a server-supplied error
-/// message (`Server`). Keeping these as typed sources rather than
-/// stringifying eagerly lets `Display` differentiate the two and
-/// preserves the underlying `serde_json::Error` chain through
+/// the `Reply::Err(String)` arm fires with a server-supplied error
+/// message (`Server`), or the line decoded cleanly but the resulting
+/// `Response` variant did not match the `Request` that was sent
+/// (`WrongVariant`). Keeping these as typed sources rather than
+/// stringifying eagerly lets `Display` name the failure mode precisely
+/// and preserves the underlying `serde_json::Error` chain through
 /// [`std::error::Error::source`].
 #[derive(Debug)]
 pub(crate) enum MalformedResponseSource {
@@ -34,6 +36,23 @@ pub(crate) enum MalformedResponseSource {
     /// The compositor responded with `Reply::Err(String)`. The string
     /// is opaque from our side; we surface it verbatim.
     Server(String),
+    /// The reply parsed as a `Reply::Ok(Response)` but the inner
+    /// `Response` variant did not match the request that was sent
+    /// (e.g. we asked for `Activities` and got `Workspaces`).
+    ///
+    /// `expected` is the static name of the awaited variant
+    /// (`"Response::Activities"`); `got` is the Debug-formatted
+    /// representation of whatever arrived. Distinct from `Decode`
+    /// (the wire parsed) and `Server` (the compositor was happy).
+    //
+    // Allowed dead-code: the first production constructor lands with
+    // the `list` subcommand wiring, which is the first call site to
+    // match a typed `Response` variant against an expected one. Remove
+    // this allowance once `list` (or any later subcommand) builds the
+    // variant in production. Variant-scoped rather than enum-scoped so
+    // accidental removal of `Server` / `Decode` producers still warns.
+    #[allow(dead_code)]
+    WrongVariant { expected: &'static str, got: String },
 }
 
 impl fmt::Display for MalformedResponseSource {
@@ -41,6 +60,9 @@ impl fmt::Display for MalformedResponseSource {
         match self {
             MalformedResponseSource::Decode(e) => write!(f, "decode error: {e}"),
             MalformedResponseSource::Server(msg) => write!(f, "server error: {msg}"),
+            MalformedResponseSource::WrongVariant { expected, got } => {
+                write!(f, "expected {expected}, got {got}")
+            }
         }
     }
 }
@@ -133,8 +155,11 @@ impl std::error::Error for CliError {
         match self {
             CliError::SocketUnavailable(io) => Some(io),
             CliError::MalformedResponse(MalformedResponseSource::Decode(e)) => Some(e),
-            // `Server(String)` has no further source — the string IS the leaf.
-            CliError::MalformedResponse(MalformedResponseSource::Server(_)) => None,
+            // `Server` and `WrongVariant` carry only strings — the
+            // message IS the leaf, no nested error to expose.
+            CliError::MalformedResponse(
+                MalformedResponseSource::Server(_) | MalformedResponseSource::WrongVariant { .. },
+            ) => None,
             CliError::Usage(_)
             | CliError::ActivityNotFound(_)
             | CliError::NotImplemented(_)
@@ -187,6 +212,22 @@ mod tests {
             CliError::MalformedResponse(MalformedResponseSource::Decode(sample_decode_error()))
                 .exit_code(),
             65,
+        );
+    }
+
+    #[test]
+    fn malformed_response_wrong_variant_is_65() {
+        // Wrong-variant mismatches share the same exit code as decode
+        // and server-side errors — the typed source carrier only
+        // changes the Display output, not the exit-code contract.
+        let err = CliError::MalformedResponse(MalformedResponseSource::WrongVariant {
+            expected: "Response::Activities",
+            got: "Response::Workspaces([])".into(),
+        });
+        assert_eq!(err.exit_code(), 65);
+        assert!(
+            format!("{err}").contains("expected Response::Activities"),
+            "Display must name the expected variant for stderr clarity",
         );
     }
 
