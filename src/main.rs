@@ -12,6 +12,7 @@ mod cli;
 mod error;
 mod ipc;
 mod list;
+mod switch;
 
 fn main() -> ExitCode {
     let parsed = match cli::Cli::try_parse() {

@@ -13,6 +13,7 @@ use clap::{Parser, Subcommand};
 use crate::error::CliError;
 use crate::ipc;
 use crate::list::{self, ListOpts};
+use crate::switch;
 
 /// Top-level CLI entry. `--version` and `--help` are handled by clap
 /// directly; everything else routes through [`Cmd`] and `dispatch`.
@@ -83,8 +84,14 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
     }
 }
 
-fn cmd_switch(_name: Option<String>) -> Result<()> {
-    Err(CliError::NotImplemented("switch").into())
+fn cmd_switch(name: Option<String>) -> Result<()> {
+    match name {
+        Some(n) => {
+            let mut client = ipc::make_client();
+            switch::run(client.as_mut(), &n)
+        }
+        None => Err(CliError::NotImplemented("switch").into()),
+    }
 }
 
 fn cmd_switch_previous() -> Result<()> {

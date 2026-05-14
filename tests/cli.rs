@@ -58,10 +58,29 @@ fn unknown_subcommand_exits_64() {
 }
 
 #[test]
-fn switch_stub_exits_70() {
+fn switch_named_no_socket_exits_69() {
+    // Pins the binary-boundary wiring: `switch <name>` dispatches
+    // through switch::run (not the NotImplemented stub), which hits the
+    // IPC factory. With $NIRI_SOCKET unset the factory returns
+    // SocketUnavailable (exit 69) — proving the named path is wired end-
+    // to-end rather than returning NotImplemented (exit 70).
     Command::cargo_bin(BIN)
         .unwrap()
-        .args(["switch", "foo"])
+        .args(["switch", "Work"])
+        .env_remove("NIRI_SOCKET")
+        .assert()
+        .code(69);
+}
+
+#[test]
+fn switch_no_arg_picker_stub_exits_70() {
+    // `switch <name>` is now wired and would attempt to connect to
+    // $NIRI_SOCKET, so this test pins the still-stub picker path:
+    // `switch` with no arg keeps returning NotImplemented until the
+    // fuzzel picker lands.
+    Command::cargo_bin(BIN)
+        .unwrap()
+        .args(["switch"])
         .assert()
         .code(70)
         .stderr(contains("subcommand not yet implemented: switch"));
