@@ -30,7 +30,7 @@ Lifted from compositor DD §8.2; refined here per the error/exit-code spec in §
 ### `niri-activities switch [<name>]`
 - IPC: `Action::SwitchActivity { name }` (named) or fuzzel picker → same action (no arg).
 - Success: silent, exit 0.
-- Errors: unknown name → `ActivityNotFound` (66); already-active → no-op exit 0.
+- Errors: unknown name → `ActivityNotFound` (66); already-active → no-op exit 0. Already-active is indistinguishable from newly-switched at the IPC layer: the compositor's layout-side `switch_activity` silently early-returns and the dispatcher still replies `Response::Handled`. The CLI relies on this; no client-side already-active probe.
 - *Picker UX is PoC-quality in v1 (§1 caveat); fuzzel is "the one we have." A v2 redesign pass is parked in Appendix B.*
 
 ### `niri-activities switch-previous` (alias: `toggle`)
@@ -77,7 +77,7 @@ Each subsection has a **Proposed:** lead sentence stating the agent recommendati
 | 0 | EX_OK | success, including silent picker cancellation |
 | 64 | EX_USAGE | clap argument errors, unknown subcommand |
 | 65 | EX_DATAERR | malformed IPC response: wrong `Response` variant (`MalformedResponseSource::WrongVariant`), wire JSON decode failure (`Decode`), or compositor returned `Reply::Err(String)` (`Server`) |
-| 66 | EX_NOINPUT | activity name not found |
+| 66 | EX_NOINPUT | activity name not found (matched against the compositor's wire error string `"activity not found"`; any other `Reply::Err` payload routes to 65 via `MalformedResponse::Server`) |
 | 69 | EX_UNAVAILABLE | `$NIRI_SOCKET` unset; connect refused |
 | 70 | EX_SOFTWARE | panic, programming-error path (a stub left unimplemented, etc.) |
 | 73 | EX_CANTCREAT | create activity failed (name collision, config-edit failure) |
@@ -310,10 +310,12 @@ Each box is a human-gated decision. The architect refuses to plan Phase 3.1+ unt
 
 ### Phase 3.4 — `switch <name>` subcommand (no picker yet)
 
-- [ ] Dispatch IPC `Action::SwitchActivity { name }`.
-- [ ] Unknown name → `ActivityNotFound` → exit 66 (the compositor returns a structured error; map it).
-- [ ] Already-active name → no-op silently, exit 0 (verify against compositor DD §5.3 — switching to the active activity is a documented no-op).
-- [ ] Integration tests: golden, unknown name, already-active.
+- [x] Dispatch IPC `Action::SwitchActivity { name }`. Landed as `8ae7384`.
+- [x] Unknown name → `ActivityNotFound` → exit 66 (the compositor returns a structured error; map it). Landed as `8ae7384`.
+- [x] Already-active name → no-op silently, exit 0 (verify against compositor DD §5.3 — switching to the active activity is a documented no-op). Landed as `8ae7384`.
+- [x] Integration tests: golden, unknown name, already-active. Landed as `8ae7384`.
+
+**Reviewed:** 2026-05-14 (`8ae7384`, was `899bad3` before the post-review amend). Phase 3.4 — all four `switch <name>` boxes in one squashed commit: `src/switch.rs` wires `Action::SwitchActivity { activity: Name(name) }`, routes the compositor's literal `"activity not found"` wire string to `CliError::ActivityNotFound` (exit 66), falls through on any other `Reply::Err` to `MalformedResponse(Server)` (exit 65), and maps `Response::Handled` to `Ok(())` for both the real-switch and already-active cases. Reviewed across four review aspects (general code quality, silent-failure surface, comment accuracy, test coverage). **Finding worth surfacing (synthetic-vs-real wire string discipline):** the implementer's initial `send_expect_handled` test injected `"activity switch blocked: gesture in flight"` — plausible-sounding but not a real compositor emission. The fixer replaced it with `"activity switch blocked: workspace switch gesture"` (matching the actual format template in `niri/gajdusek/src/layout/mod.rs`). Future action-returning subcommands (Phase 3.6) should cross-check test wire strings against the fork's layout-side format templates, not invent them. **Finding worth surfacing (negative-space tests for strict-equality string matches):** the CLI matches `msg == "activity not found"` exactly, but no test originally pinned that the match is strict-equality rather than a prefix or substring check. The fixer added two: suffix-with-name (`"activity not found: Work"`) and capitalized (`"Activity not found"`). Future Phase 3.6 sub-phases that pattern-match wire strings should follow the same negative-space pattern. **Finding worth surfacing (binary-boundary integration test pattern):** the DD's "integration tests" box was satisfied with a `$NIRI_SOCKET`-unset → exit 69 test (`switch_named_no_socket_exits_69` in `tests/cli.rs`). This pins the wiring direction at the process boundary without requiring a fake-socket harness — a cheap, replicable precedent for Phase 3.6. Post-review fixes squashed into `8ae7384`: two negative-space unit tests added (`not_found_suffix_routes_to_malformed`, `not_found_capitalized_routes_to_malformed`) pinning strict-equality; one binary-boundary integration test added (`switch_named_no_socket_exits_69` in `tests/cli.rs`); `send_expect_handled` other-server-error test wire string corrected to a real compositor format string. DD also amended in this commit: §3 `switch` already-active clarification added; §4.1 row 66 trigger expanded with wire-string match note; Appendix C extended with one new entry. Same 72 tests green (was 62; delta +10: +7 from initial implementation, +3 from fixer additions — 2 negative-space unit tests + 1 binary-boundary integration test); `cargo clippy --all --all-targets` clean. Proceed to Phase 3.5 (fuzzel picker) with the reviewed base.
 
 ### Phase 3.5 — fuzzel picker (single-select)
 
@@ -415,3 +417,5 @@ The v1 picker integration is PoC-quality (§1 caveat). Once the binary is functi
 - **`CliError::OutputPipeClosed` Display message** — currently `"stdout pipe closed"`. Under the current call graph this variant is unreachable in production (the `main.rs` suppression always fires first), but if a future code path reaches `map_exit` with this variant a more explanatory message would help. From review of `8fb13cf` (2026-05-14). Batch into the next `list.rs` / `error.rs` touch.
 
 - **`classify_write_err` vs. `is_stdout_pipe_closed` error-traversal asymmetry** — `classify_write_err` uses `root_cause()` while `is_stdout_pipe_closed` uses `chain().any()`; currently symmetric in behavior because no write site has intermediate non-`io::Error` wrappers. If a future render fn wraps `io::Error` in a non-`Error` type, `root_cause()` would still traverse via `source()`. From review of `8fb13cf` (2026-05-14). Trivial defensive note — consider symmetrising to `chain().any()` in `classify_write_err` on the next touch.
+
+- **Typed `Reply::Err` variants on the compositor side** — every action-subcommand sub-phase (3.4, 3.6) currently substring-matches a wire string (e.g., `msg == "activity not found"`) to route to a typed `CliError` variant. A future fork-side change to `DoActionError` that surfaces a structured error code — rather than `format!("{}")`-stringified text — would let the CLI drop the string-match scaffolding entirely and match on discriminant instead. This is a cross-loop coordination point: the compositor loop would need to introduce a structured error type in the IPC layer, and the CLI loop would consume it via a rev-bump sub-phase. From review of `8ae7384` (2026-05-14). Deferred because the fork's IPC is not yet stable enough to commit to a structured error-code shape.
