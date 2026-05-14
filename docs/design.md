@@ -62,7 +62,7 @@ Lifted from compositor DD §8.2; refined here per the error/exit-code spec in §
 - **Chezmoi (or any other dotfiles manager) is out of scope.** `save` writes to `$XDG_CONFIG_HOME/niri/config.kdl` directly, the same way every other niri-ecosystem app edits its own config. Users on chezmoi-managed setups must `chezmoi re-add` (or equivalent) after `save` to keep their dotfiles repo in sync — same coupling as for any other tool that edits niri/waybar/swaync configs. Detecting and integrating with chezmoi would add a runtime dep and a coupling we don't want; documented here as a known limitation rather than fixed.
 
 ### `niri-activities list [--json | --format=<spec>]`
-- IPC: `Request::Activities`. Output format per §4.5.
+- IPC: `Request::Activities` + `Request::Workspaces` + `Request::Windows` (three sequential calls per invocation; client-side join populates the per-activity workspace list and `window_count` documented in §4.5 — the wire-level `Activity` carries neither). Output format per §4.5.
 
 ## 4. Architectural decisions
 
@@ -208,6 +208,8 @@ This still leaves a visual seam (rofi's own ballot character via `-ballot-select
 
 Column widths are computed from the longest name + a 2-space gutter. Truncation rule: never truncate; if a name is wider than the terminal, the line wraps via the terminal's wrap behavior (no manual truncation).
 
+Counts pluralise on `n != 1`: `1 workspace` / `0 workspaces` / `12 workspaces`; same rule for `window` / `windows`. Zero activities → empty stdout (no header line, no trailing newline).
+
 **`--json` — machine-readable JSON.** Schema is wrapped in a top-level object carrying a `schema_version` integer so consumers can branch on shape changes without parsing failures. Bumping `schema_version` is a breaking change; additive fields (new optional keys) keep the version constant.
 
 ```json
@@ -226,6 +228,8 @@ Column widths are computed from the longest name + a 2-space gutter. Truncation 
   ]
 }
 ```
+
+When the activities list is empty, `--json` emits `{"schema_version": 1, "activities": []}` (the envelope is never omitted; consumers parse one shape unconditionally). The empty-stdout zero-case applies only to the default plain output.
 
 Consumers that don't care about versioning can read `.activities[]` directly via `jq`:
 
@@ -297,7 +301,7 @@ Each box is a human-gated decision. The architect refuses to plan Phase 3.1+ unt
 - [ ] Plain output per §4.5. Edge cases: zero activities → empty stdout; long names → no truncation.
 - [ ] `--json` output per §4.5; matches the documented schema exactly.
 - [ ] `--format=<spec>` per §4.5; unknown field → `EX_USAGE`.
-- [ ] `--json` and `--format=` mutually exclusive (clap-level).
+- [ ] `--json` and `--format=` mutually exclusive — regression test pins the clap-level `conflicts_with` rule (wiring already landed in the skeleton commit; this box adds the pinning test).
 - [ ] Integration tests via `MockClient` + `assert_cmd`: golden plain output (3 activities, focused middle), golden JSON, three `--format=` variants, zero-activities plain, zero-activities JSON.
 
 ### Phase 3.4 — `switch <name>` subcommand (no picker yet)
