@@ -11,6 +11,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::error::CliError;
+use crate::ipc;
+use crate::list::{self, ListOpts};
 
 /// Top-level CLI entry. `--version` and `--help` are handled by clap
 /// directly; everything else routes through [`Cmd`] and `dispatch`.
@@ -113,6 +115,16 @@ fn cmd_save(_name: String) -> Result<()> {
     Err(CliError::NotImplemented("save").into())
 }
 
-fn cmd_list(_json: bool, _format: Option<String>) -> Result<()> {
-    Err(CliError::NotImplemented("list").into())
+fn cmd_list(json: bool, format: Option<String>) -> Result<()> {
+    let mut client = ipc::make_client();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    list::run(
+        client.as_mut(),
+        ListOpts {
+            json,
+            format: format.as_deref(),
+        },
+        &mut out,
+    )
 }

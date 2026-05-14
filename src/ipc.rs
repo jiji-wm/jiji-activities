@@ -44,11 +44,6 @@ use crate::error::{CliError, MalformedResponseSource};
 /// `Response`. Implementations are synchronous and consume `&mut
 /// self` so a future stateful client (e.g. a connection pool) can
 /// fit the same trait without changing call sites.
-//
-// `dead_code` is allowed because the trait is established here ahead
-// of the subcommand call sites that will consume it. Drop the allow
-// once at least one subcommand routes through `make_client()`.
-#[allow(dead_code)]
 pub(crate) trait NiriClient {
     /// Sends `req` and returns the typed `Response`, or an
     /// [`IpcError`] classified by failure mode.
@@ -71,12 +66,6 @@ pub(crate) trait NiriClient {
 /// (`EX_NOINPUT`) because the compositor's error string is opaque to
 /// the CLI — we can't safely classify it as "input not found" without
 /// inspecting the string contents, which would be brittle.
-//
-// `dead_code` is allowed because the variants are constructed only
-// from `SocketClient::send` and `MockClient::send`, neither of which
-// is wired into a subcommand path yet. Drop once the IPC layer has
-// at least one production consumer.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum IpcError {
     /// `$NIRI_SOCKET` unset, connect refused, or read/write IO failure
@@ -190,13 +179,11 @@ impl NiriClient for SocketClient {
 // ----------------------------------------------------------------------
 
 #[cfg(not(test))]
-#[allow(dead_code)]
 pub(crate) fn make_client() -> Box<dyn NiriClient> {
     Box::new(SocketClient::new())
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 pub(crate) fn make_client() -> Box<dyn NiriClient> {
     if let Some(mock) = MOCK_OVERRIDE.with(|cell| cell.borrow_mut().take()) {
         mock
@@ -216,7 +203,6 @@ thread_local! {
 /// test running on the same thread.
 #[cfg(test)]
 #[must_use = "the mock override is cleared when this guard is dropped"]
-#[allow(dead_code)]
 pub(crate) struct MockGuard;
 
 #[cfg(test)]
@@ -233,7 +219,6 @@ impl Drop for MockGuard {
 /// sibling tests on the same thread see no leakage. Nested
 /// `install_mock` calls are not supported.
 #[cfg(test)]
-#[allow(dead_code)]
 pub(crate) fn install_mock(mock: MockClient) -> MockGuard {
     MOCK_OVERRIDE.with(|cell| {
         *cell.borrow_mut() = Some(Box::new(mock));
@@ -269,7 +254,6 @@ pub(crate) struct MockClient {
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 impl MockClient {
     pub(crate) fn new() -> Self {
         MockClient {
@@ -282,6 +266,13 @@ impl MockClient {
     /// the order they were queued.
     pub(crate) fn expect(&mut self, req: Request, reply: Reply) {
         self.queue.push_back((req, reply));
+    }
+
+    /// Returns the number of unconsumed `(request, reply)` pairs
+    /// remaining in the queue. Useful in tests that need to verify
+    /// exactly which IPC calls were issued without triggering a panic.
+    pub(crate) fn remaining_count(&self) -> usize {
+        self.queue.len()
     }
 
     /// Panics if the queue is non-empty. Call at the end of every
@@ -547,6 +538,16 @@ mod tests {
     }
 
     // ---- MockClient tests ----
+
+    #[test]
+    fn mock_client_remaining_count_tracks_queue() {
+        let mut client = MockClient::new();
+        assert_eq!(client.remaining_count(), 0);
+        client.expect(Request::Activities, Ok(Response::Activities(vec![])));
+        assert_eq!(client.remaining_count(), 1);
+        let _ = client.send(Request::Activities);
+        assert_eq!(client.remaining_count(), 0);
+    }
 
     #[test]
     fn mock_client_pops_in_order() {

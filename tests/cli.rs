@@ -90,3 +90,16 @@ fn list_json_and_format_conflict_exits_64() {
         .assert()
         .code(64);
 }
+
+#[test]
+fn list_unknown_format_field_exits_64() {
+    // The format-spec parser runs *before* any IPC connect attempt, so
+    // a bogus field name short-circuits to exit 64 regardless of
+    // whether `$NIRI_SOCKET` is set or reachable. Pin that end-to-end.
+    Command::cargo_bin(BIN)
+        .unwrap()
+        .args(["list", "--format", "bogus"])
+        .assert()
+        .code(64)
+        .stderr(contains("unknown field: bogus"));
+}

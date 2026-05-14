@@ -15,6 +15,7 @@
 //! | `SocketUnavailable`  |   69 | `$NIRI_SOCKET` unreachable / IPC failed  |
 //! | `NotImplemented`     |   70 | subcommand stub not yet wired            |
 //! | `CantCreate`         |   73 | `create`/`save` could not produce target |
+//! | `OutputPipeClosed`   |    0 | stdout write hit EPIPE (e.g. `| head`); suppressed to exit 0 |
 
 use std::fmt;
 
@@ -44,14 +45,6 @@ pub(crate) enum MalformedResponseSource {
     /// (`"Response::Activities"`); `got` is the Debug-formatted
     /// representation of whatever arrived. Distinct from `Decode`
     /// (the wire parsed) and `Server` (the compositor was happy).
-    //
-    // Allowed dead-code: the first production constructor lands with
-    // the `list` subcommand wiring, which is the first call site to
-    // match a typed `Response` variant against an expected one. Remove
-    // this allowance once `list` (or any later subcommand) builds the
-    // variant in production. Variant-scoped rather than enum-scoped so
-    // accidental removal of `Server` / `Decode` producers still warns.
-    #[allow(dead_code)]
     WrongVariant { expected: &'static str, got: String },
 }
 
@@ -118,6 +111,17 @@ pub(crate) enum CliError {
     /// (name collision, compositor refused). Exit code 73
     /// (`EX_CANTCREAT`).
     CantCreate(String),
+
+    /// A stdout write failed with `EPIPE` — the pipe consumer (e.g.
+    /// `head -1`) closed its read end before the CLI finished writing.
+    /// This is not an error: `main()` suppresses it to exit 0.
+    ///
+    /// **Precedence contract:** `OutputPipeClosed` is only produced by
+    /// `list::run` for stdout write / flush failures whose underlying
+    /// `io::Error::kind()` is `BrokenPipe`. IPC-layer `BrokenPipe`
+    /// (compositor crash mid-write) surfaces via the normal
+    /// `SocketUnavailable` path and is not suppressed.
+    OutputPipeClosed,
 }
 
 impl CliError {
@@ -133,6 +137,8 @@ impl CliError {
             CliError::SocketUnavailable(_) => 69,
             CliError::NotImplemented(_) => 70,
             CliError::CantCreate(_) => 73,
+            // Suppressed to 0 by main() before exit_code() is consulted.
+            CliError::OutputPipeClosed => 0,
         }
     }
 }
@@ -146,6 +152,7 @@ impl fmt::Display for CliError {
             CliError::SocketUnavailable(io) => write!(f, "niri socket unavailable: {io}"),
             CliError::NotImplemented(name) => write!(f, "subcommand not yet implemented: {name}"),
             CliError::CantCreate(msg) => write!(f, "cannot create activity: {msg}"),
+            CliError::OutputPipeClosed => write!(f, "stdout pipe closed"),
         }
     }
 }
@@ -163,7 +170,8 @@ impl std::error::Error for CliError {
             CliError::Usage(_)
             | CliError::ActivityNotFound(_)
             | CliError::NotImplemented(_)
-            | CliError::CantCreate(_) => None,
+            | CliError::CantCreate(_)
+            | CliError::OutputPipeClosed => None,
         }
     }
 }
@@ -252,6 +260,14 @@ mod tests {
     #[test]
     fn cant_create_is_73() {
         assert_eq!(CliError::CantCreate("dup name".into()).exit_code(), 73);
+    }
+
+    #[test]
+    fn output_pipe_closed_exit_code_is_zero() {
+        // OutputPipeClosed is suppressed to exit 0 in main() before
+        // exit_code() is consulted; the exit_code() value of 0 documents
+        // that contract.
+        assert_eq!(CliError::OutputPipeClosed.exit_code(), 0);
     }
 
     #[test]
