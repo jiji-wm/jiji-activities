@@ -10,6 +10,7 @@ use clap::Parser;
 
 mod cli;
 mod error;
+mod ipc;
 
 fn main() -> ExitCode {
     let parsed = match cli::Cli::try_parse() {

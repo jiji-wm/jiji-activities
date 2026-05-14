@@ -18,6 +18,33 @@
 
 use std::fmt;
 
+/// Source carrier for [`CliError::MalformedResponse`].
+///
+/// The compositor can return a malformed reply in two distinct ways:
+/// the line on the wire fails to deserialize as a `Reply` (`Decode`),
+/// or the `Reply::Err(String)` arm fires with a server-supplied error
+/// message (`Server`). Keeping these as typed sources rather than
+/// stringifying eagerly lets `Display` differentiate the two and
+/// preserves the underlying `serde_json::Error` chain through
+/// [`std::error::Error::source`].
+#[derive(Debug)]
+pub(crate) enum MalformedResponseSource {
+    /// The reply line did not deserialize as a `Reply`.
+    Decode(serde_json::Error),
+    /// The compositor responded with `Reply::Err(String)`. The string
+    /// is opaque from our side; we surface it verbatim.
+    Server(String),
+}
+
+impl fmt::Display for MalformedResponseSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MalformedResponseSource::Decode(e) => write!(f, "decode error: {e}"),
+            MalformedResponseSource::Server(msg) => write!(f, "server error: {msg}"),
+        }
+    }
+}
+
 /// Errors with an associated exit code that `main()` propagates verbatim.
 ///
 /// Carriers are kept minimal and typed so the variants are a stable
@@ -41,8 +68,11 @@ pub(crate) enum CliError {
 
     /// Compositor responded with a payload whose shape we did not
     /// expect (wrong `Response` variant, unparseable inner JSON,
-    /// missing field). Exit code 65 (`EX_DATAERR`).
-    MalformedResponse(String),
+    /// or a `Reply::Err(String)` from the server). Exit code 65
+    /// (`EX_DATAERR`). The typed [`MalformedResponseSource`] keeps
+    /// the underlying `serde_json::Error` reachable via
+    /// [`std::error::Error::source`] when it applies.
+    MalformedResponse(MalformedResponseSource),
 
     /// Subcommand referenced an activity name that does not exist in
     /// the compositor's current `Activities` snapshot. Exit code 66
@@ -53,8 +83,9 @@ pub(crate) enum CliError {
     /// round-trip failed at the transport layer. Distinct from
     /// [`Self::MalformedResponse`] so the user can tell "niri isn't
     /// running" from "niri is running but spoke gibberish."
-    /// Exit code 69 (`EX_UNAVAILABLE`).
-    SocketUnavailable(String),
+    /// Exit code 69 (`EX_UNAVAILABLE`). The typed `io::Error` source
+    /// remains reachable via [`std::error::Error::source`].
+    SocketUnavailable(std::io::Error),
 
     /// Subcommand stub has not been wired to its IPC call yet.
     /// Carries the subcommand name so the stderr message names the
@@ -88,16 +119,29 @@ impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CliError::Usage(msg) => write!(f, "usage: {msg}"),
-            CliError::MalformedResponse(msg) => write!(f, "malformed compositor response: {msg}"),
+            CliError::MalformedResponse(src) => write!(f, "malformed compositor response: {src}"),
             CliError::ActivityNotFound(name) => write!(f, "no such activity: {name}"),
-            CliError::SocketUnavailable(msg) => write!(f, "niri socket unavailable: {msg}"),
+            CliError::SocketUnavailable(io) => write!(f, "niri socket unavailable: {io}"),
             CliError::NotImplemented(name) => write!(f, "subcommand not yet implemented: {name}"),
             CliError::CantCreate(msg) => write!(f, "cannot create activity: {msg}"),
         }
     }
 }
 
-impl std::error::Error for CliError {}
+impl std::error::Error for CliError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            CliError::SocketUnavailable(io) => Some(io),
+            CliError::MalformedResponse(MalformedResponseSource::Decode(e)) => Some(e),
+            // `Server(String)` has no further source — the string IS the leaf.
+            CliError::MalformedResponse(MalformedResponseSource::Server(_)) => None,
+            CliError::Usage(_)
+            | CliError::ActivityNotFound(_)
+            | CliError::NotImplemented(_)
+            | CliError::CantCreate(_) => None,
+        }
+    }
+}
 
 /// Maps a top-level [`anyhow::Error`] to a process exit code.
 ///
@@ -119,7 +163,18 @@ pub(crate) fn map_exit(err: &anyhow::Error) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use super::*;
+
+    fn sample_io_error() -> io::Error {
+        io::Error::new(io::ErrorKind::NotFound, "ENOENT")
+    }
+
+    fn sample_decode_error() -> serde_json::Error {
+        serde_json::from_str::<()>("not json")
+            .expect_err("malformed JSON must fail to deserialize as ()")
+    }
 
     #[test]
     fn usage_is_64() {
@@ -128,7 +183,11 @@ mod tests {
 
     #[test]
     fn malformed_response_is_65() {
-        assert_eq!(CliError::MalformedResponse("bad".into()).exit_code(), 65);
+        assert_eq!(
+            CliError::MalformedResponse(MalformedResponseSource::Decode(sample_decode_error()))
+                .exit_code(),
+            65,
+        );
     }
 
     #[test]
@@ -138,7 +197,10 @@ mod tests {
 
     #[test]
     fn socket_unavailable_is_69() {
-        assert_eq!(CliError::SocketUnavailable("ENOENT".into()).exit_code(), 69);
+        assert_eq!(
+            CliError::SocketUnavailable(sample_io_error()).exit_code(),
+            69,
+        );
     }
 
     #[test]
@@ -162,8 +224,15 @@ mod tests {
         // A CliError wrapped by .context("…") must still produce its typed
         // exit code — not fall through to 1. This pins the chain-walk
         // contract before any real IPC layer exists to exercise it.
-        let base: anyhow::Error = CliError::SocketUnavailable("ENOENT".into()).into();
+        let base: anyhow::Error = CliError::SocketUnavailable(sample_io_error()).into();
         let wrapped = base.context("connecting to $NIRI_SOCKET");
+        // Pin the post-context downcast: chain-walk must still recover the
+        // typed CliError once wrapped.
+        let recovered = wrapped
+            .chain()
+            .find_map(|e| e.downcast_ref::<CliError>())
+            .expect("CliError must remain downcastable through .context wrap");
+        assert!(matches!(recovered, CliError::SocketUnavailable(_)));
         assert_eq!(map_exit(&wrapped), 69);
     }
 
@@ -172,7 +241,7 @@ mod tests {
         // {:#} on an anyhow chain must include both the context layer and
         // the CliError Display output. Pins the display contract before
         // any real chain flows through main.
-        let base: anyhow::Error = CliError::SocketUnavailable("ENOENT".into()).into();
+        let base: anyhow::Error = CliError::SocketUnavailable(sample_io_error()).into();
         let wrapped = base.context("connecting to $NIRI_SOCKET");
         let formatted = format!("{wrapped:#}");
         assert!(
