@@ -380,7 +380,7 @@ Group landings — most of these are 1–2 line wrappers around a single `Action
 ### Phase 3.7 — Polish & v0.1.0
 
 - [x] README install/usage docs (currently a stub) — usage examples for every subcommand. Landed as `23ec8ee`. README rewritten from 32-line stub to v0.1.0 release docs; documents eight implemented subcommands, two runtime picker deps (fuzzel + rofi), source-only build path, exit-code table with stderr-prefix disambiguation for shared codes, and v1 caveats.
-- [ ] Manual smoke test against a running niri (the `--ignored` test layer per §4.6) — author the e2e tests, document the manual run cadence.
+- [x] Manual smoke test against a running niri (the `--ignored` test layer per §4.6) — author the e2e tests, document the manual run cadence. Landed as part of the Phase 3.7 box 2 commit. `tests/smoke.rs` adds six `#[ignore]`-gated e2e cases (list / list --json / create-remove / collision / switch-round-trip / switch-previous) asserting post-IPC side effects via a `niri msg --json` round-trip rather than exit codes alone. README gains a "Manual smoke test" section documenting the run cadence (`cargo test --test smoke -- --ignored --test-threads=1`), prerequisites, side-effect-recovery procedure, and the explicit out-of-scope list (`save`, picker-driven variants).
 - [x] `cargo clippy --all --all-targets` clean against the baseline established in Phase 3.1. Verified zero-warning clippy baseline held against `23ec8ee` — no delta vs. prior reviewed base.
 - [ ] Tag `v0.1.0`.
 
@@ -454,6 +454,10 @@ Populated as files land. Initial state: `src/main.rs` is the stub from the boots
 
 **After Phase 3.7 box 1 (`23ec8ee`):**
 - `README.md` — v0.1.0 release docs (was 32-line bootstrap stub); covers install, all eight implemented subcommands, runtime picker deps (fuzzel for single-select, rofi 2.0+ for `assign-workspace`), exit-code table with stderr-prefix anchors for shared codes 69 and 73, and v1 caveats (picker UX, `move-window` gap, source-only install, dotfiles-manager warning on `save`).
+
+**After Phase 3.7 box 2:**
+- `tests/smoke.rs` — `#[ignore]`-gated e2e smoke layer against a live niri. Six tests: `smoke_list_succeeds` (plain `list` returns non-empty stdout), `smoke_list_json_parses` (envelope `schema_version == 1` with an `activities` array), `smoke_create_then_remove` (create + remove round-trip verified via `niri msg --json activities`), `smoke_create_collision_exits_73` (second create at the same name exits 73 with stderr anchor `cannot create activity:`), `smoke_switch_round_trip` (focus moves via `Action::SwitchActivity`, restored after assertion), `smoke_switch_previous` (either focus changes on exit 0 or a niri-activities-prefixed stderr breadcrumb appears on non-zero exit). `require_live_niri()` precondition helper short-circuits with a `smoke: SKIP` breadcrumb when `$NIRI_SOCKET` is unset or unreachable. `niri_msg(socket, args)` shells out to `niri msg --json …` and decodes to `serde_json::Value`. `RuntimeActivityGuard` is a `Drop`-based best-effort cleanup handle (no `.unwrap()` in `Drop`; logs to stderr on failure). All runtime activities are named with the `__nact_smoke_<test>_<pid>_<nanos>` prefix for isolation and operator-side recovery. `save` and picker-driven subcommands are deliberately out of scope (would mutate `config.kdl` or require interactive pickers). Default `cargo test --all` count unchanged at 204; `cargo test --test smoke -- --ignored --test-threads=1` adds 6 more for 210 total.
+- `README.md` — gains a "Manual smoke test" section documenting the run cadence (`cargo test --test smoke -- --ignored --test-threads=1` with `--test-threads=1` mandatory to avoid races), prerequisites (`$NIRI_SOCKET` set, `niri` on `$PATH`), side-effect recovery procedure (`niri-activities list | grep __nact_smoke`), and the explicit out-of-scope subcommands.
 
 ## Appendix B: Open questions parked for v2
 

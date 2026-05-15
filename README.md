@@ -255,6 +255,53 @@ picker unavailable: ...`, `niri-activities: niri socket unavailable: ...`,
 `niri-activities: config edit failed: ...`, etc.) so consumers can pattern-match
 the surface without parsing the trailing detail.
 
+## Manual smoke test
+
+The default `cargo test` lane (`tests/cli.rs`, `tests/picker_shim.rs`,
+`tests/rofi_shim.rs`) covers every subcommand against in-process mocks and
+tempdir picker shims — no live compositor required. A separate `--ignored`
+test layer (`tests/smoke.rs`) exercises the same subcommands against a real
+running niri, asserting *side effects* (post-IPC state observable via
+`niri msg --json`) rather than just exit codes.
+
+Run it manually after any change that touches IPC wiring or output
+formatting:
+
+```sh
+cargo test --test smoke -- --ignored --test-threads=1
+```
+
+`--test-threads=1` is mandatory — these tests mutate compositor state
+(create / switch / remove activities) and would race if run in parallel.
+
+**Prerequisites:**
+
+- A running niri compositor with its IPC socket reachable via
+  `$NIRI_SOCKET`. Tests with the precondition unmet log a `smoke: SKIP`
+  breadcrumb to stderr and pass without action.
+- `niri` on `$PATH` (used as a side-effect verifier; **must be the gajdusek
+  fork build** — upstream `niri msg activities` exits non-zero and the entire
+  smoke run skips with a `niri msg activities failed (...)` breadcrumb).
+
+**Side-effect warning.** Smoke tests create runtime activities under a
+`__nact_smoke_<test>_<pid>_<nanos>` prefix and best-effort-remove them at
+the end of each test. If a test panics before cleanup, or cleanup itself
+fails (compositor unreachable, etc.), stranded activities remain in the
+session. Recover with:
+
+```sh
+niri-activities list | grep __nact_smoke
+niri-activities remove <stranded-name>
+```
+
+Runtime activities do not persist across a compositor restart, so a
+session restart also clears them.
+
+The `save` subcommand and picker-driven variants are deliberately **not**
+covered by the smoke layer — `save` would mutate the operator's real
+`~/.config/niri/config.kdl`, and picker variants require an interactive
+fuzzel / rofi binary. Cover them by exercising the binary by hand.
+
 ## Caveats
 
 Things to know for v0.1.0:
