@@ -10,12 +10,14 @@ use clap::Parser;
 
 mod assign_workspace;
 mod cli;
+mod create;
 mod error;
 mod ipc;
 mod ipc_helpers;
 mod list;
 mod move_workspace;
 mod picker;
+mod remove;
 mod switch;
 mod switch_previous;
 

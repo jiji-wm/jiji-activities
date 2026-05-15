@@ -238,6 +238,38 @@ fn move_workspace_no_arg_no_socket_exits_69() {
 }
 
 #[test]
+fn create_no_socket_exits_69() {
+    // Pins the binary-boundary wiring: `create <name>` dispatches
+    // through create::run (not the NotImplemented stub), which hits the
+    // IPC factory. With $NIRI_SOCKET unset the factory returns
+    // SocketUnavailable (exit 69) — proving the wired path replaced the
+    // stub. A regression to exit 70 would mean it fell back to
+    // NotImplemented.
+    Command::cargo_bin(BIN)
+        .unwrap()
+        .args(["create", "Foo"])
+        .env_remove("NIRI_SOCKET")
+        .assert()
+        .code(69);
+}
+
+#[test]
+fn remove_no_socket_exits_69() {
+    // Pins the binary-boundary wiring: `remove <name>` dispatches
+    // through remove::run (not the NotImplemented stub), which hits the
+    // IPC factory. With $NIRI_SOCKET unset the factory returns
+    // SocketUnavailable (exit 69) — proving the wired path replaced the
+    // stub. A regression to exit 70 would mean it fell back to
+    // NotImplemented.
+    Command::cargo_bin(BIN)
+        .unwrap()
+        .args(["remove", "Foo"])
+        .env_remove("NIRI_SOCKET")
+        .assert()
+        .code(69);
+}
+
+#[test]
 fn list_json_and_format_conflict_exits_64() {
     Command::cargo_bin(BIN)
         .unwrap()

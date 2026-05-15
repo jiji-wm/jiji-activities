@@ -1,8 +1,8 @@
 //! Clap-derive subcommand surface and per-subcommand dispatch.
 //!
 //! Each subcommand routes to a `cmd_<name>` helper. Wired-up subcommands
-//! (`switch`, `switch-previous`, `move-workspace`, `list`,
-//! `assign-workspace`) issue real IPC; unwired ones return
+//! (`switch`, `switch-previous`, `move-workspace`, `assign-workspace`,
+//! `create`, `remove`, `list`) issue real IPC; unwired ones return
 //! [`CliError::NotImplemented`] (exit 70). The dispatch shape and CLI
 //! surface are pinned by `tests/cli.rs`.
 
@@ -10,11 +10,13 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::assign_workspace;
+use crate::create;
 use crate::error::CliError;
 use crate::ipc;
 use crate::list::{self, ListOpts};
 use crate::move_workspace;
 use crate::picker;
+use crate::remove;
 use crate::switch;
 use crate::switch_previous;
 
@@ -149,12 +151,14 @@ fn cmd_assign_workspace() -> Result<()> {
     assign_workspace::run(client.as_mut()).context("running assign-workspace picker")
 }
 
-fn cmd_create(_name: String) -> Result<()> {
-    Err(CliError::NotImplemented("create").into())
+fn cmd_create(name: String) -> Result<()> {
+    let mut client = ipc::make_client();
+    create::run(client.as_mut(), &name)
 }
 
-fn cmd_remove(_name: String) -> Result<()> {
-    Err(CliError::NotImplemented("remove").into())
+fn cmd_remove(name: String) -> Result<()> {
+    let mut client = ipc::make_client();
+    remove::run(client.as_mut(), &name)
 }
 
 fn cmd_save(_name: String) -> Result<()> {
