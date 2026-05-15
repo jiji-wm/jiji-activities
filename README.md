@@ -4,9 +4,9 @@ A user-facing CLI for KDE-style **Activities** on the [niri](https://github.com/
 
 ## Status
 
-**v0.1.0 in `Cargo.toml`, not yet git-tagged.** Implementation complete except
-for the `move-window` subcommand, which is blocked on an IPC variant that has
-not yet been implemented in the niri fork this CLI links against. Every other
+**v0.1.0 tagged (`cb8b573`).** Implementation complete except for the
+`move-window` subcommand, which is blocked on an IPC variant that has not yet
+been implemented in the niri fork this CLI links against. Every other
 subcommand is wired and covered by tests.
 
 ## Concept
