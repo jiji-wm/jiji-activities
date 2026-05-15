@@ -270,6 +270,43 @@ fn remove_no_socket_exits_69() {
 }
 
 #[test]
+fn save_no_socket_exits_69() {
+    // Pins the binary-boundary wiring: `save <name>` dispatches through
+    // save::run (not the NotImplemented stub), which performs a
+    // filesystem write FIRST, then crosses the IPC factory for the
+    // LoadConfigFile reload. With $NIRI_CONFIG pointing at a writable
+    // tempdir and $NIRI_SOCKET unset, the fs-edit step succeeds and
+    // the reload IPC call fails on the dead socket → exit 69. A
+    // regression to exit 70 would mean save fell back to
+    // NotImplemented; a regression to exit 73 would mean the fs-edit
+    // erroneously preceded the empty-socket short-circuit (or the IPC
+    // step never ran).
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = tmp.path().join("config.kdl");
+    std::fs::write(&cfg, "// seed\n").expect("seed config");
+    Command::cargo_bin(BIN)
+        .unwrap()
+        .args(["save", "Foo"])
+        .env("NIRI_CONFIG", &cfg)
+        .env_remove("NIRI_SOCKET")
+        .assert()
+        .code(69)
+        // C1: the recovery breadcrumb must always appear on stderr when
+        // the fs-write succeeded but the reload IPC failed — including
+        // the Transport (dead-socket) path, which is the primary documented
+        // failure mode.
+        .stderr(contains("niri-activities: note: activity was written to"))
+        .stderr(contains("load-config-file"));
+    // The fs-edit phase must have completed: the new activity is on
+    // disk even though the reload failed.
+    let after = std::fs::read_to_string(&cfg).expect("config readable after");
+    assert!(
+        after.contains("activity") && after.contains("Foo"),
+        "save must write the activity to config before the reload IPC; got: {after:?}",
+    );
+}
+
+#[test]
 fn list_json_and_format_conflict_exits_64() {
     Command::cargo_bin(BIN)
         .unwrap()

@@ -16,6 +16,7 @@
 //! | `PickerUnavailable`  |   69 | external picker missing / spawn failed   |
 //! | `NotImplemented`     |   70 | subcommand stub not yet wired            |
 //! | `CantCreate`         |   73 | `create`/`save` could not produce target |
+//! | `ConfigEdit`         |   73 | filesystem edit of niri config failed    |
 //! | `OutputPipeClosed`   |    0 | stdout write hit EPIPE (e.g. `| head`); suppressed to exit 0 |
 
 use std::fmt;
@@ -122,6 +123,20 @@ pub(crate) enum CliError {
     /// (`EX_CANTCREAT`).
     CantCreate(String),
 
+    /// Editing the on-disk niri config file failed: file open/create,
+    /// write, or atomic rename failed; the existing config did not
+    /// parse as KDL; or the platform-specific user-config directory
+    /// could not be determined (e.g. `$HOME` unset, no valid base
+    /// directory per platform conventions). Carries the underlying
+    /// [`std::io::Error`] so the chain is preserved via
+    /// [`std::error::Error::source`]. Exit code 73 (`EX_CANTCREAT`) —
+    /// shared with [`Self::CantCreate`]; `CantCreate` keeps its
+    /// compositor-side `CreateActivity` meaning while `ConfigEdit`
+    /// carries filesystem failure. Symmetry with
+    /// [`Self::SocketUnavailable`] / [`Self::PickerUnavailable`]
+    /// sharing exit code 69.
+    ConfigEdit(std::io::Error),
+
     /// A stdout write failed with `EPIPE` — the pipe consumer (e.g.
     /// `head -1`) closed its read end before the CLI finished writing.
     /// This is not an error: `main()` suppresses it to exit 0.
@@ -148,6 +163,7 @@ impl CliError {
             CliError::PickerUnavailable(_) => 69,
             CliError::NotImplemented(_) => 70,
             CliError::CantCreate(_) => 73,
+            CliError::ConfigEdit(_) => 73,
             // Suppressed to 0 by main() before exit_code() is consulted.
             CliError::OutputPipeClosed => 0,
         }
@@ -164,6 +180,7 @@ impl fmt::Display for CliError {
             CliError::PickerUnavailable(io) => write!(f, "picker unavailable: {io}"),
             CliError::NotImplemented(name) => write!(f, "subcommand not yet implemented: {name}"),
             CliError::CantCreate(msg) => write!(f, "cannot create activity: {msg}"),
+            CliError::ConfigEdit(io) => write!(f, "config edit failed: {io}"),
             CliError::OutputPipeClosed => write!(f, "stdout pipe closed"),
         }
     }
@@ -174,6 +191,7 @@ impl std::error::Error for CliError {
         match self {
             CliError::SocketUnavailable(io) => Some(io),
             CliError::PickerUnavailable(io) => Some(io),
+            CliError::ConfigEdit(io) => Some(io),
             CliError::MalformedResponse(MalformedResponseSource::Decode(e)) => Some(e),
             // `Server` and `WrongVariant` carry only strings — the
             // message IS the leaf, no nested error to expose.
@@ -287,6 +305,18 @@ mod tests {
     #[test]
     fn cant_create_is_73() {
         assert_eq!(CliError::CantCreate("dup name".into()).exit_code(), 73);
+    }
+
+    #[test]
+    fn config_edit_is_73() {
+        // ConfigEdit shares exit code 73 with CantCreate. The Display
+        // prefix is what disambiguates them for the user.
+        let err = CliError::ConfigEdit(sample_io_error());
+        assert_eq!(err.exit_code(), 73);
+        assert!(
+            format!("{err}").starts_with("config edit failed:"),
+            "Display must use the config-edit-failed prefix",
+        );
     }
 
     #[test]

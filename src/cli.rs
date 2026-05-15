@@ -17,6 +17,7 @@ use crate::list::{self, ListOpts};
 use crate::move_workspace;
 use crate::picker;
 use crate::remove;
+use crate::save;
 use crate::switch;
 use crate::switch_previous;
 
@@ -161,8 +162,9 @@ fn cmd_remove(name: String) -> Result<()> {
     remove::run(client.as_mut(), &name)
 }
 
-fn cmd_save(_name: String) -> Result<()> {
-    Err(CliError::NotImplemented("save").into())
+fn cmd_save(name: String) -> Result<()> {
+    let mut client = ipc::make_client();
+    save::run(client.as_mut(), &name, &save::RealConfigPaths).context("saving activity to config")
 }
 
 fn cmd_list(json: bool, format: Option<String>) -> Result<()> {
