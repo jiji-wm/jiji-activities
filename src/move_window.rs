@@ -83,36 +83,38 @@ use crate::ipc::NiriClient;
 use crate::ipc_helpers::{send_expect_activities, send_expect_handled, send_expect_workspaces};
 use crate::picker::PickerOutcome;
 
-// ---- Sentinel pairs --------------------------------------------------------
+// ---- Stage sentinels -------------------------------------------------------
 
-/// Stage-1 sentinel: the `« Current activity »` row that opens stage 2
-/// against the focused activity.
-///
-/// Held in a struct rather than a bare `String` for symmetry with
-/// [`crate::picker::multi_select::SentinelNames`] (which has a genuine
-/// two-sentinel pair) and to make adding a second stage-1 sentinel in
-/// the future a single-field update rather than a scattered rename.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SentinelNames {
-    current_activity: String,
-}
+// Each stage of the move-window picker carries a single sentinel string:
+// the unicode form is preferred, and the underscore-fallback form is
+// substituted iff a collision against the user-visible row set is
+// detected at composition time. Both sentinels are CLI-internal (never
+// emitted on the wire) and resolved by strict string equality in the
+// stage resolvers.
+//
+// Contrast with [`crate::picker::multi_select::SentinelNames`], which is
+// a genuine matched pair of distinct sentinels carried atomically — that
+// shape is justified there and intentionally retained. Here, each stage
+// has only one sentinel, so a plain `&'static str` threads through the
+// composer/resolver pair with no abstraction in between.
 
-impl SentinelNames {
-    const UNICODE_CURRENT_ACTIVITY: &'static str = "« Current activity »";
-    const FALLBACK_CURRENT_ACTIVITY: &'static str = "__niri_activities_current_activity__";
-}
+/// Stage-1 sentinel (preferred unicode form): the `« Current activity »`
+/// row that opens stage 2 against the focused activity.
+const UNICODE_CURRENT_ACTIVITY: &str = "« Current activity »";
 
-/// Stage-2 sentinel: the `« New workspace »` row that resolves to the
-/// activity's trailing-empty workspace.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct WorkspaceSentinelNames {
-    new_workspace: String,
-}
+/// Stage-1 sentinel fallback used iff any activity name collides with
+/// the unicode form. Selected by [`sentinel_names`] per picker invocation
+/// against the live activity name set.
+const FALLBACK_CURRENT_ACTIVITY: &str = "__niri_activities_current_activity__";
 
-impl WorkspaceSentinelNames {
-    const UNICODE_NEW_WORKSPACE: &'static str = "« New workspace »";
-    const FALLBACK_NEW_WORKSPACE: &'static str = "__niri_activities_new_workspace__";
-}
+/// Stage-2 sentinel (preferred unicode form): the `« New workspace »`
+/// row that resolves to the active activity's trailing-empty workspace.
+const UNICODE_NEW_WORKSPACE: &str = "« New workspace »";
+
+/// Stage-2 sentinel fallback used iff any workspace label collides with
+/// the unicode form. Selected by [`workspace_sentinel_names`] per picker
+/// invocation against the live workspace label set.
+const FALLBACK_NEW_WORKSPACE: &str = "__niri_activities_new_workspace__";
 
 // ---- Stage-resolution enums ------------------------------------------------
 
@@ -262,11 +264,11 @@ where
     }
 
     let activity_name_refs: Vec<&str> = activities.iter().map(|a| a.name.as_str()).collect();
-    let stage1_sentinels = sentinel_names(&activity_name_refs);
-    let stage1_items = compose_stage1_items(&activities, &stage1_sentinels);
+    let stage1_sentinel = sentinel_names(&activity_name_refs);
+    let stage1_items = compose_stage1_items(&activities, stage1_sentinel);
     let stage1_picked = pick("Move window to activity:", &stage1_items)?;
 
-    match resolve_stage1(stage1_picked, &stage1_sentinels, &activities) {
+    match resolve_stage1(stage1_picked, stage1_sentinel, &activities) {
         Stage1Resolution::Cancelled => Ok(()),
         Stage1Resolution::CurrentActivity => {
             let id = current_activity_id(&activities)?;
@@ -360,11 +362,11 @@ where
 
     let workspace_labels: Vec<String> = filtered.iter().map(|w| workspace_label(w)).collect();
     let workspace_label_refs: Vec<&str> = workspace_labels.iter().map(String::as_str).collect();
-    let stage2_sentinels = workspace_sentinel_names(&workspace_label_refs);
-    let stage2_items = compose_stage2_items_with_new(&filtered, &stage2_sentinels);
+    let stage2_sentinel = workspace_sentinel_names(&workspace_label_refs);
+    let stage2_items = compose_stage2_items_with_new(&filtered, stage2_sentinel);
 
     let stage2_picked = pick("Move window to workspace:", &stage2_items)?;
-    match resolve_stage2_with_new(stage2_picked, &stage2_sentinels, &filtered) {
+    match resolve_stage2_with_new(stage2_picked, stage2_sentinel, &filtered) {
         Stage2ResolutionWithNew::Cancelled => Ok(()),
         Stage2ResolutionWithNew::Selected(ws) => dispatch_move(client, ws.id),
         Stage2ResolutionWithNew::Unknown(label) => Err(CliError::MalformedResponse(
@@ -535,39 +537,25 @@ fn trailing_empty_workspace<'a>(filtered: &[&'a Workspace]) -> Option<&'a Worksp
         .copied()
 }
 
-/// Returns the stage-1 sentinel pair, falling back to the underscore
-/// form when any activity name would collide with the unicode sentinel.
-///
-/// The collision check is conservative: any collision flips the whole
-/// pair (currently a single-field pair, but kept atomic for symmetry
-/// with [`crate::picker::multi_select::sentinel_names`] and to keep
-/// future sentinel additions a single-field update).
-fn sentinel_names(activity_names: &[&str]) -> SentinelNames {
-    let collides = activity_names.contains(&SentinelNames::UNICODE_CURRENT_ACTIVITY);
-    if collides {
-        SentinelNames {
-            current_activity: SentinelNames::FALLBACK_CURRENT_ACTIVITY.to_owned(),
-        }
+/// Returns the stage-1 sentinel guaranteed not to collide with any element
+/// of `activity_names`. Prefers the unicode form; substitutes the
+/// underscore fallback iff a collision would occur.
+fn sentinel_names(activity_names: &[&str]) -> &'static str {
+    if activity_names.contains(&UNICODE_CURRENT_ACTIVITY) {
+        FALLBACK_CURRENT_ACTIVITY
     } else {
-        SentinelNames {
-            current_activity: SentinelNames::UNICODE_CURRENT_ACTIVITY.to_owned(),
-        }
+        UNICODE_CURRENT_ACTIVITY
     }
 }
 
-/// Returns the stage-2 sentinel pair, falling back to the underscore
-/// form when any workspace label would collide with the unicode
-/// sentinel.
-fn workspace_sentinel_names(workspace_labels: &[&str]) -> WorkspaceSentinelNames {
-    let collides = workspace_labels.contains(&WorkspaceSentinelNames::UNICODE_NEW_WORKSPACE);
-    if collides {
-        WorkspaceSentinelNames {
-            new_workspace: WorkspaceSentinelNames::FALLBACK_NEW_WORKSPACE.to_owned(),
-        }
+/// Returns the stage-2 sentinel guaranteed not to collide with any element
+/// of `workspace_labels`. Prefers the unicode form; substitutes the
+/// underscore fallback iff a collision would occur.
+fn workspace_sentinel_names(workspace_labels: &[&str]) -> &'static str {
+    if workspace_labels.contains(&UNICODE_NEW_WORKSPACE) {
+        FALLBACK_NEW_WORKSPACE
     } else {
-        WorkspaceSentinelNames {
-            new_workspace: WorkspaceSentinelNames::UNICODE_NEW_WORKSPACE.to_owned(),
-        }
+        UNICODE_NEW_WORKSPACE
     }
 }
 
@@ -578,9 +566,9 @@ fn workspace_sentinel_names(workspace_labels: &[&str]) -> WorkspaceSentinelNames
 /// **Ordering invariant.** The sentinel is **always** the first row;
 /// activity order is **never** reshuffled by `names_focused_first` —
 /// the sentinel already covers the focused-activity shortcut.
-fn compose_stage1_items(activities: &[Activity], sentinels: &SentinelNames) -> Vec<String> {
+fn compose_stage1_items(activities: &[Activity], sentinel: &str) -> Vec<String> {
     let mut out = Vec::with_capacity(activities.len() + 1);
-    out.push(sentinels.current_activity.clone());
+    out.push(sentinel.to_owned());
     for a in activities {
         out.push(a.name.clone());
     }
@@ -597,12 +585,9 @@ fn compose_stage1_items(activities: &[Activity], sentinels: &SentinelNames) -> V
 /// `resolve_stage2_with_new`: it walks the same slice to match labels,
 /// and the sentinel is identified by strict string equality (not
 /// position).
-fn compose_stage2_items_with_new(
-    workspaces: &[&Workspace],
-    sentinels: &WorkspaceSentinelNames,
-) -> Vec<String> {
+fn compose_stage2_items_with_new(workspaces: &[&Workspace], sentinel: &str) -> Vec<String> {
     let mut out: Vec<String> = workspaces.iter().map(|w| workspace_label(w)).collect();
-    out.push(sentinels.new_workspace.clone());
+    out.push(sentinel.to_owned());
     out
 }
 
@@ -623,19 +608,19 @@ fn compose_stage2_items_literal_only(workspaces: &[&Workspace]) -> Vec<String> {
 /// row not in the items we passed (a picker-side contract violation).
 ///
 /// Sentinel match is strict equality against the unicode or
-/// underscore-fallback form held in `sentinels`. Activity match walks
+/// underscore-fallback form passed as `sentinel`. Activity match walks
 /// the snapshot by name. `Unknown(name)` is returned rather than
 /// silently folding contract violations into `Cancelled` so callers
 /// can surface the anomaly as `MalformedResponse`.
 fn resolve_stage1<'a>(
     picked: PickerOutcome,
-    sentinels: &SentinelNames,
+    sentinel: &str,
     activities: &'a [Activity],
 ) -> Stage1Resolution<'a> {
     match picked {
         PickerOutcome::Cancelled => Stage1Resolution::Cancelled,
         PickerOutcome::Selected(name) => {
-            if name == sentinels.current_activity {
+            if name == sentinel {
                 Stage1Resolution::CurrentActivity
             } else if let Some(a) = activities.iter().find(|a| a.name == name) {
                 Stage1Resolution::Selected(a)
@@ -657,13 +642,13 @@ fn resolve_stage1<'a>(
 /// `MalformedResponse`.
 fn resolve_stage2_with_new<'a>(
     picked: PickerOutcome,
-    sentinels: &WorkspaceSentinelNames,
+    sentinel: &str,
     candidates: &'a [&'a Workspace],
 ) -> Stage2ResolutionWithNew<'a> {
     match picked {
         PickerOutcome::Cancelled => Stage2ResolutionWithNew::Cancelled,
         PickerOutcome::Selected(label) => {
-            if label == sentinels.new_workspace {
+            if label == sentinel {
                 Stage2ResolutionWithNew::NewWorkspace
             } else if let Some(ws) = candidates
                 .iter()
@@ -923,28 +908,28 @@ mod tests {
     fn sentinel_names_no_collision_uses_unicode() {
         let names = vec!["Work", "Personal"];
         let s = sentinel_names(&names);
-        assert_eq!(s.current_activity, "« Current activity »");
+        assert_eq!(s, "« Current activity »");
     }
 
     #[test]
     fn sentinel_names_collision_with_current_activity_uses_underscore_fallback() {
         let names = vec!["Work", "« Current activity »"];
         let s = sentinel_names(&names);
-        assert_eq!(s.current_activity, "__niri_activities_current_activity__");
+        assert_eq!(s, "__niri_activities_current_activity__");
     }
 
     #[test]
     fn workspace_sentinel_names_no_collision_uses_unicode() {
         let labels = vec!["ws-1", "ws-2"];
         let s = workspace_sentinel_names(&labels);
-        assert_eq!(s.new_workspace, "« New workspace »");
+        assert_eq!(s, "« New workspace »");
     }
 
     #[test]
     fn workspace_sentinel_names_collision_with_new_workspace_uses_underscore_fallback() {
         let labels = vec!["ws-1", "« New workspace »"];
         let s = workspace_sentinel_names(&labels);
-        assert_eq!(s.new_workspace, "__niri_activities_new_workspace__");
+        assert_eq!(s, "__niri_activities_new_workspace__");
     }
 
     // ---- compose_stage1_items / compose_stage2_items_{with_new,literal_only} -
@@ -952,8 +937,8 @@ mod tests {
     #[test]
     fn compose_stage1_items_puts_current_activity_sentinel_first() {
         let acts = vec![act(1, "Work", false), act(2, "Personal", true)];
-        let sentinels = sentinel_names(&["Work", "Personal"]);
-        let items = compose_stage1_items(&acts, &sentinels);
+        let sentinel = sentinel_names(&["Work", "Personal"]);
+        let items = compose_stage1_items(&acts, sentinel);
         assert_eq!(items[0], "« Current activity »");
         assert_eq!(items[1], "Work");
         assert_eq!(items[2], "Personal");
@@ -965,8 +950,8 @@ mod tests {
         // focused-activity shortcut — the activity slice must NOT be
         // reordered to hoist 'Personal' above 'Work'.
         let acts = vec![act(1, "Work", false), act(2, "Personal", true)];
-        let sentinels = sentinel_names(&["Work", "Personal"]);
-        let items = compose_stage1_items(&acts, &sentinels);
+        let sentinel = sentinel_names(&["Work", "Personal"]);
+        let items = compose_stage1_items(&acts, sentinel);
         assert_eq!(items, vec!["« Current activity »", "Work", "Personal"]);
     }
 
@@ -975,8 +960,8 @@ mod tests {
         let a = ws(1, 0, false, Some("DP-1"), vec![1], None);
         let b = ws(2, 1, false, Some("DP-1"), vec![1], None);
         let filtered = vec![&a, &b];
-        let sentinels = workspace_sentinel_names(&["idx 0", "idx 1"]);
-        let items = compose_stage2_items_with_new(&filtered, &sentinels);
+        let sentinel = workspace_sentinel_names(&["idx 0", "idx 1"]);
+        let items = compose_stage2_items_with_new(&filtered, sentinel);
         assert_eq!(items.last().map(String::as_str), Some("« New workspace »"));
         assert_eq!(items.len(), 3);
     }
@@ -1018,13 +1003,10 @@ mod tests {
     fn resolve_stage1_recognises_current_activity_sentinel_with_underscore_fallback() {
         let acts = vec![act(1, "Work", true)];
         // Force the underscore fallback by passing a colliding name.
-        let sentinels = sentinel_names(&["« Current activity »"]);
-        assert_eq!(
-            sentinels.current_activity,
-            "__niri_activities_current_activity__"
-        );
+        let sentinel = sentinel_names(&["« Current activity »"]);
+        assert_eq!(sentinel, "__niri_activities_current_activity__");
         let picked = PickerOutcome::Selected("__niri_activities_current_activity__".into());
-        match resolve_stage1(picked, &sentinels, &acts) {
+        match resolve_stage1(picked, sentinel, &acts) {
             Stage1Resolution::CurrentActivity => {}
             other => panic!("expected CurrentActivity, got {other:?}"),
         }
@@ -1035,10 +1017,10 @@ mod tests {
         let a = ws(1, 0, false, Some("DP-1"), vec![1], None);
         let filtered = vec![&a];
         // Force the underscore fallback by passing a colliding label.
-        let sentinels = workspace_sentinel_names(&["« New workspace »"]);
-        assert_eq!(sentinels.new_workspace, "__niri_activities_new_workspace__");
+        let sentinel = workspace_sentinel_names(&["« New workspace »"]);
+        assert_eq!(sentinel, "__niri_activities_new_workspace__");
         let picked = PickerOutcome::Selected("__niri_activities_new_workspace__".into());
-        match resolve_stage2_with_new(picked, &sentinels, &filtered) {
+        match resolve_stage2_with_new(picked, sentinel, &filtered) {
             Stage2ResolutionWithNew::NewWorkspace => {}
             other => panic!("expected NewWorkspace, got {other:?}"),
         }
@@ -1049,9 +1031,9 @@ mod tests {
         // Picker returned a row that wasn't in the items (contract
         // violation). Must surface as Unknown, not silently as Cancelled.
         let acts = vec![act(1, "Work", true)];
-        let sentinels = sentinel_names(&["Work"]);
+        let sentinel = sentinel_names(&["Work"]);
         let picked = PickerOutcome::Selected("NotAnActivity".into());
-        match resolve_stage1(picked, &sentinels, &acts) {
+        match resolve_stage1(picked, sentinel, &acts) {
             Stage1Resolution::Unknown(row) => assert_eq!(row, "NotAnActivity"),
             other => panic!("expected Unknown, got {other:?}"),
         }
@@ -1063,9 +1045,9 @@ mod tests {
         // violation). Must surface as Unknown, not silently as Cancelled.
         let a = ws(1, 0, false, Some("DP-1"), vec![1], None);
         let filtered = vec![&a];
-        let sentinels = workspace_sentinel_names(&["idx 0"]);
+        let sentinel = workspace_sentinel_names(&["idx 0"]);
         let picked = PickerOutcome::Selected("not-a-workspace".into());
-        match resolve_stage2_with_new(picked, &sentinels, &filtered) {
+        match resolve_stage2_with_new(picked, sentinel, &filtered) {
             Stage2ResolutionWithNew::Unknown(label) => assert_eq!(label, "not-a-workspace"),
             other => panic!("expected Unknown, got {other:?}"),
         }
