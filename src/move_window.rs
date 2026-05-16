@@ -58,19 +58,22 @@
 //!   walking the `Activities` snapshot, mirroring how
 //!   `move-workspace` lets the compositor produce it.
 //! - Synthetic `MalformedResponse(Server(_))` carriers fire when the
-//!   compositor's snapshot violates an invariant we depend on. The three
+//!   compositor's snapshot violates an invariant we depend on. The four
 //!   CLI-internal synthetic strings (not on the wire):
 //!   - `"no focused workspace"` — [`focused_workspace`] (via
 //!     [`focused_output_name`])
 //!   - `"focused workspace has no output"` — [`focused_output_name`]
 //!   - `"no active activity"` — [`current_activity_id`]
+//!   - `"trailing-empty workspace expected for active activity"` —
+//!     [`dispatch_stage2_with_new`] when the user picks `« New workspace »`
+//!     but no trailing-empty workspace is present on the focused output.
+//!     The compositor's trailing-empty invariant guarantees the active
+//!     activity always has one such workspace; surfacing the violation as
+//!     a typed error instead of a panic matches the rest of this
+//!     module's synthetic-string discipline.
 //!
 //!   All use the same rustdoc-discipline pattern as
 //!   [`crate::assign_workspace::focused_workspace`].
-//!
-//!   The `Stage2Resolution::NewWorkspace` arm in [`dispatch_stage2`]
-//!   uses `unreachable!` instead of a synthetic carrier — it is a
-//!   resolver bug, not a runtime condition.
 
 use anyhow::{Context, Result};
 use niri_ipc::{Action, Activity, Request, Workspace, WorkspaceReferenceArg};
@@ -125,10 +128,34 @@ enum Stage1Resolution<'a> {
     Unknown(String),
 }
 
-/// Post-picker resolution for stage 2.
+/// Post-picker resolution for stage 2 when the `« New workspace »`
+/// sentinel is part of the composed item list (active-activity path).
+///
+/// The presence of [`Self::NewWorkspace`] is encoded in the type: callers
+/// of this variant arm are statically guaranteed to be on the with-new
+/// path, eliminating the need for a panic branch on the literal-only
+/// path.
 #[derive(Debug)]
-enum Stage2Resolution<'a> {
+enum Stage2ResolutionWithNew<'a> {
     NewWorkspace,
+    Selected(&'a Workspace),
+    Cancelled,
+    /// The stage-2 picker returned a label that was not in the items we
+    /// passed — a picker-side contract violation. Propagated as
+    /// `MalformedResponse(Server(...))` at the call site.
+    Unknown(String),
+}
+
+/// Post-picker resolution for stage 2 when the `« New workspace »`
+/// sentinel is structurally absent from the composed item list
+/// (non-active activity path).
+///
+/// The absence of a `NewWorkspace` variant here is load-bearing: the
+/// compositor's trailing-empty invariant only applies to the active
+/// activity, so on the non-active path the sentinel was never injected,
+/// and there is no `NewWorkspace` outcome to resolve.
+#[derive(Debug)]
+enum Stage2ResolutionLiteralOnly<'a> {
     Selected(&'a Workspace),
     Cancelled,
     /// The stage-2 picker returned a label that was not in the items we
@@ -204,16 +231,20 @@ pub(crate) fn run(client: &mut dyn NiriClient, activity_name: &str) -> Result<()
 ///    stage-1 picker is never spawned.
 /// 2. Opens stage 1 (activity picker) with a `« Current activity »`
 ///    sentinel as the first row. Cancellation returns `Ok(())`.
-/// 3. Issues `Request::Workspaces` and filters to workspaces in the
-///    chosen activity that live on the focused output.
-/// 4. **Zero-case:** when the chosen activity is not the active one and
-///    the filtered list is empty, writes a stderr diagnostic and returns
-///    `Ok(())` — picker stage 2 is **not** spawned. For the active
-///    activity (where `include_new_workspace = true`) the sentinel
-///    suffices, so this short-circuit doesn't fire.
+/// 3. Dispatches to [`dispatch_stage2_with_new`] (active activity, or
+///    `« Current activity »` sentinel) or
+///    [`dispatch_stage2_literal_only`] (non-active activity), per the
+///    `Stage1Resolution::Selected(activity).is_active` discriminator.
+///    The dispatch helpers issue `Request::Workspaces`, filter to
+///    workspaces in the chosen activity on the focused output, and
+///    manage zero-case diagnostics and sentinel composition.
+/// 4. **Zero-case:** on the literal-only path, when the filtered
+///    workspace list is empty, the helper writes a stderr diagnostic and
+///    returns `Ok(())` — stage 2 is **not** spawned. On the with-new
+///    path the `« New workspace »` sentinel covers the empty case so no
+///    short-circuit fires there.
 /// 5. Opens stage 2 (workspace picker). `« New workspace »` is only
-///    offered when the chosen activity is the active one. Cancellation
-///    returns `Ok(())`.
+///    offered on the with-new path. Cancellation returns `Ok(())`.
 /// 6. Dispatches `Action::MoveWindowToWorkspace { window_id: None,
 ///    reference: Id(ws.id), focus: false }`.
 ///
@@ -235,33 +266,30 @@ where
     let stage1_items = compose_stage1_items(&activities, &stage1_sentinels);
     let stage1_picked = pick("Move window to activity:", &stage1_items)?;
 
-    let (target_activity_id, target_activity_name, include_new_workspace) =
-        match resolve_stage1(stage1_picked, &stage1_sentinels, &activities) {
-            Stage1Resolution::Cancelled => return Ok(()),
-            Stage1Resolution::CurrentActivity => {
-                let (id, name) = current_activity_id_and_name(&activities)?;
-                (id, name, true)
-            }
-            Stage1Resolution::Selected(activity) => {
-                (activity.id, activity.name.clone(), activity.is_active)
-            }
-            Stage1Resolution::Unknown(row) => {
-                return Err(
-                    CliError::MalformedResponse(MalformedResponseSource::Server(format!(
-                        "stage-1 picker returned row not in items: {row:?}"
-                    )))
-                    .into(),
-                );
-            }
-        };
-
-    dispatch_stage2(
-        client,
-        target_activity_id,
-        &target_activity_name,
-        include_new_workspace,
-        &pick,
-    )
+    match resolve_stage1(stage1_picked, &stage1_sentinels, &activities) {
+        Stage1Resolution::Cancelled => Ok(()),
+        Stage1Resolution::CurrentActivity => {
+            let id = current_activity_id(&activities)?;
+            dispatch_stage2_with_new(client, id, &pick)
+        }
+        // Active activity → with-new path (compositor trailing-empty
+        // invariant guarantees a landing slot for « New workspace »).
+        // Non-active → literal-only path (no auto-materialised
+        // trailing-empty, so no sentinel offered).
+        Stage1Resolution::Selected(activity) if activity.is_active => {
+            dispatch_stage2_with_new(client, activity.id, &pick)
+        }
+        Stage1Resolution::Selected(activity) => {
+            let name = activity.name.clone();
+            dispatch_stage2_literal_only(client, activity.id, &name, &pick)
+        }
+        Stage1Resolution::Unknown(row) => Err(CliError::MalformedResponse(
+            MalformedResponseSource::Server(format!(
+                "stage-1 picker returned row not in items: {row:?}"
+            )),
+        )
+        .into()),
+    }
 }
 
 /// Single-stage picker form for `move-window-here`.
@@ -285,28 +313,41 @@ where
     F: FnOnce(&str, &[String]) -> Result<PickerOutcome, CliError>,
 {
     let activities = send_expect_activities(client).context("requesting activities")?;
-    let (activity_id, activity_name) = current_activity_id_and_name(&activities)?;
-    dispatch_stage2(client, activity_id, &activity_name, true, pick)
+    let activity_id = current_activity_id(&activities)?;
+    dispatch_stage2_with_new(client, activity_id, pick)
 }
 
-// ---- Stage-2 dispatch (shared by run_picker and run_here_picker) -----------
+// ---- Stage-2 dispatch (with-new vs literal-only) ---------------------------
 
-/// Runs stage 2 against a pinned `target_activity_id` and dispatches the
-/// move on a literal selection (or the new-workspace sentinel).
+/// Runs stage 2 against a pinned `target_activity_id` on the with-new
+/// path: the `« New workspace »` sentinel is always appended to the
+/// composed item list. Selected by callers when the target activity is
+/// the currently-active one (compositor trailing-empty invariant
+/// guarantees a landing slot exists).
 ///
-/// `include_new_workspace` is honoured both in the composed item list
-/// and in the zero-case short-circuit: when `false` and the filtered
-/// workspace list is empty, the stage-2 picker is not spawned and
-/// `Ok(())` is returned with a stderr diagnostic.
+/// No `target_activity_name` parameter: the with-new path has no
+/// zero-case `eprintln!` diagnostic that would need it. Under the
+/// compositor's trailing-empty invariant, `filtered` contains at least
+/// the active activity's trailing-empty workspace, so the sentinel always
+/// resolves. The synthetic `MalformedResponse(Server("trailing-empty
+/// workspace expected for active activity"))` in the `NewWorkspace` arm
+/// exists only as a defensive guard against invariant violation — it is
+/// not the normal zero-case path.
+///
+/// **Invariant breach.** The literal `"trailing-empty workspace expected
+/// for active activity"` is a **CLI-internal** value — it is **not**
+/// emitted on the wire by the niri compositor. A future grep that audits
+/// compositor wire-string matches must skip this site. It routes through
+/// `MalformedResponse(Server)` → exit 65 via the same
+/// `IpcError::Server → MalformedResponseSource::Server` `Display` path
+/// as [`focused_workspace`].
 ///
 /// The `pick` parameter accepts an `FnOnce` because stage 2 fires only
 /// once per invocation; `run_picker` passes its `Fn` closure here by
 /// reference.
-fn dispatch_stage2<F>(
+fn dispatch_stage2_with_new<F>(
     client: &mut dyn NiriClient,
     target_activity_id: u64,
-    target_activity_name: &str,
-    include_new_workspace: bool,
     pick: F,
 ) -> Result<()>
 where
@@ -317,49 +358,77 @@ where
     let filtered =
         workspaces_in_activity_on_focused_output(&workspaces, target_activity_id, focused_output);
 
-    if filtered.is_empty() && !include_new_workspace {
+    let workspace_labels: Vec<String> = filtered.iter().map(|w| workspace_label(w)).collect();
+    let workspace_label_refs: Vec<&str> = workspace_labels.iter().map(String::as_str).collect();
+    let stage2_sentinels = workspace_sentinel_names(&workspace_label_refs);
+    let stage2_items = compose_stage2_items_with_new(&filtered, &stage2_sentinels);
+
+    let stage2_picked = pick("Move window to workspace:", &stage2_items)?;
+    match resolve_stage2_with_new(stage2_picked, &stage2_sentinels, &filtered) {
+        Stage2ResolutionWithNew::Cancelled => Ok(()),
+        Stage2ResolutionWithNew::Selected(ws) => dispatch_move(client, ws.id),
+        Stage2ResolutionWithNew::Unknown(label) => Err(CliError::MalformedResponse(
+            MalformedResponseSource::Server(format!(
+                "stage-2 picker returned label not in items: {label:?}"
+            )),
+        )
+        .into()),
+        Stage2ResolutionWithNew::NewWorkspace => {
+            let Some(ws) = trailing_empty_workspace(&filtered) else {
+                return Err(CliError::MalformedResponse(MalformedResponseSource::Server(
+                    "trailing-empty workspace expected for active activity".to_owned(),
+                ))
+                .into());
+            };
+            dispatch_move(client, ws.id)
+        }
+    }
+}
+
+/// Runs stage 2 against a pinned `target_activity_id` on the literal-only
+/// path: the `« New workspace »` sentinel is structurally absent from the
+/// composed item list. Selected by callers when the target activity is a
+/// non-active one (trailing-empty invariant does not apply, so the
+/// sentinel has no canonical landing slot to resolve against).
+///
+/// **Zero-case.** When the filtered workspace list is empty, the stage-2
+/// picker is **not** spawned: a stderr diagnostic is written and `Ok(())`
+/// is returned. This short-circuit is structurally pinned to the
+/// literal-only path because the with-new path's sentinel covers the
+/// zero-case affordance.
+fn dispatch_stage2_literal_only<F>(
+    client: &mut dyn NiriClient,
+    target_activity_id: u64,
+    target_activity_name: &str,
+    pick: F,
+) -> Result<()>
+where
+    F: FnOnce(&str, &[String]) -> Result<PickerOutcome, CliError>,
+{
+    let workspaces = send_expect_workspaces(client).context("requesting workspaces")?;
+    let focused_output = focused_output_name(&workspaces)?;
+    let filtered =
+        workspaces_in_activity_on_focused_output(&workspaces, target_activity_id, focused_output);
+
+    if filtered.is_empty() {
         eprintln!(
             "niri-activities: activity '{target_activity_name}' has no workspaces on the focused output; nothing to move window to"
         );
         return Ok(());
     }
 
-    let workspace_labels: Vec<String> = filtered.iter().map(|w| workspace_label(w)).collect();
-    let workspace_label_refs: Vec<&str> = workspace_labels.iter().map(String::as_str).collect();
-    let stage2_sentinels = workspace_sentinel_names(&workspace_label_refs);
-    let stage2_items = compose_stage2_items(&filtered, &stage2_sentinels, include_new_workspace);
+    let stage2_items = compose_stage2_items_literal_only(&filtered);
 
     let stage2_picked = pick("Move window to workspace:", &stage2_items)?;
-    match resolve_stage2(stage2_picked, &stage2_sentinels, &filtered) {
-        Stage2Resolution::Cancelled => Ok(()),
-        Stage2Resolution::Selected(ws) => dispatch_move(client, ws.id),
-        Stage2Resolution::Unknown(label) => Err(CliError::MalformedResponse(
+    match resolve_stage2_literal_only(stage2_picked, &filtered) {
+        Stage2ResolutionLiteralOnly::Cancelled => Ok(()),
+        Stage2ResolutionLiteralOnly::Selected(ws) => dispatch_move(client, ws.id),
+        Stage2ResolutionLiteralOnly::Unknown(label) => Err(CliError::MalformedResponse(
             MalformedResponseSource::Server(format!(
                 "stage-2 picker returned label not in items: {label:?}"
             )),
         )
         .into()),
-        Stage2Resolution::NewWorkspace => {
-            // For `include_new_workspace = true` the active-activity
-            // trailing-empty invariant guarantees this resolves. For
-            // `false` the sentinel was not in the composed item list so
-            // `Stage2Resolution::NewWorkspace` is only constructed by
-            // `resolve_stage2` when the stage-2 picker returns the
-            // new-workspace sentinel, and the sentinel is only injected
-            // into the item list when `include_new_workspace = true`.
-            // The compositor trailing-empty invariant guarantees
-            // `filtered` is non-empty for the active activity;
-            // `trailing_empty_workspace` returning `None` here would
-            // require a resolver bug (sentinel returned from a
-            // zero-workspace filtered list), not a user gesture.
-            let Some(ws) = trailing_empty_workspace(&filtered) else {
-                unreachable!(
-                    "Stage2Resolution::NewWorkspace requires include_new_workspace=true \
-                     and a non-empty trailing-empty slot; resolver bug"
-                );
-            };
-            dispatch_move(client, ws.id)
-        }
     }
 }
 
@@ -430,23 +499,6 @@ fn current_activity_id(activities: &[Activity]) -> Result<u64, CliError> {
         .ok_or_else(|| {
             CliError::MalformedResponse(MalformedResponseSource::Server(
                 "no active activity".to_owned(),
-            ))
-        })
-}
-
-/// Returns the `(id, name)` pair of the currently-active activity, or
-/// `MalformedResponse` when none has `is_active: true` or when the id
-/// is present but not found again in the slice (the latter is
-/// unreachable in practice but avoids a bare `.expect()` at call sites).
-fn current_activity_id_and_name(activities: &[Activity]) -> Result<(u64, String), CliError> {
-    let id = current_activity_id(activities)?;
-    activities
-        .iter()
-        .find(|a| a.id == id)
-        .map(|a| (a.id, a.name.clone()))
-        .ok_or_else(|| {
-            CliError::MalformedResponse(MalformedResponseSource::Server(
-                "active activity id not found in snapshot".to_owned(),
             ))
         })
 }
@@ -535,25 +587,34 @@ fn compose_stage1_items(activities: &[Activity], sentinels: &SentinelNames) -> V
     out
 }
 
-/// Composes the stage-2 item list: workspace labels in compositor order,
-/// then `« New workspace »` (or its fallback) appended when
-/// `include_new_workspace` is `true`.
+/// Composes the stage-2 item list for the with-new path: workspace
+/// labels in compositor order, then `« New workspace »` (or its
+/// fallback) appended unconditionally.
 ///
 /// **Ordering invariant.** Workspace labels preserve the compositor-
 /// supplied order of the `workspaces` slice (no sort). The sentinel is
-/// **always** the last row when present. Both invariants are load-bearing
-/// for `resolve_stage2`: it walks the same slice to match labels, and
-/// the sentinel is identified by strict string equality (not position).
-fn compose_stage2_items(
+/// **always** the last row. Both invariants are load-bearing for
+/// `resolve_stage2_with_new`: it walks the same slice to match labels,
+/// and the sentinel is identified by strict string equality (not
+/// position).
+fn compose_stage2_items_with_new(
     workspaces: &[&Workspace],
     sentinels: &WorkspaceSentinelNames,
-    include_new_workspace: bool,
 ) -> Vec<String> {
     let mut out: Vec<String> = workspaces.iter().map(|w| workspace_label(w)).collect();
-    if include_new_workspace {
-        out.push(sentinels.new_workspace.clone());
-    }
+    out.push(sentinels.new_workspace.clone());
     out
+}
+
+/// Composes the stage-2 item list for the literal-only path: workspace
+/// labels in compositor order, with no sentinel appended.
+///
+/// **Ordering invariant.** Workspace labels preserve the compositor-
+/// supplied order of the `workspaces` slice (no sort). The sentinel is
+/// structurally absent — see [`Stage2ResolutionLiteralOnly`] for the
+/// type-level encoding of that absence.
+fn compose_stage2_items_literal_only(workspaces: &[&Workspace]) -> Vec<String> {
+    workspaces.iter().map(|w| workspace_label(w)).collect()
 }
 
 /// Resolves the stage-1 picker outcome to one of four branches:
@@ -585,32 +646,65 @@ fn resolve_stage1<'a>(
     }
 }
 
-/// Resolves the stage-2 picker outcome to one of four branches:
-/// cancellation, the `« New workspace »` sentinel, a literal workspace
-/// selection, or `Unknown` when the stage-2 picker returns a label not
-/// in the items we passed (a picker-side contract violation).
+/// Resolves the stage-2 picker outcome on the with-new path to one of
+/// four branches: cancellation, the `« New workspace »` sentinel, a
+/// literal workspace selection, or `Unknown` when the stage-2 picker
+/// returns a label not in the items we passed (a picker-side contract
+/// violation).
 ///
 /// `Unknown(label)` is returned rather than silently folding contract
 /// violations into `Cancelled` so callers can surface the anomaly as
 /// `MalformedResponse`.
-fn resolve_stage2<'a>(
+fn resolve_stage2_with_new<'a>(
     picked: PickerOutcome,
     sentinels: &WorkspaceSentinelNames,
     candidates: &'a [&'a Workspace],
-) -> Stage2Resolution<'a> {
+) -> Stage2ResolutionWithNew<'a> {
     match picked {
-        PickerOutcome::Cancelled => Stage2Resolution::Cancelled,
+        PickerOutcome::Cancelled => Stage2ResolutionWithNew::Cancelled,
         PickerOutcome::Selected(label) => {
             if label == sentinels.new_workspace {
-                Stage2Resolution::NewWorkspace
+                Stage2ResolutionWithNew::NewWorkspace
             } else if let Some(ws) = candidates
                 .iter()
                 .find(|w| workspace_label(w) == label)
                 .copied()
             {
-                Stage2Resolution::Selected(ws)
+                Stage2ResolutionWithNew::Selected(ws)
             } else {
-                Stage2Resolution::Unknown(label)
+                Stage2ResolutionWithNew::Unknown(label)
+            }
+        }
+    }
+}
+
+/// Resolves the stage-2 picker outcome on the literal-only path to one
+/// of three branches: cancellation, a literal workspace selection, or
+/// `Unknown` when the stage-2 picker returns a label not in the items we
+/// passed (a picker-side contract violation).
+///
+/// Takes no `sentinels` argument: on the literal-only path the
+/// `« New workspace »` sentinel is structurally absent from the composed
+/// item list, so no sentinel match needs to fire.
+///
+/// `Unknown(label)` is returned rather than silently folding contract
+/// violations into `Cancelled` so callers can surface the anomaly as
+/// `MalformedResponse`.
+fn resolve_stage2_literal_only<'a>(
+    picked: PickerOutcome,
+    candidates: &'a [&'a Workspace],
+) -> Stage2ResolutionLiteralOnly<'a> {
+    match picked {
+        PickerOutcome::Cancelled => Stage2ResolutionLiteralOnly::Cancelled,
+        PickerOutcome::Selected(label) => {
+            if let Some(ws) = candidates
+                .iter()
+                .find(|w| workspace_label(w) == label)
+                .copied()
+            {
+                Stage2ResolutionLiteralOnly::Selected(ws)
+            } else {
+                Stage2ResolutionLiteralOnly::Unknown(label)
             }
         }
     }
@@ -853,7 +947,7 @@ mod tests {
         assert_eq!(s.new_workspace, "__niri_activities_new_workspace__");
     }
 
-    // ---- compose_stage1_items / compose_stage2_items -----------------------
+    // ---- compose_stage1_items / compose_stage2_items_{with_new,literal_only} -
 
     #[test]
     fn compose_stage1_items_puts_current_activity_sentinel_first() {
@@ -877,27 +971,48 @@ mod tests {
     }
 
     #[test]
-    fn compose_stage2_items_appends_new_workspace_sentinel_when_include_true() {
+    fn compose_stage2_items_with_new_appends_new_workspace_sentinel() {
         let a = ws(1, 0, false, Some("DP-1"), vec![1], None);
         let b = ws(2, 1, false, Some("DP-1"), vec![1], None);
         let filtered = vec![&a, &b];
         let sentinels = workspace_sentinel_names(&["idx 0", "idx 1"]);
-        let items = compose_stage2_items(&filtered, &sentinels, true);
+        let items = compose_stage2_items_with_new(&filtered, &sentinels);
         assert_eq!(items.last().map(String::as_str), Some("« New workspace »"));
         assert_eq!(items.len(), 3);
     }
 
     #[test]
-    fn compose_stage2_items_omits_new_workspace_sentinel_when_include_false() {
+    fn compose_stage2_items_literal_only_omits_new_workspace_sentinel() {
         let a = ws(1, 0, false, Some("DP-1"), vec![1], None);
         let filtered = vec![&a];
-        let sentinels = workspace_sentinel_names(&["idx 0"]);
-        let items = compose_stage2_items(&filtered, &sentinels, false);
+        let items = compose_stage2_items_literal_only(&filtered);
         assert!(items.iter().all(|s| s != "« New workspace »"));
+        assert!(
+            items
+                .iter()
+                .all(|s| s != "__niri_activities_new_workspace__")
+        );
         assert_eq!(items.len(), 1);
     }
 
-    // ---- resolve_stage1 / resolve_stage2 -----------------------------------
+    #[test]
+    fn dispatch_stage2_literal_only_does_not_offer_new_workspace_sentinel_to_picker() {
+        // Structural pin: compose_stage2_items_literal_only's output
+        // contains neither the unicode sentinel nor the underscore
+        // fallback, even when the workspace labels would collide.
+        let a = ws(1, 0, false, Some("DP-1"), vec![1], None);
+        let b = ws(2, 1, false, Some("DP-1"), vec![1], None);
+        let filtered = vec![&a, &b];
+        let items = compose_stage2_items_literal_only(&filtered);
+        assert!(items.iter().all(|s| s != "« New workspace »"));
+        assert!(
+            items
+                .iter()
+                .all(|s| s != "__niri_activities_new_workspace__")
+        );
+    }
+
+    // ---- resolve_stage1 / resolve_stage2_{with_new,literal_only} ----------
 
     #[test]
     fn resolve_stage1_recognises_current_activity_sentinel_with_underscore_fallback() {
@@ -916,15 +1031,15 @@ mod tests {
     }
 
     #[test]
-    fn resolve_stage2_recognises_new_workspace_sentinel_with_underscore_fallback() {
+    fn resolve_stage2_with_new_recognises_new_workspace_sentinel_with_underscore_fallback() {
         let a = ws(1, 0, false, Some("DP-1"), vec![1], None);
         let filtered = vec![&a];
         // Force the underscore fallback by passing a colliding label.
         let sentinels = workspace_sentinel_names(&["« New workspace »"]);
         assert_eq!(sentinels.new_workspace, "__niri_activities_new_workspace__");
         let picked = PickerOutcome::Selected("__niri_activities_new_workspace__".into());
-        match resolve_stage2(picked, &sentinels, &filtered) {
-            Stage2Resolution::NewWorkspace => {}
+        match resolve_stage2_with_new(picked, &sentinels, &filtered) {
+            Stage2ResolutionWithNew::NewWorkspace => {}
             other => panic!("expected NewWorkspace, got {other:?}"),
         }
     }
@@ -943,15 +1058,29 @@ mod tests {
     }
 
     #[test]
-    fn resolve_stage2_unknown_label_returns_unknown_not_cancelled() {
+    fn resolve_stage2_with_new_unknown_label_returns_unknown_not_cancelled() {
         // Picker returned a label that wasn't in the items (contract
         // violation). Must surface as Unknown, not silently as Cancelled.
         let a = ws(1, 0, false, Some("DP-1"), vec![1], None);
         let filtered = vec![&a];
         let sentinels = workspace_sentinel_names(&["idx 0"]);
         let picked = PickerOutcome::Selected("not-a-workspace".into());
-        match resolve_stage2(picked, &sentinels, &filtered) {
-            Stage2Resolution::Unknown(label) => assert_eq!(label, "not-a-workspace"),
+        match resolve_stage2_with_new(picked, &sentinels, &filtered) {
+            Stage2ResolutionWithNew::Unknown(label) => assert_eq!(label, "not-a-workspace"),
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_stage2_literal_only_unknown_label_returns_unknown_not_cancelled() {
+        // Same contract-violation pin as the with-new path, but on the
+        // literal-only path: ensure both enums route picker-side
+        // contract violations to `Unknown(_)` rather than `Cancelled`.
+        let a = ws(1, 0, false, Some("DP-1"), vec![1], None);
+        let filtered = vec![&a];
+        let picked = PickerOutcome::Selected("not-a-workspace".into());
+        match resolve_stage2_literal_only(picked, &filtered) {
+            Stage2ResolutionLiteralOnly::Unknown(label) => assert_eq!(label, "not-a-workspace"),
             other => panic!("expected Unknown, got {other:?}"),
         }
     }
@@ -1090,8 +1219,8 @@ mod tests {
 
     #[test]
     fn run_picker_stage1_current_sentinel_proceeds_to_stage2_with_active_activity() {
-        // User picks « Current activity » → stage 2 fires for the active
-        // activity (Work, id 1) with `include_new_workspace = true`.
+        // User picks « Current activity » → stage 2 fires via the
+        // with-new path for the active activity (Work, id 1).
         let mut client = MockClient::new();
         client.expect(
             Request::Activities,
@@ -1389,6 +1518,82 @@ mod tests {
         match cli_err {
             CliError::MalformedResponse(MalformedResponseSource::Server(msg)) => {
                 assert_eq!(msg, "no active activity");
+            }
+            other => panic!("expected MalformedResponse(Server), got {other:?}"),
+        }
+        client.assert_consumed_in_order();
+    }
+
+    // ---- dispatch_stage2_{with_new,literal_only} ---------------------------
+
+    #[test]
+    fn dispatch_stage2_literal_only_empty_filtered_short_circuits_with_diagnostic() {
+        // Drive `dispatch_stage2_literal_only` via `run_picker`: pick a
+        // non-active activity ('Personal') whose workspaces are not on
+        // the focused output. The literal-only path's zero-case
+        // short-circuit must fire: eprintln + Ok(()) without spawning
+        // stage 2 and without dispatching the move action.
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![
+                act(1, "Work", true),
+                act(2, "Personal", false),
+            ])),
+        );
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![
+                ws(10, 0, true, Some("DP-1"), vec![1], None),
+                // Activity-2 workspace lives on DP-2, not the focused output.
+                ws(20, 0, false, Some("DP-2"), vec![2], None),
+            ])),
+        );
+        let pick = |prompt: &str, _items: &[String]| -> Result<PickerOutcome, CliError> {
+            if prompt == "Move window to activity:" {
+                Ok(PickerOutcome::Selected("Personal".into()))
+            } else {
+                panic!("stage 2 must NOT be spawned on literal-only empty zero-case");
+            }
+        };
+        run_picker(&mut client, pick).expect("zero-case must exit Ok");
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn dispatch_stage2_with_new_returns_server_error_when_trailing_empty_invariant_breached() {
+        // Drive `dispatch_stage2_with_new` via `run_here_picker`: the
+        // active activity has workspaces on the focused output but ALL
+        // of them have an active window (compositor invariant violated).
+        // Picking « New workspace » must surface as
+        // MalformedResponse(Server("trailing-empty workspace expected
+        // for active activity")) → exit 65, NOT panic.
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![act(1, "Work", true)])),
+        );
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![
+                // Focused workspace with a window; no trailing-empty.
+                ws(10, 0, true, Some("DP-1"), vec![1], Some(99)),
+                ws(20, 1, false, Some("DP-1"), vec![1], Some(88)),
+            ])),
+        );
+        let pick = |_prompt: &str, _items: &[String]| -> Result<PickerOutcome, CliError> {
+            Ok(PickerOutcome::Selected("« New workspace »".into()))
+        };
+        let err = run_here_picker(&mut client, pick)
+            .expect_err("trailing-empty breach must surface as MalformedResponse");
+        let cli_err = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<CliError>())
+            .expect("CliError must be in chain");
+        assert_eq!(cli_err.exit_code(), 65);
+        match cli_err {
+            CliError::MalformedResponse(MalformedResponseSource::Server(msg)) => {
+                assert_eq!(msg, "trailing-empty workspace expected for active activity");
             }
             other => panic!("expected MalformedResponse(Server), got {other:?}"),
         }
