@@ -44,11 +44,11 @@
 //!   unchanged.
 
 use anyhow::{Context, Result};
-use niri_ipc::{Action, ActivityReferenceArg, Request, Response};
+use niri_ipc::{Action, ActivityReferenceArg, Request};
 
-use crate::error::{CliError, MalformedResponseSource};
+use crate::error::CliError;
 use crate::ipc::NiriClient;
-use crate::ipc_helpers::{names_focused_first, send_expect_handled, variant_name};
+use crate::ipc_helpers::{names_focused_first, send_expect_activities, send_expect_handled};
 use crate::picker::PickerOutcome;
 
 /// Moves the focused workspace to the activity named `name`.
@@ -102,23 +102,6 @@ where
     match pick("Move workspace to activity:", &names)? {
         PickerOutcome::Cancelled => Ok(()),
         PickerOutcome::Selected(name) => run(client, &name),
-    }
-}
-
-/// Sends `Request::Activities` and unwraps the matching
-/// `Response::Activities` payload. Mismatched variants surface as
-/// `MalformedResponse(WrongVariant)` naming `Response::Activities`.
-fn send_expect_activities(client: &mut dyn NiriClient) -> Result<Vec<niri_ipc::Activity>> {
-    let resp = client.send(Request::Activities).map_err(CliError::from)?;
-    match resp {
-        Response::Activities(v) => Ok(v),
-        other => Err(
-            CliError::MalformedResponse(MalformedResponseSource::WrongVariant {
-                expected: "Response::Activities",
-                got: variant_name(&other).into(),
-            })
-            .into(),
-        ),
     }
 }
 

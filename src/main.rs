@@ -15,6 +15,7 @@ mod error;
 mod ipc;
 mod ipc_helpers;
 mod list;
+mod move_window;
 mod move_workspace;
 mod picker;
 mod remove;

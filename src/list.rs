@@ -22,7 +22,7 @@ use serde::Serialize;
 
 use crate::error::{CliError, MalformedResponseSource};
 use crate::ipc::NiriClient;
-use crate::ipc_helpers::variant_name;
+use crate::ipc_helpers::{send_expect_activities, send_expect_workspaces, variant_name};
 
 /// Options threaded from [`crate::cli::dispatch`].
 pub(crate) struct ListOpts<'a> {
@@ -99,28 +99,6 @@ fn classify_write_err(err: anyhow::Error) -> anyhow::Error {
 }
 
 // ---- IPC: typed-variant expectation helpers ---------------------------------
-
-/// Sends [`Request::Activities`] and unwraps the expected [`Response::Activities`].
-///
-/// Any other `Response` variant is surfaced as [`CliError::MalformedResponse`]
-/// carrying [`MalformedResponseSource::WrongVariant`] with the Debug-formatted
-/// payload of whatever arrived. Transport / decode / server errors flow
-/// through the existing `IpcError` → `CliError` mapping.
-fn send_expect_activities(client: &mut dyn NiriClient) -> Result<Vec<Activity>> {
-    let resp = client.send(Request::Activities).map_err(CliError::from)?;
-    match resp {
-        Response::Activities(v) => Ok(v),
-        other => Err(wrong_variant("Response::Activities", &other).into()),
-    }
-}
-
-fn send_expect_workspaces(client: &mut dyn NiriClient) -> Result<Vec<Workspace>> {
-    let resp = client.send(Request::Workspaces).map_err(CliError::from)?;
-    match resp {
-        Response::Workspaces(v) => Ok(v),
-        other => Err(wrong_variant("Response::Workspaces", &other).into()),
-    }
-}
 
 fn send_expect_windows(client: &mut dyn NiriClient) -> Result<Vec<Window>> {
     let resp = client.send(Request::Windows).map_err(CliError::from)?;

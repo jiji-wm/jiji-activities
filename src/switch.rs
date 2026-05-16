@@ -19,11 +19,11 @@
 //! fail loudly.
 
 use anyhow::{Context, Result};
-use niri_ipc::{Action, Activity, ActivityReferenceArg, Request, Response};
+use niri_ipc::{Action, ActivityReferenceArg, Request};
 
-use crate::error::{CliError, MalformedResponseSource};
+use crate::error::CliError;
 use crate::ipc::NiriClient;
-use crate::ipc_helpers::{names_focused_first, send_expect_handled, variant_name};
+use crate::ipc_helpers::{names_focused_first, send_expect_activities, send_expect_handled};
 use crate::picker::PickerOutcome;
 
 /// Switches to the activity named `name` over IPC.
@@ -51,27 +51,6 @@ pub(crate) fn run(client: &mut dyn NiriClient, name: &str) -> Result<()> {
         activity: ActivityReferenceArg::Name(name.to_owned()),
     });
     send_expect_handled(client, req, Some(name)).context("switching activity")
-}
-
-/// Sends [`Request::Activities`] and unwraps the expected
-/// [`Response::Activities`].
-///
-/// Mirrors `list::send_expect_activities`; kept local rather than shared
-/// because re-exporting that helper would widen `list`'s public surface
-/// for a single re-use. The mismatch path produces the same typed
-/// `WrongVariant` error so behavioural parity is preserved.
-fn send_expect_activities(client: &mut dyn NiriClient) -> Result<Vec<Activity>> {
-    let resp = client.send(Request::Activities).map_err(CliError::from)?;
-    match resp {
-        Response::Activities(v) => Ok(v),
-        other => Err(
-            CliError::MalformedResponse(MalformedResponseSource::WrongVariant {
-                expected: "Response::Activities",
-                got: variant_name(&other).into(),
-            })
-            .into(),
-        ),
-    }
 }
 
 /// Opens a single-select picker over the current activity list, then

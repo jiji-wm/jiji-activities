@@ -30,7 +30,7 @@ use niri_ipc::{
 
 use crate::error::{CliError, MalformedResponseSource};
 use crate::ipc::{IpcError, NiriClient};
-use crate::ipc_helpers::variant_name;
+use crate::ipc_helpers::{send_expect_activities, send_expect_workspaces, variant_name};
 use crate::picker::PickerOutcome;
 use crate::picker::multi_select::{self, MultiPickerOutcome};
 
@@ -170,40 +170,6 @@ fn send_expect_handled(client: &mut dyn NiriClient, req: Request) -> Result<()> 
             Err(CliError::MalformedResponse(MalformedResponseSource::Server(msg)).into())
         }
         Err(other) => Err(CliError::from(other).into()),
-    }
-}
-
-/// Sends `Request::Activities` and unwraps the matching
-/// `Response::Activities` payload. Mismatched variants surface as
-/// `MalformedResponse(WrongVariant)`.
-fn send_expect_activities(client: &mut dyn NiriClient) -> Result<Vec<Activity>> {
-    let resp = client.send(Request::Activities).map_err(CliError::from)?;
-    match resp {
-        Response::Activities(v) => Ok(v),
-        other => Err(
-            CliError::MalformedResponse(MalformedResponseSource::WrongVariant {
-                expected: "Response::Activities",
-                got: variant_name(&other).into(),
-            })
-            .into(),
-        ),
-    }
-}
-
-/// Sends `Request::Workspaces` and unwraps the matching
-/// `Response::Workspaces` payload. Mismatched variants surface as
-/// `MalformedResponse(WrongVariant)`.
-fn send_expect_workspaces(client: &mut dyn NiriClient) -> Result<Vec<Workspace>> {
-    let resp = client.send(Request::Workspaces).map_err(CliError::from)?;
-    match resp {
-        Response::Workspaces(v) => Ok(v),
-        other => Err(
-            CliError::MalformedResponse(MalformedResponseSource::WrongVariant {
-                expected: "Response::Workspaces",
-                got: variant_name(&other).into(),
-            })
-            .into(),
-        ),
     }
 }
 

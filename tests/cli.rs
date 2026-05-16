@@ -76,13 +76,17 @@ fn help_lists_all_subcommands() {
     // e.g. "switch" does not accidentally match "switch-previous".
     for sub in [
         "switch-previous",
-        "move-window",
+        "move-window-here",
         "move-workspace",
         "assign-workspace",
         "create",
         "remove",
         "save",
         "list",
+        // "move-window" checked after "move-window-here" so a plain
+        // `contains("move-window")` does not accidentally match the longer
+        // name; the two-space-and-trailing-space pattern also disambiguates.
+        "move-window",
         // "switch" checked last and with delimiter so it doesn't hit "switch-previous"
         "switch",
     ] {
@@ -194,6 +198,43 @@ fn toggle_alias_no_socket_exits_69() {
     Command::cargo_bin(BIN)
         .unwrap()
         .arg("toggle")
+        .env_remove("NIRI_SOCKET")
+        .assert()
+        .code(69);
+}
+
+#[test]
+fn move_window_no_socket_exits_69() {
+    // `move-window` with no arg opens the fuzzel picker. With
+    // `$NIRI_SOCKET` unset, two distinct paths can produce exit 69:
+    //
+    // 1. If `fuzzel` IS installed on this host, `which fuzzel` succeeds
+    //    but `Request::Activities` fails on the missing socket →
+    //    `SocketUnavailable`.
+    // 2. If `fuzzel` is NOT installed, `which fuzzel` short-circuits to
+    //    `PickerUnavailable`.
+    //
+    // Both routes share exit code 69. The assertion target is the
+    // wire-up (no-arg branch routed through the picker/IPC path, not
+    // the `NotImplemented` stub it used to fall through to). A
+    // regression to exit 70 would mean the no-arg branch silently fell
+    // back to the stub.
+    Command::cargo_bin(BIN)
+        .unwrap()
+        .args(["move-window"])
+        .env_remove("NIRI_SOCKET")
+        .assert()
+        .code(69);
+}
+
+#[test]
+fn move_window_here_no_socket_exits_69() {
+    // `move-window-here` is always picker-driven (no named-arg form).
+    // Same exit-code matrix as `move-window` no-arg. A regression to
+    // exit 70 would mean the verb wasn't wired up.
+    Command::cargo_bin(BIN)
+        .unwrap()
+        .args(["move-window-here"])
         .env_remove("NIRI_SOCKET")
         .assert()
         .code(69);

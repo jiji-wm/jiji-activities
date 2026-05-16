@@ -1,6 +1,6 @@
 //! Shared IPC plumbing reused across subcommand modules.
 //!
-//! Three helpers live here:
+//! Five helpers live here:
 //!
 //! - [`variant_name`] — static name for a [`Response`] variant, used
 //!   by every `Response::Handled`-or-mismatch site to populate the
@@ -10,16 +10,23 @@
 //!   expects `Response::Handled`, routing the compositor's
 //!   `"activity not found"` wire string to the typed
 //!   [`CliError::ActivityNotFound`] when an activity name is in scope.
+//! - [`send_expect_activities`] — wraps a `client.send(Request::Activities)`
+//!   call that expects `Response::Activities`; mismatched variants surface
+//!   as `WrongVariant`.
+//! - [`send_expect_workspaces`] — wraps a `client.send(Request::Workspaces)`
+//!   call that expects `Response::Workspaces`; mismatched variants surface
+//!   as `WrongVariant`.
 //! - [`names_focused_first`] — pure helper that reorders an
 //!   [`Activity`] slice's names so the focused activity (if any) is
 //!   first; remaining names preserve their compositor-supplied order.
 //!
-//! Centralising these avoids three-way duplication between
-//! `crate::switch`, `crate::switch_previous`, and
-//! `crate::move_workspace`, and closes the latent risk that two
-//! independent `variant_name` definitions drift apart.
+//! Centralising these avoids N-way duplication between
+//! `crate::switch`, `crate::switch_previous`,
+//! `crate::move_workspace`, `crate::assign_workspace`, `crate::list`,
+//! and `crate::move_window`, and closes the latent risk that
+//! independent definitions drift apart.
 
-use niri_ipc::{Activity, Request, Response};
+use niri_ipc::{Activity, Request, Response, Workspace};
 
 use crate::error::{CliError, MalformedResponseSource};
 use crate::ipc::{IpcError, NiriClient};
@@ -100,6 +107,56 @@ pub(crate) fn send_expect_handled(
             None => Err(CliError::MalformedResponse(MalformedResponseSource::Server(msg)).into()),
         },
         Err(other) => Err(CliError::from(other).into()),
+    }
+}
+
+/// Sends [`Request::Activities`] and unwraps the matching
+/// [`Response::Activities`] payload.
+///
+/// **Contract:**
+/// - `Response::Activities(v)` → `Ok(v)`.
+/// - Any other `Response` variant →
+///   `CliError::MalformedResponse(WrongVariant { expected:
+///   "Response::Activities", got: variant_name(&other) })`.
+/// - Transport / decode / server errors flow through the existing
+///   `IpcError → CliError` mapping unchanged.
+pub(crate) fn send_expect_activities(client: &mut dyn NiriClient) -> anyhow::Result<Vec<Activity>> {
+    let resp = client.send(Request::Activities).map_err(CliError::from)?;
+    match resp {
+        Response::Activities(v) => Ok(v),
+        other => Err(
+            CliError::MalformedResponse(MalformedResponseSource::WrongVariant {
+                expected: "Response::Activities",
+                got: variant_name(&other).into(),
+            })
+            .into(),
+        ),
+    }
+}
+
+/// Sends [`Request::Workspaces`] and unwraps the matching
+/// [`Response::Workspaces`] payload.
+///
+/// **Contract:**
+/// - `Response::Workspaces(v)` → `Ok(v)`.
+/// - Any other `Response` variant →
+///   `CliError::MalformedResponse(WrongVariant { expected:
+///   "Response::Workspaces", got: variant_name(&other) })`.
+/// - Transport / decode / server errors flow through the existing
+///   `IpcError → CliError` mapping unchanged.
+pub(crate) fn send_expect_workspaces(
+    client: &mut dyn NiriClient,
+) -> anyhow::Result<Vec<Workspace>> {
+    let resp = client.send(Request::Workspaces).map_err(CliError::from)?;
+    match resp {
+        Response::Workspaces(v) => Ok(v),
+        other => Err(
+            CliError::MalformedResponse(MalformedResponseSource::WrongVariant {
+                expected: "Response::Workspaces",
+                got: variant_name(&other).into(),
+            })
+            .into(),
+        ),
     }
 }
 
@@ -311,6 +368,58 @@ mod tests {
                 assert_eq!(msg, "some other failure");
             }
             other => panic!("expected MalformedResponse(Server), got {other:?}"),
+        }
+        client.assert_consumed_in_order();
+    }
+
+    // ---- send_expect_activities / send_expect_workspaces ----
+
+    #[test]
+    fn send_expect_activities_wrong_variant_is_malformed() {
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Version("v".into())),
+        );
+        let err = send_expect_activities(&mut client).expect_err("wrong variant must fail");
+        let cli_err = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<CliError>())
+            .expect("CliError must be in chain");
+        match cli_err {
+            CliError::MalformedResponse(MalformedResponseSource::WrongVariant {
+                expected,
+                got,
+            }) => {
+                assert_eq!(*expected, "Response::Activities");
+                assert_eq!(got, "Response::Version");
+            }
+            other => panic!("expected WrongVariant, got {other:?}"),
+        }
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn send_expect_workspaces_wrong_variant_is_malformed() {
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Version("v".into())),
+        );
+        let err = send_expect_workspaces(&mut client).expect_err("wrong variant must fail");
+        let cli_err = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<CliError>())
+            .expect("CliError must be in chain");
+        match cli_err {
+            CliError::MalformedResponse(MalformedResponseSource::WrongVariant {
+                expected,
+                got,
+            }) => {
+                assert_eq!(*expected, "Response::Workspaces");
+                assert_eq!(got, "Response::Version");
+            }
+            other => panic!("expected WrongVariant, got {other:?}"),
         }
         client.assert_consumed_in_order();
     }

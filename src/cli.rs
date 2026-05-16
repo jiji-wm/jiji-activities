@@ -1,9 +1,9 @@
 //! Clap-derive subcommand surface and per-subcommand dispatch.
 //!
-//! Each subcommand routes to a `cmd_<name>` helper. Wired-up subcommands
-//! (`switch`, `switch-previous`, `move-workspace`, `assign-workspace`,
-//! `create`, `remove`, `list`) issue real IPC; unwired ones return
-//! [`CliError::NotImplemented`] (exit 70). The dispatch shape and CLI
+//! Each subcommand routes to a `cmd_<name>` helper. All current
+//! subcommands (`switch`, `switch-previous`, `move-window`,
+//! `move-window-here`, `move-workspace`, `assign-workspace`, `create`,
+//! `remove`, `save`, `list`) issue real IPC. The dispatch shape and CLI
 //! surface are pinned by `tests/cli.rs`.
 
 use anyhow::{Context, Result};
@@ -11,9 +11,9 @@ use clap::{Parser, Subcommand};
 
 use crate::assign_workspace;
 use crate::create;
-use crate::error::CliError;
 use crate::ipc;
 use crate::list::{self, ListOpts};
+use crate::move_window;
 use crate::move_workspace;
 use crate::picker;
 use crate::remove;
@@ -44,8 +44,11 @@ pub(crate) enum Cmd {
     #[command(alias = "toggle")]
     SwitchPrevious,
 
-    /// Move the focused window to an activity (picker if no name).
+    /// Move the focused window to a workspace in an activity (picker if no name).
     MoveWindow { name: Option<String> },
+
+    /// Move the focused window to a workspace within the current activity (picker).
+    MoveWindowHere,
 
     /// Move the focused workspace to an activity (picker if no name).
     MoveWorkspace { name: Option<String> },
@@ -81,6 +84,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
         Cmd::Switch { name } => cmd_switch(name),
         Cmd::SwitchPrevious => cmd_switch_previous(),
         Cmd::MoveWindow { name } => cmd_move_window(name),
+        Cmd::MoveWindowHere => cmd_move_window_here(),
         Cmd::MoveWorkspace { name } => cmd_move_workspace(name),
         Cmd::AssignWorkspace => cmd_assign_workspace(),
         Cmd::Create { name } => cmd_create(name),
@@ -117,8 +121,34 @@ fn cmd_switch_previous() -> Result<()> {
     switch_previous::run(client.as_mut())
 }
 
-fn cmd_move_window(_name: Option<String>) -> Result<()> {
-    Err(CliError::NotImplemented("move-window").into())
+fn cmd_move_window(name: Option<String>) -> Result<()> {
+    match name {
+        Some(n) => {
+            let mut client = ipc::make_client();
+            move_window::run(client.as_mut(), &n)
+        }
+        None => {
+            // Verify `fuzzel` is on $PATH BEFORE any IPC round-trip so a
+            // missing-dep failure surfaces with a fuzzel-naming stderr
+            // message ("fuzzel: not on $PATH (...)") rather than the
+            // generic "niri socket unavailable" the IPC layer would
+            // produce on a disconnected socket.
+            picker::ensure_available().context("verifying move-window picker availability")?;
+            let mut client = ipc::make_client();
+            move_window::run_picker(client.as_mut(), picker::pick_one)
+                .context("running move-window picker")
+        }
+    }
+}
+
+fn cmd_move_window_here() -> Result<()> {
+    // Verify `fuzzel` is on $PATH BEFORE any IPC round-trip — same
+    // rationale as cmd_move_window's no-arg branch. `move-window-here`
+    // has no named-arg form; it is always picker-driven.
+    picker::ensure_available().context("verifying move-window-here picker availability")?;
+    let mut client = ipc::make_client();
+    move_window::run_here_picker(client.as_mut(), picker::pick_one)
+        .context("running move-window-here picker")
 }
 
 fn cmd_move_workspace(name: Option<String>) -> Result<()> {
