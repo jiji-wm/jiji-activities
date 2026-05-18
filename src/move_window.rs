@@ -75,6 +75,8 @@
 //!   All use the same rustdoc-discipline pattern as
 //!   [`crate::assign_workspace::focused_workspace`].
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use niri_ipc::{Action, Activity, Request, Response, Workspace, WorkspaceReferenceArg};
 
@@ -171,6 +173,20 @@ enum Stage1Resolution<'a> {
 enum Stage2ResolutionWithNew<'a> {
     NewWorkspace,
     Selected(&'a Workspace),
+    /// User picked the row annotated with the ` (current)` suffix — the
+    /// focused window already lives in this workspace, so the move is a
+    /// no-op. Surfaced as a typed resolution rather than dispatched: the
+    /// caller writes a stderr diagnostic and exits 0 without an IPC
+    /// round-trip. Carries the workspace id so the caller can render the
+    /// un-annotated label in the diagnostic.
+    ///
+    /// **Why a distinct variant.** `AlreadyCurrent` represents user
+    /// intent (clicked the `(current)`-annotated row); [`Self::Unknown`]
+    /// represents a picker-contract violation (label not in items).
+    /// Collapsing the two would route a contract violation to a
+    /// user-gesture path, which is the silent-failure anti-pattern this
+    /// module otherwise guards against.
+    AlreadyCurrent(u64),
     Cancelled,
     /// The stage-2 picker returned a label that was not in the items we
     /// passed — a picker-side contract violation. Propagated as
@@ -207,6 +223,13 @@ enum Stage2ResolutionLiteralOnly<'a> {
     /// exists regardless.
     NewWorkspace,
     Selected(&'a Workspace),
+    /// User picked the row annotated with the ` (current)` suffix — the
+    /// focused window already lives in this workspace, so the move is a
+    /// no-op. Same rationale as
+    /// [`Stage2ResolutionWithNew::AlreadyCurrent`]: surfaced as a typed
+    /// resolution to keep user intent and picker-contract violations on
+    /// distinct branches.
+    AlreadyCurrent(u64),
     Cancelled,
     /// The stage-2 picker returned a label that was not in the items we
     /// passed — a picker-side contract violation. Propagated as
@@ -332,12 +355,15 @@ where
     let stage1_items = compose_stage1_items(&activities, &stage1_sentinels);
     let stage1_picked = pick("Move window to activity:", &stage1_items)?;
 
+    let activity_names: HashMap<u64, String> =
+        activities.iter().map(|a| (a.id, a.name.clone())).collect();
+
     match resolve_stage1(stage1_picked, &stage1_sentinels, &activities) {
         Stage1Resolution::Cancelled => Ok(()),
         Stage1Resolution::CurrentActivity => {
             let active = current_activity(&activities)?;
             let name = active.name.clone();
-            dispatch_stage2_with_new(client, active.id, &name, &pick)
+            dispatch_stage2_with_new(client, active.id, &name, &activity_names, &pick)
         }
         // Active activity → with-new path (compositor trailing-empty
         // invariant guarantees a landing slot for « New workspace »).
@@ -345,11 +371,11 @@ where
         // trailing-empty, so no sentinel offered).
         Stage1Resolution::Selected(activity) if activity.is_active => {
             let name = activity.name.clone();
-            dispatch_stage2_with_new(client, activity.id, &name, &pick)
+            dispatch_stage2_with_new(client, activity.id, &name, &activity_names, &pick)
         }
         Stage1Resolution::Selected(activity) => {
             let name = activity.name.clone();
-            dispatch_stage2_literal_only(client, activity.id, &name, &pick)
+            dispatch_stage2_literal_only(client, activity.id, &name, &activity_names, &pick)
         }
         Stage1Resolution::NewActivity => {
             // Prompt for a name in the same fuzzel-shaped UI. Pre-reject
@@ -378,12 +404,29 @@ where
                         .to_owned(),
                 ))
             })?;
+            // Rebuild the activity-name map from the post-create
+            // snapshot so the new activity's id is in scope for the
+            // stage-2 label annotations.
+            let activity_names_after: HashMap<u64, String> =
+                after.iter().map(|a| (a.id, a.name.clone())).collect();
             if new_activity.is_active {
-                dispatch_stage2_with_new(client, new_activity.id, &new_name, &pick)
-                    .context("dispatching stage 2 against newly-created activity")
+                dispatch_stage2_with_new(
+                    client,
+                    new_activity.id,
+                    &new_name,
+                    &activity_names_after,
+                    &pick,
+                )
+                .context("dispatching stage 2 against newly-created activity")
             } else {
-                dispatch_stage2_literal_only(client, new_activity.id, &new_name, &pick)
-                    .context("dispatching stage 2 against newly-created activity")
+                dispatch_stage2_literal_only(
+                    client,
+                    new_activity.id,
+                    &new_name,
+                    &activity_names_after,
+                    &pick,
+                )
+                .context("dispatching stage 2 against newly-created activity")
             }
         }
         Stage1Resolution::Unknown(row) => Err(CliError::MalformedResponse(
@@ -464,7 +507,9 @@ where
     let active = current_activity(&activities)?;
     let activity_id = active.id;
     let activity_name = active.name.clone();
-    dispatch_stage2_with_new(client, activity_id, &activity_name, pick)
+    let activity_names: HashMap<u64, String> =
+        activities.iter().map(|a| (a.id, a.name.clone())).collect();
+    dispatch_stage2_with_new(client, activity_id, &activity_name, &activity_names, pick)
 }
 
 // ---- Stage-2 dispatch (with-new vs literal-only) ---------------------------
@@ -501,13 +546,23 @@ fn dispatch_stage2_with_new<F>(
     client: &mut dyn NiriClient,
     target_activity_id: u64,
     target_activity_name: &str,
+    activity_names: &HashMap<u64, String>,
     pick: F,
 ) -> Result<()>
 where
     F: FnOnce(&str, &[String]) -> Result<PickerOutcome, CliError>,
 {
+    debug_assert!(
+        activity_names.contains_key(&target_activity_id),
+        "target activity id not in name map — caller construction drift",
+    );
     let workspaces = send_expect_workspaces(client).context("requesting workspaces")?;
     let focused_output = focused_output_name(&workspaces)?;
+    // Ordering invariant: read the focused workspace id AFTER
+    // `focused_output_name` so the `no focused workspace` / `focused
+    // workspace has no output` synthetic errors fire first; this
+    // computation is best-effort (None is a legitimate "no focus").
+    let focused_workspace_id = focused_workspace(&workspaces).ok().map(|w| w.id);
     let mut filtered =
         workspaces_in_activity_on_focused_output(&workspaces, target_activity_id, focused_output);
     sort_for_picker(&mut filtered);
@@ -515,15 +570,41 @@ where
     let workspace_labels: Vec<String> = filtered.iter().map(|w| workspace_label(w)).collect();
     let workspace_label_refs: Vec<&str> = workspace_labels.iter().map(String::as_str).collect();
     let stage2_sentinel = workspace_sentinel_names(&workspace_label_refs);
-    let stage2_items = compose_stage2_items_with_new(&filtered, stage2_sentinel);
+    let stage2_items = compose_stage2_items_with_new(
+        &filtered,
+        focused_workspace_id,
+        stage2_sentinel,
+        target_activity_id,
+        activity_names,
+    );
 
     let stage2_picked = pick("Move window to workspace:", &stage2_items)?;
-    match resolve_stage2_with_new(stage2_picked, stage2_sentinel, &filtered) {
+    match resolve_stage2_with_new(
+        stage2_picked,
+        stage2_sentinel,
+        &filtered,
+        focused_workspace_id,
+    ) {
         Stage2ResolutionWithNew::Cancelled => Ok(()),
         Stage2ResolutionWithNew::Selected(ws) => {
             let ws_id = ws.id;
             dispatch_move(client, ws_id)?;
             print_move_confirmation(ws_id, target_activity_name);
+            Ok(())
+        }
+        Stage2ResolutionWithNew::AlreadyCurrent(ws_id) => {
+            // Use the un-annotated `workspace_label` here: the stderr message already
+            // says "already in workspace", so a trailing `(current)` would be redundant.
+            // Membership disclosure (`[sticky]`, `[also in: …]`) is also elided — the
+            // user just clicked this row, they know where the window lives.
+            let label = workspaces
+                .iter()
+                .find(|w| w.id == ws_id)
+                .map(workspace_label)
+                .unwrap_or_else(|| format!("id {ws_id}"));
+            eprintln!(
+                "niri-activities: focused window is already in workspace {label}; nothing to move"
+            );
             Ok(())
         }
         Stage2ResolutionWithNew::Unknown(label) => Err(CliError::MalformedResponse(
@@ -562,13 +643,22 @@ fn dispatch_stage2_literal_only<F>(
     client: &mut dyn NiriClient,
     target_activity_id: u64,
     target_activity_name: &str,
+    activity_names: &HashMap<u64, String>,
     pick: F,
 ) -> Result<()>
 where
     F: FnOnce(&str, &[String]) -> Result<PickerOutcome, CliError>,
 {
+    debug_assert!(
+        activity_names.contains_key(&target_activity_id),
+        "target activity id not in name map — caller construction drift",
+    );
     let workspaces = send_expect_workspaces(client).context("requesting workspaces")?;
     let focused_output = focused_output_name(&workspaces)?;
+    // Ordering invariant: read the focused workspace id AFTER
+    // `focused_output_name` so the synthetic errors fire first. See
+    // `dispatch_stage2_with_new` for the matching rationale.
+    let focused_workspace_id = focused_workspace(&workspaces).ok().map(|w| w.id);
     let mut filtered =
         workspaces_in_activity_on_focused_output(&workspaces, target_activity_id, focused_output);
     sort_for_picker(&mut filtered);
@@ -580,7 +670,12 @@ where
         return Ok(());
     }
 
-    let stage2_items = compose_stage2_items_literal_only(&filtered);
+    let stage2_items = compose_stage2_items_literal_only(
+        &filtered,
+        focused_workspace_id,
+        target_activity_id,
+        activity_names,
+    );
     // Compute the sentinel against the live label set even though the
     // literal-only composer does not inject it. This keeps the resolver
     // call shape symmetric with `dispatch_stage2_with_new` and means
@@ -591,12 +686,29 @@ where
     let stage2_sentinel = workspace_sentinel_names(&labels);
 
     let stage2_picked = pick("Move window to workspace:", &stage2_items)?;
-    match resolve_stage2_literal_only(stage2_picked, stage2_sentinel, &filtered) {
+    match resolve_stage2_literal_only(
+        stage2_picked,
+        stage2_sentinel,
+        &filtered,
+        focused_workspace_id,
+    ) {
         Stage2ResolutionLiteralOnly::Cancelled => Ok(()),
         Stage2ResolutionLiteralOnly::Selected(ws) => {
             let ws_id = ws.id;
             dispatch_move(client, ws_id)?;
             print_move_confirmation(ws_id, target_activity_name);
+            Ok(())
+        }
+        Stage2ResolutionLiteralOnly::AlreadyCurrent(ws_id) => {
+            // See dispatch_stage2_with_new for the rationale on rendering the un-annotated label here.
+            let label = workspaces
+                .iter()
+                .find(|w| w.id == ws_id)
+                .map(workspace_label)
+                .unwrap_or_else(|| format!("id {ws_id}"));
+            eprintln!(
+                "niri-activities: focused window is already in workspace {label}; nothing to move"
+            );
             Ok(())
         }
         Stage2ResolutionLiteralOnly::Unknown(label) => Err(CliError::MalformedResponse(
@@ -831,8 +943,24 @@ fn compose_stage1_items(activities: &[Activity], sentinels: &Stage1Sentinels) ->
 /// `resolve_stage2_with_new`: it walks the same slice to match labels,
 /// and the sentinel is identified by strict string equality (not
 /// position).
-fn compose_stage2_items_with_new(workspaces: &[&Workspace], sentinel: &str) -> Vec<String> {
-    let mut out: Vec<String> = workspaces.iter().map(|w| workspace_label(w)).collect();
+fn compose_stage2_items_with_new(
+    workspaces: &[&Workspace],
+    focused_workspace_id: Option<u64>,
+    sentinel: &str,
+    target_activity_id: u64,
+    activity_names: &HashMap<u64, String>,
+) -> Vec<String> {
+    let mut out: Vec<String> = workspaces
+        .iter()
+        .map(|w| {
+            workspace_label_with_annotations(
+                w,
+                target_activity_id,
+                focused_workspace_id == Some(w.id),
+                activity_names,
+            )
+        })
+        .collect();
     out.push(sentinel.to_owned());
     out
 }
@@ -844,8 +972,23 @@ fn compose_stage2_items_with_new(workspaces: &[&Workspace], sentinel: &str) -> V
 /// supplied order of the `workspaces` slice (no sort). The sentinel is
 /// structurally absent — see [`Stage2ResolutionLiteralOnly`] for the
 /// type-level encoding of that absence.
-fn compose_stage2_items_literal_only(workspaces: &[&Workspace]) -> Vec<String> {
-    workspaces.iter().map(|w| workspace_label(w)).collect()
+fn compose_stage2_items_literal_only(
+    workspaces: &[&Workspace],
+    focused_workspace_id: Option<u64>,
+    target_activity_id: u64,
+    activity_names: &HashMap<u64, String>,
+) -> Vec<String> {
+    workspaces
+        .iter()
+        .map(|w| {
+            workspace_label_with_annotations(
+                w,
+                target_activity_id,
+                focused_workspace_id == Some(w.id),
+                activity_names,
+            )
+        })
+        .collect()
 }
 
 /// Resolves the stage-1 picker outcome to one of five branches:
@@ -893,17 +1036,27 @@ fn resolve_stage2_with_new<'a>(
     picked: PickerOutcome,
     sentinel: &str,
     candidates: &'a [&'a Workspace],
+    focused_workspace_id: Option<u64>,
 ) -> Stage2ResolutionWithNew<'a> {
     match picked {
         PickerOutcome::Cancelled => Stage2ResolutionWithNew::Cancelled,
         PickerOutcome::Selected(label) => {
             if label == sentinel {
                 Stage2ResolutionWithNew::NewWorkspace
+            } else if let Some(ws) = focused_workspace_id
+                .and_then(|focused_id| candidates.iter().find(|w| w.id == focused_id).copied())
+                .filter(|ws| label == format!("{} (current)", workspace_label(ws)))
+            {
+                Stage2ResolutionWithNew::AlreadyCurrent(ws.id)
             } else if let Some(ws) = candidates
                 .iter()
                 .find(|w| workspace_label(w) == label)
                 .copied()
             {
+                debug_assert!(
+                    focused_workspace_id != Some(ws.id),
+                    "Selected branch reached for the focused workspace; AlreadyCurrent branch should have matched first",
+                );
                 Stage2ResolutionWithNew::Selected(ws)
             } else {
                 Stage2ResolutionWithNew::Unknown(label)
@@ -934,17 +1087,27 @@ fn resolve_stage2_literal_only<'a>(
     picked: PickerOutcome,
     sentinel: &str,
     candidates: &'a [&'a Workspace],
+    focused_workspace_id: Option<u64>,
 ) -> Stage2ResolutionLiteralOnly<'a> {
     match picked {
         PickerOutcome::Cancelled => Stage2ResolutionLiteralOnly::Cancelled,
         PickerOutcome::Selected(label) => {
             if label == sentinel {
                 Stage2ResolutionLiteralOnly::NewWorkspace
+            } else if let Some(ws) = focused_workspace_id
+                .and_then(|focused_id| candidates.iter().find(|w| w.id == focused_id).copied())
+                .filter(|ws| label == format!("{} (current)", workspace_label(ws)))
+            {
+                Stage2ResolutionLiteralOnly::AlreadyCurrent(ws.id)
             } else if let Some(ws) = candidates
                 .iter()
                 .find(|w| workspace_label(w) == label)
                 .copied()
             {
+                debug_assert!(
+                    focused_workspace_id != Some(ws.id),
+                    "Selected branch reached for the focused workspace; AlreadyCurrent branch should have matched first",
+                );
                 Stage2ResolutionLiteralOnly::Selected(ws)
             } else {
                 Stage2ResolutionLiteralOnly::Unknown(label)
@@ -986,6 +1149,42 @@ fn workspace_label(ws: &Workspace) -> String {
         Some(name) => format!("{name} ({unit} {value})"),
         None => format!("{unit} {value}"),
     }
+}
+
+/// Renders a workspace as a stage-2 picker label with optional
+/// annotation suffixes layered on top of the base [`workspace_label`]
+/// output.
+///
+/// Annotations (suffix order is **load-bearing** and pinned by tests):
+///
+/// 1. **Base** — [`workspace_label`] output.
+/// 2. **Membership suffix** — currently a no-op placeholder; reserved
+///    for a future ` [sticky]` / ` [also in: <names>]` extension that
+///    will land alongside the multi-activity disclosure work. The
+///    parameters `target_activity_id` and `activity_names` are accepted
+///    today so the call-site signatures do not churn when that
+///    extension lands.
+/// 3. **Current suffix** — ` (current)` iff `is_current == true`.
+///
+/// **Suffix-ordering invariant.** The final shape is always
+/// `{base}{membership}{current}` — membership annotations come BEFORE
+/// the `(current)` marker. This ordering is the resolver's source of
+/// truth for label matching: future extensions to this function must
+/// preserve it. The invariant is pinned by the
+/// `workspace_label_*_in_correct_order` tests when membership lands.
+fn workspace_label_with_annotations(
+    ws: &Workspace,
+    _target_activity_id: u64,
+    is_current: bool,
+    _activity_names: &HashMap<u64, String>,
+) -> String {
+    let base = workspace_label(ws);
+    // Extension point: the multi-activity / sticky membership suffix
+    // slots in here (between `base` and `current`). Keep this site as
+    // the single source of suffix order — the resolver matches against
+    // the composed output.
+    let current = if is_current { " (current)" } else { "" };
+    format!("{base}{current}")
 }
 
 #[cfg(test)]
@@ -1404,7 +1603,7 @@ mod tests {
         let b = ws(2, 1, false, Some("DP-1"), vec![1], None);
         let filtered = vec![&a, &b];
         let sentinel = workspace_sentinel_names(&["idx 0", "idx 1"]);
-        let items = compose_stage2_items_with_new(&filtered, sentinel);
+        let items = compose_stage2_items_with_new(&filtered, None, sentinel, 1, &HashMap::new());
         assert_eq!(items.last().map(String::as_str), Some("« New workspace »"));
         assert_eq!(items.len(), 3);
     }
@@ -1413,7 +1612,7 @@ mod tests {
     fn compose_stage2_items_literal_only_omits_new_workspace_sentinel() {
         let a = ws(1, 0, false, Some("DP-1"), vec![1], None);
         let filtered = vec![&a];
-        let items = compose_stage2_items_literal_only(&filtered);
+        let items = compose_stage2_items_literal_only(&filtered, None, 1, &HashMap::new());
         assert!(items.iter().all(|s| s != "« New workspace »"));
         assert!(
             items
@@ -1434,12 +1633,196 @@ mod tests {
         let a = ws(1, 0, false, Some("DP-1"), vec![1], None);
         let b = ws(2, 1, false, Some("DP-1"), vec![1], None);
         let filtered = vec![&a, &b];
-        let items = compose_stage2_items_literal_only(&filtered);
+        let items = compose_stage2_items_literal_only(&filtered, None, 1, &HashMap::new());
         assert!(items.iter().all(|s| s != "« New workspace »"));
         assert!(
             items
                 .iter()
                 .all(|s| s != "__niri_activities_new_workspace__")
+        );
+    }
+
+    // ---- workspace_label_with_annotations / current-workspace annotation ---
+
+    /// Test-only helper that builds a `HashMap<u64, String>` from a
+    /// slice of `(id, name)` tuples. Keeps the annotation tests below
+    /// readable without hand-rolling `into_iter().collect()` at every
+    /// call site.
+    fn activity_lookup(entries: &[(u64, &str)]) -> HashMap<u64, String> {
+        entries
+            .iter()
+            .map(|(id, name)| (*id, (*name).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn workspace_label_with_annotations_appends_current_suffix() {
+        // is_current=true must append ` (current)`; is_current=false
+        // returns the base label unchanged.
+        let mut w = ws(7, 2, true, Some("DP-1"), vec![1], None);
+        w.is_in_active_activity = true;
+        let names = activity_lookup(&[(1, "Work")]);
+        assert_eq!(
+            workspace_label_with_annotations(&w, 1, true, &names),
+            "idx 2 (current)",
+        );
+        assert_eq!(
+            workspace_label_with_annotations(&w, 1, false, &names),
+            "idx 2",
+        );
+    }
+
+    #[test]
+    fn compose_stage2_annotates_only_focused_window_workspace() {
+        // Three candidates in the same activity; the focused window is
+        // in the middle one (id 20). Only that row gets the (current)
+        // annotation.
+        let mut a = ws(10, 0, false, Some("DP-1"), vec![1], None);
+        a.is_in_active_activity = true;
+        let mut b = ws(20, 1, true, Some("DP-1"), vec![1], None);
+        b.is_in_active_activity = true;
+        let mut c = ws(30, 2, false, Some("DP-1"), vec![1], None);
+        c.is_in_active_activity = true;
+        let filtered = vec![&a, &b, &c];
+        let sentinel = workspace_sentinel_names(&[]);
+        let names = activity_lookup(&[(1, "Work")]);
+        let items = compose_stage2_items_with_new(&filtered, Some(20), sentinel, 1, &names);
+        // Sentinel is the last row; only middle row carries (current).
+        assert_eq!(items[0], "idx 0");
+        assert_eq!(items[1], "idx 1 (current)");
+        assert_eq!(items[2], "idx 2");
+        assert_eq!(items[3], "« New workspace »");
+        assert_eq!(
+            items.iter().filter(|s| s.contains("(current)")).count(),
+            1,
+            "exactly one row must carry (current); got: {items:?}",
+        );
+    }
+
+    #[test]
+    fn resolve_stage2_with_new_current_row_returns_already_current() {
+        // Picker outcome is the (current)-suffixed label for id 7;
+        // resolver returns AlreadyCurrent(7).
+        let mut w = ws(7, 3, true, Some("DP-1"), vec![1], None);
+        w.is_in_active_activity = true;
+        let other = ws(8, 4, false, Some("DP-1"), vec![1], None);
+        let filtered = vec![&w, &other];
+        let sentinel = workspace_sentinel_names(&[]);
+        let picked = PickerOutcome::Selected("idx 3 (current)".into());
+        match resolve_stage2_with_new(picked, sentinel, &filtered, Some(7)) {
+            Stage2ResolutionWithNew::AlreadyCurrent(id) => assert_eq!(id, 7),
+            other => panic!("expected AlreadyCurrent(7), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_stage2_literal_only_current_row_returns_already_current() {
+        // Symmetric pin on the literal-only path.
+        let mut w = ws(7, 3, true, Some("DP-1"), vec![1], None);
+        w.is_in_active_activity = true;
+        let filtered = vec![&w];
+        let sentinel = workspace_sentinel_names(&[]);
+        let picked = PickerOutcome::Selected("idx 3 (current)".into());
+        match resolve_stage2_literal_only(picked, sentinel, &filtered, Some(7)) {
+            Stage2ResolutionLiteralOnly::AlreadyCurrent(id) => assert_eq!(id, 7),
+            other => panic!("expected AlreadyCurrent(7), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_stage2_with_new_already_current_emits_breadcrumb_and_no_move() {
+        // Drive dispatch_stage2_with_new via run_picker with a picker that
+        // returns the (current)-annotated row. The dispatcher must return
+        // Ok(()) and must NOT issue a MoveWindowToWorkspace request.
+        // MockClient screams if an unexpected request arrives, so the
+        // absence of a `client.expect(move_req(...))` call is the assertion.
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![act(1, "Work", true)])),
+        );
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![
+                ws(10, 0, true, Some("DP-1"), vec![1], Some(99)),
+                ws(20, 1, false, Some("DP-1"), vec![1], None),
+            ])),
+        );
+        // No move_req expectation — the dispatcher must short-circuit.
+        let pick = |prompt: &str, items: &[String]| -> Result<PickerOutcome, CliError> {
+            if prompt == "Move window to activity:" {
+                Ok(PickerOutcome::Selected("Work".into()))
+            } else {
+                // Pick the (current)-annotated row for the focused workspace.
+                let current_row = items
+                    .iter()
+                    .find(|s| s.contains("(current)"))
+                    .expect("(current) row must be present")
+                    .clone();
+                Ok(PickerOutcome::Selected(current_row))
+            }
+        };
+        run_picker(&mut client, pick, no_new_activity_prompt).expect("AlreadyCurrent must exit Ok");
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn dispatch_stage2_literal_only_already_current_emits_breadcrumb_and_no_move() {
+        // Drive dispatch_stage2_literal_only via run_picker with a picker that
+        // returns the (current)-annotated row. The dispatcher must return
+        // Ok(()) and must NOT issue a MoveWindowToWorkspace request.
+        // Uses a non-active activity (literal-only path). Single-activity
+        // membership keeps the label free of annotation suffixes so the
+        // resolver match is clean.
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![
+                act(1, "Work", true),
+                act(2, "Personal", false),
+            ])),
+        );
+        // The focused workspace (id 10) is in activity 2 (Personal) only.
+        let mut focused_ws = ws(10, 0, true, Some("DP-1"), vec![2], Some(99));
+        focused_ws.is_in_active_activity = false;
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![focused_ws])),
+        );
+        // No move_req expectation — the dispatcher must short-circuit.
+        let pick = |prompt: &str, items: &[String]| -> Result<PickerOutcome, CliError> {
+            if prompt == "Move window to activity:" {
+                Ok(PickerOutcome::Selected("Personal".into()))
+            } else {
+                // Pick the (current)-annotated row.
+                let current_row = items
+                    .iter()
+                    .find(|s| s.contains("(current)"))
+                    .expect("(current) row must be present")
+                    .clone();
+                Ok(PickerOutcome::Selected(current_row))
+            }
+        };
+        run_picker(&mut client, pick, no_new_activity_prompt).expect("AlreadyCurrent must exit Ok");
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn compose_stage2_annotates_no_row_when_focused_window_workspace_not_in_filtered_set() {
+        // Cross-activity case: the focused workspace lives in activity
+        // A (id 1) but the filter walks activity B (id 2) candidates.
+        // The focused id is still threaded through, but no candidate
+        // matches it — so NO row gets (current).
+        let b1 = ws_hidden(100, 0, Some("DP-1"), vec![2], None);
+        let b2 = ws_hidden(101, 0, Some("DP-1"), vec![2], None);
+        let filtered = vec![&b1, &b2];
+        let sentinel = workspace_sentinel_names(&[]);
+        let names = activity_lookup(&[(1, "Work"), (2, "Personal")]);
+        // Focused id is 5, none of the candidates have that id.
+        let items = compose_stage2_items_with_new(&filtered, Some(5), sentinel, 2, &names);
+        assert!(
+            items.iter().all(|s| !s.contains("(current)")),
+            "no row may carry (current) when focused workspace is outside the filter set; got: {items:?}",
         );
     }
 
@@ -1479,7 +1862,7 @@ mod tests {
         let sentinel = workspace_sentinel_names(&["« New workspace »"]);
         assert_eq!(sentinel, "__niri_activities_new_workspace__");
         let picked = PickerOutcome::Selected("__niri_activities_new_workspace__".into());
-        match resolve_stage2_with_new(picked, sentinel, &filtered) {
+        match resolve_stage2_with_new(picked, sentinel, &filtered, None) {
             Stage2ResolutionWithNew::NewWorkspace => {}
             other => panic!("expected NewWorkspace, got {other:?}"),
         }
@@ -1506,7 +1889,7 @@ mod tests {
         let filtered = vec![&a];
         let sentinel = workspace_sentinel_names(&["idx 0"]);
         let picked = PickerOutcome::Selected("not-a-workspace".into());
-        match resolve_stage2_with_new(picked, sentinel, &filtered) {
+        match resolve_stage2_with_new(picked, sentinel, &filtered, None) {
             Stage2ResolutionWithNew::Unknown(label) => assert_eq!(label, "not-a-workspace"),
             other => panic!("expected Unknown, got {other:?}"),
         }
@@ -1521,7 +1904,7 @@ mod tests {
         let filtered = vec![&a];
         let sentinel = workspace_sentinel_names(&["idx 0"]);
         let picked = PickerOutcome::Selected("not-a-workspace".into());
-        match resolve_stage2_literal_only(picked, sentinel, &filtered) {
+        match resolve_stage2_literal_only(picked, sentinel, &filtered, None) {
             Stage2ResolutionLiteralOnly::Unknown(label) => assert_eq!(label, "not-a-workspace"),
             other => panic!("expected Unknown, got {other:?}"),
         }
@@ -1539,7 +1922,7 @@ mod tests {
         let filtered = vec![&a];
         let sentinel = workspace_sentinel_names(&["idx 0"]);
         let picked = PickerOutcome::Selected(sentinel.to_owned());
-        match resolve_stage2_literal_only(picked, sentinel, &filtered) {
+        match resolve_stage2_literal_only(picked, sentinel, &filtered, None) {
             Stage2ResolutionLiteralOnly::NewWorkspace => {}
             other => panic!("expected NewWorkspace, got {other:?}"),
         }
@@ -1737,7 +2120,11 @@ mod tests {
     #[test]
     fn run_picker_stage1_current_sentinel_proceeds_to_stage2_with_active_activity() {
         // User picks « Current activity » → stage 2 fires via the
-        // with-new path for the active activity (Work, id 1).
+        // with-new path for the active activity (Work, id 1). Two
+        // workspaces in Work; the focused one is id 10 (would render
+        // as `idx 0 (current)` and resolve to AlreadyCurrent), so the
+        // test picks the non-focused row id 20 to drive the dispatch
+        // path.
         let mut client = MockClient::new();
         client.expect(
             Request::Activities,
@@ -1748,16 +2135,12 @@ mod tests {
         );
         client.expect(
             Request::Workspaces,
-            Reply::Ok(Response::Workspaces(vec![ws(
-                10,
-                0,
-                true,
-                Some("DP-1"),
-                vec![1],
-                None,
-            )])),
+            Reply::Ok(Response::Workspaces(vec![
+                ws(10, 0, true, Some("DP-1"), vec![1], Some(99)),
+                ws(20, 1, false, Some("DP-1"), vec![1], None),
+            ])),
         );
-        client.expect(move_req(10), Reply::Ok(Response::Handled));
+        client.expect(move_req(20), Reply::Ok(Response::Handled));
 
         let pick = |prompt: &str, items: &[String]| -> Result<PickerOutcome, CliError> {
             if prompt == "Move window to activity:" {
@@ -1767,8 +2150,10 @@ mod tests {
             } else if prompt == "Move window to workspace:" {
                 // Stage 2: « New workspace » appended for active activity.
                 assert!(items.last().is_some_and(|s| s == "« New workspace »"));
-                // Pick the literal workspace label instead of the sentinel.
-                Ok(PickerOutcome::Selected(items[0].clone()))
+                // items[0] is the focused row with `(current)` annotation;
+                // pick items[1] (non-focused) so dispatch fires.
+                assert_eq!(items[0], "idx 0 (current)");
+                Ok(PickerOutcome::Selected(items[1].clone()))
             } else {
                 panic!("unexpected prompt: {prompt}");
             }
@@ -2055,21 +2440,28 @@ mod tests {
         client.expect(
             Request::Workspaces,
             Reply::Ok(Response::Workspaces(vec![
-                // Active activity = 1; one workspace in it on DP-1.
-                ws(10, 0, true, Some("DP-1"), vec![1], None),
+                // Active activity = 1; focused workspace on DP-1.
+                ws(10, 0, true, Some("DP-1"), vec![1], Some(99)),
+                // Second workspace in activity 1 — the picker selects
+                // this one so dispatch fires (selecting the focused row
+                // would route to AlreadyCurrent).
+                ws(11, 1, false, Some("DP-1"), vec![1], None),
                 // Workspace in activity 2 on DP-1 — MUST NOT be offered.
                 ws(20, 0, false, Some("DP-1"), vec![2], None),
             ])),
         );
-        client.expect(move_req(10), Reply::Ok(Response::Handled));
+        client.expect(move_req(11), Reply::Ok(Response::Handled));
 
         let pick = |prompt: &str, items: &[String]| -> Result<PickerOutcome, CliError> {
             assert_eq!(prompt, "Move window to workspace:");
-            // Stage 2 only — no activity prompt. Items: one workspace
-            // (activity 1) + « New workspace » sentinel.
-            assert_eq!(items.len(), 2, "items: {items:?}");
+            // Stage 2 only — no activity prompt. Items: two workspaces
+            // (activity 1) + « New workspace » sentinel. The focused
+            // row carries `(current)`, so pick the second row to drive
+            // dispatch.
+            assert_eq!(items.len(), 3, "items: {items:?}");
             assert!(items.last().is_some_and(|s| s == "« New workspace »"));
-            Ok(PickerOutcome::Selected(items[0].clone()))
+            assert_eq!(items[0], "idx 0 (current)");
+            Ok(PickerOutcome::Selected(items[1].clone()))
         };
         run_here_picker(&mut client, pick).expect("happy path");
         client.assert_consumed_in_order();
