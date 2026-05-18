@@ -83,6 +83,7 @@ fn help_lists_all_subcommands() {
         "remove",
         "save",
         "list",
+        "completions",
         // "move-window" checked after "move-window-here" so a plain
         // `contains("move-window")` does not accidentally match the longer
         // name; the two-space-and-trailing-space pattern also disambiguates.
@@ -401,4 +402,62 @@ fn toggle_alias_routes_to_switch_activity_previous() {
         !req_json.contains("Activities"),
         "toggle must NOT emit Activities (picker path); got: {req_json:?}",
     );
+}
+
+#[test]
+fn completions_fish_emits_clap_complete_base_and_dynamic_lines() {
+    // Pins both halves of the fish completion output:
+    //   1. clap_complete base (anchored by `complete -c niri-activities`)
+    //   2. dynamic activity-name augmentation (anchored by the comment
+    //      header and the `__fish_seen_subcommand_from switch` line).
+    // A regression in either half — clap_complete dropped, or the fish
+    // branch in completions::run lost the augmentation — fails here.
+    let assert = Command::cargo_bin(BIN)
+        .unwrap()
+        .args(["completions", "fish"])
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        out.contains("complete -c niri-activities"),
+        "fish completion output missing clap_complete base:\n{out}",
+    );
+    assert!(
+        out.contains("# Dynamic activity-name completion."),
+        "fish completion output missing dynamic-section header:\n{out}",
+    );
+    assert!(
+        out.contains("__fish_seen_subcommand_from switch\""),
+        "fish completion output missing dynamic line for `switch`:\n{out}",
+    );
+    assert!(
+        out.contains("(niri-activities list --format=name 2>/dev/null)"),
+        "fish completion output missing live-candidate source:\n{out}",
+    );
+}
+
+#[test]
+fn completions_bash_emits_non_empty_output() {
+    // Smoke check that non-fish shells still produce a clap_complete
+    // base. We do not assert content beyond non-emptiness — bash output
+    // shape is owned by clap_complete and changing across minor bumps is
+    // expected; this test guards only that the dispatch path is wired.
+    let assert = Command::cargo_bin(BIN)
+        .unwrap()
+        .args(["completions", "bash"])
+        .assert()
+        .success();
+    let out = assert.get_output().stdout.clone();
+    assert!(!out.is_empty(), "bash completions stdout must be non-empty");
+}
+
+#[test]
+fn completions_unknown_shell_exits_64() {
+    // Unknown shell values are rejected by clap (ValueEnum). Pins the
+    // exit-64 contract for clap parse errors.
+    Command::cargo_bin(BIN)
+        .unwrap()
+        .args(["completions", "bogus-shell"])
+        .assert()
+        .code(64);
 }

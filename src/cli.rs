@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::assign_workspace;
+use crate::completions;
 use crate::create;
 use crate::ipc;
 use crate::list::{self, ListOpts};
@@ -72,6 +73,16 @@ pub(crate) enum Cmd {
         #[arg(long, conflicts_with = "json")]
         format: Option<String>,
     },
+
+    /// Emit a shell completion script for the given shell to stdout.
+    ///
+    /// Fish output is augmented with dynamic activity-name completion;
+    /// other shells emit the `clap_complete` base only. See
+    /// [`crate::completions`].
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }
 
 /// Routes the parsed [`Cli`] to the appropriate stub.
@@ -91,6 +102,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
         Cmd::Remove { name } => cmd_remove(name),
         Cmd::Save { name } => cmd_save(name),
         Cmd::List { json, format } => cmd_list(json, format),
+        Cmd::Completions { shell } => cmd_completions(shell),
     }
 }
 
@@ -209,4 +221,8 @@ fn cmd_list(json: bool, format: Option<String>) -> Result<()> {
         },
         &mut out,
     )
+}
+
+fn cmd_completions(shell: clap_complete::Shell) -> Result<()> {
+    completions::run(shell)
 }

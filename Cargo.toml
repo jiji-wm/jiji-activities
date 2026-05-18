@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4.6"
 # Aligned with niri's own resolution (`niri/gajdusek/Cargo.toml`).
 directories = "6"
 # `v1` feature pins the KDL v1 spec — niri's `knuffel` 3.2.0 parses KDL v1;

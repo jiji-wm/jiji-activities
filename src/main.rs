@@ -10,6 +10,7 @@ use clap::Parser;
 
 mod assign_workspace;
 mod cli;
+mod completions;
 mod create;
 mod error;
 mod ipc;
