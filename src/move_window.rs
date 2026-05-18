@@ -276,7 +276,12 @@ enum Stage2ResolutionLiteralOnly<'a> {
 ///   `MalformedResponse(Server("focused workspace has no output"))` (exit 65).
 /// - Compositor reply variant / server-error handling matches
 ///   [`send_expect_handled_or_no_op`].
-pub(crate) fn run(client: &mut dyn NiriClient, activity_name: &str) -> Result<()> {
+pub(crate) fn run(
+    client: &mut dyn NiriClient,
+    activity_name: &str,
+    _follow: bool,
+    _overview: bool,
+) -> Result<()> {
     let activities = send_expect_activities(client).context("requesting activities")?;
     let activity = activities
         .iter()
@@ -429,6 +434,8 @@ pub(crate) fn run_picker<F, P>(
     client: &mut dyn NiriClient,
     pick: F,
     prompt_name_fn: P,
+    _follow: bool,
+    _overview: bool,
 ) -> Result<()>
 where
     F: Fn(&str, &[String]) -> Result<PickerOutcome, CliError>,
@@ -589,7 +596,12 @@ fn create_activity_via_ipc(client: &mut dyn NiriClient, name: &str) -> Result<()
 /// - No focused workspace / focused workspace has no output — same
 ///   synthetics as [`run`].
 /// - Reply / variant handling matches [`send_expect_handled_or_no_op`].
-pub(crate) fn run_here_picker<F>(client: &mut dyn NiriClient, pick: F) -> Result<()>
+pub(crate) fn run_here_picker<F>(
+    client: &mut dyn NiriClient,
+    pick: F,
+    _follow: bool,
+    _overview: bool,
+) -> Result<()>
 where
     F: FnOnce(&str, &[String]) -> Result<PickerOutcome, CliError>,
 {
@@ -1961,7 +1973,8 @@ mod tests {
                 Ok(PickerOutcome::Selected(current_row))
             }
         };
-        run_picker(&mut client, pick, no_new_activity_prompt).expect("AlreadyCurrent must exit Ok");
+        run_picker(&mut client, pick, no_new_activity_prompt, false, false)
+            .expect("AlreadyCurrent must exit Ok");
         client.assert_consumed_in_order();
     }
 
@@ -2002,7 +2015,8 @@ mod tests {
                 Ok(PickerOutcome::Selected(current_row))
             }
         };
-        run_picker(&mut client, pick, no_new_activity_prompt).expect("AlreadyCurrent must exit Ok");
+        run_picker(&mut client, pick, no_new_activity_prompt, false, false)
+            .expect("AlreadyCurrent must exit Ok");
         client.assert_consumed_in_order();
     }
 
@@ -2047,7 +2061,8 @@ mod tests {
                 Ok(PickerOutcome::Selected(items[1].clone()))
             }
         };
-        run_picker(&mut client, pick, no_new_activity_prompt).expect("NoOp reply must exit Ok");
+        run_picker(&mut client, pick, no_new_activity_prompt, false, false)
+            .expect("NoOp reply must exit Ok");
         client.assert_consumed_in_order();
     }
 
@@ -2092,7 +2107,8 @@ mod tests {
                 Ok(PickerOutcome::Selected(items[1].clone()))
             }
         };
-        run_picker(&mut client, pick, no_new_activity_prompt).expect("NoOp reply must exit Ok");
+        run_picker(&mut client, pick, no_new_activity_prompt, false, false)
+            .expect("NoOp reply must exit Ok");
         client.assert_consumed_in_order();
     }
 
@@ -2439,7 +2455,7 @@ mod tests {
                 Ok(PickerOutcome::Selected("« New workspace »".into()))
             }
         };
-        let err = run_picker(&mut client, pick, no_new_activity_prompt).expect_err(
+        let err = run_picker(&mut client, pick, no_new_activity_prompt, false, false).expect_err(
             "synthetic sentinel on literal-only path must surface as MalformedResponse",
         );
         let cli_err = err
@@ -2487,7 +2503,7 @@ mod tests {
         );
         client.expect(move_req(20), Reply::Ok(Response::Handled));
 
-        run(&mut client, "Personal").expect("named-arg succeeds");
+        run(&mut client, "Personal", false, false).expect("named-arg succeeds");
         client.assert_consumed_in_order();
     }
 
@@ -2498,7 +2514,7 @@ mod tests {
             Request::Activities,
             Reply::Ok(Response::Activities(vec![act(1, "Work", true)])),
         );
-        let err = run(&mut client, "Nope").expect_err("unknown name must fail");
+        let err = run(&mut client, "Nope", false, false).expect_err("unknown name must fail");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())
@@ -2531,7 +2547,7 @@ mod tests {
                 ws(20, 0, false, Some("DP-1"), vec![2], Some(77)),
             ])),
         );
-        run(&mut client, "Personal").expect("zero-case must exit Ok");
+        run(&mut client, "Personal", false, false).expect("zero-case must exit Ok");
         // No third IPC call queued — dispatch was skipped.
         client.assert_consumed_in_order();
     }
@@ -2557,7 +2573,7 @@ mod tests {
                 ws(20, 0, false, Some("DP-2"), vec![2], None),
             ])),
         );
-        run(&mut client, "Personal").expect("zero-case must exit Ok");
+        run(&mut client, "Personal", false, false).expect("zero-case must exit Ok");
         client.assert_consumed_in_order();
     }
 
@@ -2573,7 +2589,7 @@ mod tests {
         let pick = |_prompt: &str, _items: &[String]| -> Result<PickerOutcome, CliError> {
             panic!("stage-1 picker must NOT be spawned for empty activities list");
         };
-        run_picker(&mut client, pick, no_new_activity_prompt)
+        run_picker(&mut client, pick, no_new_activity_prompt, false, false)
             .expect("empty activities must exit Ok");
         client.assert_consumed_in_order();
     }
@@ -2588,7 +2604,8 @@ mod tests {
         let pick = |_prompt: &str, _items: &[String]| -> Result<PickerOutcome, CliError> {
             Ok(PickerOutcome::Cancelled)
         };
-        run_picker(&mut client, pick, no_new_activity_prompt).expect("stage1 cancel is silent Ok");
+        run_picker(&mut client, pick, no_new_activity_prompt, false, false)
+            .expect("stage1 cancel is silent Ok");
         client.assert_consumed_in_order();
     }
 
@@ -2633,7 +2650,8 @@ mod tests {
                 panic!("unexpected prompt: {prompt}");
             }
         };
-        run_picker(&mut client, pick, no_new_activity_prompt).expect("happy path succeeds");
+        run_picker(&mut client, pick, no_new_activity_prompt, false, false)
+            .expect("happy path succeeds");
         client.assert_consumed_in_order();
     }
 
@@ -2662,7 +2680,8 @@ mod tests {
                 Ok(PickerOutcome::Cancelled)
             }
         };
-        run_picker(&mut client, pick, no_new_activity_prompt).expect("stage2 cancel is silent Ok");
+        run_picker(&mut client, pick, no_new_activity_prompt, false, false)
+            .expect("stage2 cancel is silent Ok");
         client.assert_consumed_in_order();
     }
 
@@ -2692,7 +2711,7 @@ mod tests {
                 Ok(PickerOutcome::Selected("« New workspace »".into()))
             }
         };
-        run_picker(&mut client, pick, no_new_activity_prompt)
+        run_picker(&mut client, pick, no_new_activity_prompt, false, false)
             .expect("new-workspace sentinel succeeds");
         client.assert_consumed_in_order();
     }
@@ -2724,7 +2743,8 @@ mod tests {
                 panic!("stage 2 must NOT be spawned for non-active activity with no workspaces");
             }
         };
-        run_picker(&mut client, pick, no_new_activity_prompt).expect("zero-case must exit Ok");
+        run_picker(&mut client, pick, no_new_activity_prompt, false, false)
+            .expect("zero-case must exit Ok");
         client.assert_consumed_in_order();
     }
 
@@ -2780,7 +2800,8 @@ mod tests {
         let prompt = |_prompt: &str| -> Result<NameOutcome, CliError> {
             Ok(NameOutcome::Typed("Personal".to_owned()))
         };
-        run_picker(&mut client, pick, prompt).expect("new-activity happy path must succeed");
+        run_picker(&mut client, pick, prompt, false, false)
+            .expect("new-activity happy path must succeed");
         client.assert_consumed_in_order();
     }
 
@@ -2834,7 +2855,8 @@ mod tests {
         let prompt_fn = |_prompt: &str| -> Result<NameOutcome, CliError> {
             Ok(NameOutcome::Typed("Personal".to_owned()))
         };
-        run_picker(&mut client, pick, prompt_fn).expect("new-activity active path must succeed");
+        run_picker(&mut client, pick, prompt_fn, false, false)
+            .expect("new-activity active path must succeed");
         client.assert_consumed_in_order();
     }
 
@@ -2850,7 +2872,7 @@ mod tests {
         let pick = |_prompt: &str, _items: &[String]| -> Result<PickerOutcome, CliError> {
             panic!("stage 1 must NOT be spawned on malformed Activities response");
         };
-        let err = run_picker(&mut client, pick, no_new_activity_prompt)
+        let err = run_picker(&mut client, pick, no_new_activity_prompt, false, false)
             .expect_err("wrong variant must fail");
         let cli_err = err
             .chain()
@@ -2884,7 +2906,7 @@ mod tests {
                 panic!("stage 2 must NOT be spawned on malformed Workspaces response");
             }
         };
-        let err = run_picker(&mut client, pick, no_new_activity_prompt)
+        let err = run_picker(&mut client, pick, no_new_activity_prompt, false, false)
             .expect_err("wrong variant must fail");
         let cli_err = err
             .chain()
@@ -2938,7 +2960,7 @@ mod tests {
             assert_eq!(items[0], "idx 0 (current)");
             Ok(PickerOutcome::Selected(items[1].clone()))
         };
-        run_here_picker(&mut client, pick).expect("happy path");
+        run_here_picker(&mut client, pick, false, false).expect("happy path");
         client.assert_consumed_in_order();
     }
 
@@ -2963,7 +2985,7 @@ mod tests {
         let pick = |_prompt: &str, _items: &[String]| -> Result<PickerOutcome, CliError> {
             Ok(PickerOutcome::Cancelled)
         };
-        run_here_picker(&mut client, pick).expect("cancellation is silent Ok");
+        run_here_picker(&mut client, pick, false, false).expect("cancellation is silent Ok");
         client.assert_consumed_in_order();
     }
 
@@ -2986,7 +3008,7 @@ mod tests {
         let pick = |_prompt: &str, _items: &[String]| -> Result<PickerOutcome, CliError> {
             Ok(PickerOutcome::Selected("« New workspace »".into()))
         };
-        run_here_picker(&mut client, pick).expect("new-workspace sentinel succeeds");
+        run_here_picker(&mut client, pick, false, false).expect("new-workspace sentinel succeeds");
         client.assert_consumed_in_order();
     }
 
@@ -3006,7 +3028,8 @@ mod tests {
         let pick = |_prompt: &str, _items: &[String]| -> Result<PickerOutcome, CliError> {
             panic!("picker must NOT be spawned when no active activity");
         };
-        let err = run_here_picker(&mut client, pick).expect_err("no active activity must fail");
+        let err = run_here_picker(&mut client, pick, false, false)
+            .expect_err("no active activity must fail");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())
@@ -3039,8 +3062,8 @@ mod tests {
             Ok(PickerOutcome::Selected("« New activity »".into()))
         };
         let prompt = |_prompt: &str| -> Result<NameOutcome, CliError> { Ok(NameOutcome::Unnamed) };
-        let err =
-            run_picker(&mut client, pick, prompt).expect_err("empty-Enter must surface as Usage");
+        let err = run_picker(&mut client, pick, prompt, false, false)
+            .expect_err("empty-Enter must surface as Usage");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())
@@ -3225,7 +3248,8 @@ mod tests {
                 panic!("stage 2 must NOT be spawned on literal-only empty zero-case");
             }
         };
-        run_picker(&mut client, pick, no_new_activity_prompt).expect("zero-case must exit Ok");
+        run_picker(&mut client, pick, no_new_activity_prompt, false, false)
+            .expect("zero-case must exit Ok");
         client.assert_consumed_in_order();
     }
 
@@ -3253,7 +3277,7 @@ mod tests {
         let pick = |_prompt: &str, _items: &[String]| -> Result<PickerOutcome, CliError> {
             Ok(PickerOutcome::Selected("« New workspace »".into()))
         };
-        let err = run_here_picker(&mut client, pick)
+        let err = run_here_picker(&mut client, pick, false, false)
             .expect_err("trailing-empty breach must surface as MalformedResponse");
         let cli_err = err
             .chain()

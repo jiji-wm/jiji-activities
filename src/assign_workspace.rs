@@ -63,7 +63,7 @@ use crate::picker::multi_select::{self, MultiPickerOutcome};
 /// `IpcError → CliError` mapping (typically
 /// `MalformedResponse(Server)` when the chosen name no longer
 /// resolves). Reactive refresh is deferred to v2.
-pub(crate) fn run(client: &mut dyn NiriClient) -> Result<()> {
+pub(crate) fn run(client: &mut dyn NiriClient, _follow: bool, _overview: bool) -> Result<()> {
     let activities = send_expect_activities(client).context("requesting activities")?;
     if activities.is_empty() {
         eprintln!("niri-activities: no activities configured; nothing to assign");

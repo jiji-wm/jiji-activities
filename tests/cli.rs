@@ -545,3 +545,37 @@ fn move_window_named_prints_confirmation_to_stderr_on_success() {
         .stderr(contains("moved focused window"))
         .stderr(contains("'Personal'"));
 }
+
+#[test]
+fn move_and_assign_verbs_expose_follow_and_overview_flags() {
+    // Pins the clap surface for the four mutating verbs that grew
+    // `--follow` and `--overview` flags. Iterating over the verbs keeps
+    // the assertion target uniform: a missing `#[arg(long)]` on any of
+    // the eight flag fields would render that flag as a positional in
+    // `--help` (or omit it entirely), and this test catches both shapes.
+    //
+    // The flags are surface-only in this commit — the runner functions
+    // accept and discard them. Behavioral consumption lands in later
+    // tasks; the help-text assertion is the contract-pin until then.
+    for verb in [
+        "move-window",
+        "move-window-here",
+        "move-workspace",
+        "assign-workspace",
+    ] {
+        let assert = Command::cargo_bin(BIN)
+            .unwrap()
+            .args([verb, "--help"])
+            .assert()
+            .success();
+        let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+        assert!(
+            out.contains("--follow"),
+            "`{verb} --help` missing `--follow` flag:\n{out}",
+        );
+        assert!(
+            out.contains("--overview"),
+            "`{verb} --help` missing `--overview` flag:\n{out}",
+        );
+    }
+}

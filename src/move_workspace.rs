@@ -61,7 +61,12 @@ use crate::picker::PickerOutcome;
 /// The IPC error is wrapped with
 /// `.context("moving workspace to activity")` so the operation
 /// surfaces in the stderr chain.
-pub(crate) fn run(client: &mut dyn NiriClient, name: &str) -> Result<()> {
+pub(crate) fn run(
+    client: &mut dyn NiriClient,
+    name: &str,
+    _follow: bool,
+    _overview: bool,
+) -> Result<()> {
     let req = Request::Action(Action::MoveWorkspaceToActivity {
         workspace: None,
         activity: ActivityReferenceArg::Name(name.to_owned()),
@@ -89,7 +94,12 @@ pub(crate) fn run(client: &mut dyn NiriClient, name: &str) -> Result<()> {
 /// The `pick` parameter is a closure so unit tests can inject a stub
 /// without spawning `fuzzel`; production wiring passes
 /// [`crate::picker::pick_one`].
-pub(crate) fn run_picker<F>(client: &mut dyn NiriClient, pick: F) -> Result<()>
+pub(crate) fn run_picker<F>(
+    client: &mut dyn NiriClient,
+    pick: F,
+    _follow: bool,
+    _overview: bool,
+) -> Result<()>
 where
     F: FnOnce(&str, &[String]) -> Result<PickerOutcome, CliError>,
 {
@@ -101,7 +111,12 @@ where
     let names = names_focused_first(&activities);
     match pick("Move workspace to activity:", &names)? {
         PickerOutcome::Cancelled => Ok(()),
-        PickerOutcome::Selected(name) => run(client, &name),
+        PickerOutcome::Selected(name) => {
+            // `_follow` / `_overview` are accepted by `run` but ignored
+            // this commit; Task 1 lands surface-only and pins the
+            // signature shape before any behavioral consumption.
+            run(client, &name, false, false)
+        }
     }
 }
 
@@ -131,7 +146,7 @@ mod tests {
         // that flipped focus or pinned a workspace id would fail here.
         let mut client = MockClient::new();
         client.expect(move_req("Work"), Reply::Ok(Response::Handled));
-        run(&mut client, "Work").expect("move-workspace succeeds on Handled");
+        run(&mut client, "Work", false, false).expect("move-workspace succeeds on Handled");
         client.assert_consumed_in_order();
     }
 
@@ -139,7 +154,7 @@ mod tests {
     fn move_workspace_unknown_name_maps_to_activity_not_found() {
         let mut client = MockClient::new();
         client.expect(move_req("Work"), Err("activity not found".to_owned()));
-        let err = run(&mut client, "Work").expect_err("unknown activity must fail");
+        let err = run(&mut client, "Work", false, false).expect_err("unknown activity must fail");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())
@@ -161,7 +176,7 @@ mod tests {
         // workspace-miss wire string would be misleading.
         let mut client = MockClient::new();
         client.expect(move_req("Work"), Err("workspace not found".to_owned()));
-        let err = run(&mut client, "Work").expect_err("must fail");
+        let err = run(&mut client, "Work", false, false).expect_err("must fail");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())
@@ -188,7 +203,7 @@ mod tests {
             move_req("Work"),
             Err("workspace not in active activity".to_owned()),
         );
-        let err = run(&mut client, "Work").expect_err("must fail");
+        let err = run(&mut client, "Work", false, false).expect_err("must fail");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())
@@ -207,7 +222,7 @@ mod tests {
     fn move_workspace_wrong_response_variant_is_malformed() {
         let mut client = MockClient::new();
         client.expect(move_req("Work"), Reply::Ok(Response::Version("v".into())));
-        let err = run(&mut client, "Work").expect_err("wrong variant must fail");
+        let err = run(&mut client, "Work", false, false).expect_err("wrong variant must fail");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())
@@ -233,7 +248,7 @@ mod tests {
             move_req("Work"),
             Err("activity switch blocked: gesture".to_owned()),
         );
-        let err = run(&mut client, "Work").expect_err("server error must surface");
+        let err = run(&mut client, "Work", false, false).expect_err("server error must surface");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())
@@ -252,7 +267,7 @@ mod tests {
     fn move_workspace_preserves_context_in_error_chain() {
         let mut client = MockClient::new();
         client.expect(move_req("Work"), Err("activity not found".to_owned()));
-        let err = run(&mut client, "Work").expect_err("must fail");
+        let err = run(&mut client, "Work", false, false).expect_err("must fail");
         let formatted = format!("{err:#}");
         assert!(
             formatted.contains("moving workspace to activity"),
@@ -301,7 +316,7 @@ mod tests {
             Ok(PickerOutcome::Selected("Personal".to_owned()))
         };
 
-        run_picker(&mut client, pick).expect("happy path succeeds");
+        run_picker(&mut client, pick, false, false).expect("happy path succeeds");
         client.assert_consumed_in_order();
     }
 
@@ -314,7 +329,7 @@ mod tests {
             panic!("pick must not be called when activity list is empty");
         };
 
-        run_picker(&mut client, pick).expect("empty list exits Ok");
+        run_picker(&mut client, pick, false, false).expect("empty list exits Ok");
         client.assert_consumed_in_order();
     }
 
@@ -333,7 +348,7 @@ mod tests {
             Ok(PickerOutcome::Cancelled)
         };
 
-        run_picker(&mut client, pick).expect("cancellation is silent Ok");
+        run_picker(&mut client, pick, false, false).expect("cancellation is silent Ok");
         client.assert_consumed_in_order();
     }
 
@@ -352,7 +367,7 @@ mod tests {
             panic!("pick must not be called on a malformed Activities response");
         };
 
-        let err = run_picker(&mut client, pick).expect_err("wrong variant must fail");
+        let err = run_picker(&mut client, pick, false, false).expect_err("wrong variant must fail");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())

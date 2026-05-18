@@ -46,16 +46,58 @@ pub(crate) enum Cmd {
     SwitchPrevious,
 
     /// Move the focused window to a workspace in an activity (picker if no name).
-    MoveWindow { name: Option<String> },
+    MoveWindow {
+        name: Option<String>,
+        /// Follow the window to its new workspace after the move.
+        #[arg(long)]
+        follow: bool,
+        /// Like `--follow`, but also reveal the destination in overview.
+        /// Implies `--follow`.
+        // The `--overview` → `--follow` implication is resolved canonically
+        // in `dispatch` via `resolve_follow_overview`.
+        #[arg(long)]
+        overview: bool,
+    },
 
     /// Move the focused window to a workspace within the current activity (picker).
-    MoveWindowHere,
+    MoveWindowHere {
+        /// Follow the window to its new workspace after the move.
+        #[arg(long)]
+        follow: bool,
+        /// Like `--follow`, but also reveal the destination in overview.
+        /// Implies `--follow`.
+        // The `--overview` → `--follow` implication is resolved canonically
+        // in `dispatch` via `resolve_follow_overview`.
+        #[arg(long)]
+        overview: bool,
+    },
 
     /// Move the focused workspace to an activity (picker if no name).
-    MoveWorkspace { name: Option<String> },
+    MoveWorkspace {
+        name: Option<String>,
+        /// Follow the workspace to its new activity after the move.
+        #[arg(long)]
+        follow: bool,
+        /// Like `--follow`, but also reveal the destination in overview.
+        /// Implies `--follow`.
+        // The `--overview` → `--follow` implication is resolved canonically
+        // in `dispatch` via `resolve_follow_overview`.
+        #[arg(long)]
+        overview: bool,
+    },
 
     /// Assign the focused workspace to one or more activities via picker.
-    AssignWorkspace,
+    AssignWorkspace {
+        /// Follow the focused workspace after the assignment completes.
+        #[arg(long)]
+        follow: bool,
+        /// Like `--follow`, but also reveal the destination in overview.
+        /// Implies `--follow`.
+        // The `--overview` → `--follow` implication is resolved canonically
+        // in `dispatch` via `resolve_follow_overview`.
+        #[arg(long)]
+        overview: bool,
+    },
 
     /// Create a new activity with the given name.
     Create { name: String },
@@ -85,6 +127,17 @@ pub(crate) enum Cmd {
     },
 }
 
+/// Resolve the `--overview` → `--follow` implication.
+///
+/// `--overview` alone is shorthand for `--follow --overview`; this
+/// helper folds that single resolution rule. Lives at module scope so
+/// it is reachable from `src/cli.rs::tests` without spinning up clap or
+/// IPC, and is invoked from each `Cmd::Move*` / `Cmd::AssignWorkspace`
+/// dispatch arm to keep the rule canonical across verbs.
+fn resolve_follow_overview(follow: bool, overview: bool) -> (bool, bool) {
+    (follow || overview, overview)
+}
+
 /// Routes the parsed [`Cli`] to the appropriate stub.
 ///
 /// Returns [`anyhow::Result`] so future IPC layers can `?`-propagate
@@ -94,10 +147,30 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
     match cli.cmd {
         Cmd::Switch { name } => cmd_switch(name),
         Cmd::SwitchPrevious => cmd_switch_previous(),
-        Cmd::MoveWindow { name } => cmd_move_window(name),
-        Cmd::MoveWindowHere => cmd_move_window_here(),
-        Cmd::MoveWorkspace { name } => cmd_move_workspace(name),
-        Cmd::AssignWorkspace => cmd_assign_workspace(),
+        Cmd::MoveWindow {
+            name,
+            follow,
+            overview,
+        } => {
+            let (follow, overview) = resolve_follow_overview(follow, overview);
+            cmd_move_window(name, follow, overview)
+        }
+        Cmd::MoveWindowHere { follow, overview } => {
+            let (follow, overview) = resolve_follow_overview(follow, overview);
+            cmd_move_window_here(follow, overview)
+        }
+        Cmd::MoveWorkspace {
+            name,
+            follow,
+            overview,
+        } => {
+            let (follow, overview) = resolve_follow_overview(follow, overview);
+            cmd_move_workspace(name, follow, overview)
+        }
+        Cmd::AssignWorkspace { follow, overview } => {
+            let (follow, overview) = resolve_follow_overview(follow, overview);
+            cmd_assign_workspace(follow, overview)
+        }
         Cmd::Create { name } => cmd_create(name),
         Cmd::Remove { name } => cmd_remove(name),
         Cmd::Save { name } => cmd_save(name),
@@ -133,11 +206,11 @@ fn cmd_switch_previous() -> Result<()> {
     switch_previous::run(client.as_mut())
 }
 
-fn cmd_move_window(name: Option<String>) -> Result<()> {
+fn cmd_move_window(name: Option<String>, follow: bool, overview: bool) -> Result<()> {
     match name {
         Some(n) => {
             let mut client = ipc::make_client();
-            move_window::run(client.as_mut(), &n)
+            move_window::run(client.as_mut(), &n, follow, overview)
         }
         None => {
             // Verify `fuzzel` is on $PATH BEFORE any IPC round-trip so a
@@ -147,27 +220,33 @@ fn cmd_move_window(name: Option<String>) -> Result<()> {
             // produce on a disconnected socket.
             picker::ensure_available().context("verifying move-window picker availability")?;
             let mut client = ipc::make_client();
-            move_window::run_picker(client.as_mut(), picker::pick_one, picker::prompt_name)
-                .context("running move-window picker")
+            move_window::run_picker(
+                client.as_mut(),
+                picker::pick_one,
+                picker::prompt_name,
+                follow,
+                overview,
+            )
+            .context("running move-window picker")
         }
     }
 }
 
-fn cmd_move_window_here() -> Result<()> {
+fn cmd_move_window_here(follow: bool, overview: bool) -> Result<()> {
     // Verify `fuzzel` is on $PATH BEFORE any IPC round-trip — same
     // rationale as cmd_move_window's no-arg branch. `move-window-here`
     // has no named-arg form; it is always picker-driven.
     picker::ensure_available().context("verifying move-window-here picker availability")?;
     let mut client = ipc::make_client();
-    move_window::run_here_picker(client.as_mut(), picker::pick_one)
+    move_window::run_here_picker(client.as_mut(), picker::pick_one, follow, overview)
         .context("running move-window-here picker")
 }
 
-fn cmd_move_workspace(name: Option<String>) -> Result<()> {
+fn cmd_move_workspace(name: Option<String>, follow: bool, overview: bool) -> Result<()> {
     match name {
         Some(n) => {
             let mut client = ipc::make_client();
-            move_workspace::run(client.as_mut(), &n)
+            move_workspace::run(client.as_mut(), &n, follow, overview)
         }
         None => {
             // Verify `fuzzel` is on $PATH BEFORE any IPC round-trip so a
@@ -177,13 +256,13 @@ fn cmd_move_workspace(name: Option<String>) -> Result<()> {
             // produce on a disconnected socket.
             picker::ensure_available().context("verifying move-workspace picker availability")?;
             let mut client = ipc::make_client();
-            move_workspace::run_picker(client.as_mut(), picker::pick_one)
+            move_workspace::run_picker(client.as_mut(), picker::pick_one, follow, overview)
                 .context("running move-workspace picker")
         }
     }
 }
 
-fn cmd_assign_workspace() -> Result<()> {
+fn cmd_assign_workspace(follow: bool, overview: bool) -> Result<()> {
     // Verify `rofi` is on $PATH BEFORE any IPC round-trip so a
     // missing-dep failure surfaces with a rofi-naming stderr message
     // rather than the generic "niri socket unavailable" the IPC layer
@@ -191,7 +270,8 @@ fn cmd_assign_workspace() -> Result<()> {
     picker::multi_select::ensure_available()
         .context("verifying assign-workspace picker availability")?;
     let mut client = ipc::make_client();
-    assign_workspace::run(client.as_mut()).context("running assign-workspace picker")
+    assign_workspace::run(client.as_mut(), follow, overview)
+        .context("running assign-workspace picker")
 }
 
 fn cmd_create(name: String) -> Result<()> {
@@ -225,4 +305,26 @@ fn cmd_list(json: bool, format: Option<String>) -> Result<()> {
 
 fn cmd_completions(shell: clap_complete::Shell) -> Result<()> {
     completions::run(shell)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the canonical `--overview` → `--follow` implication that the
+    /// four mutating-verb dispatch arms (`MoveWindow`, `MoveWindowHere`,
+    /// `MoveWorkspace`, `AssignWorkspace`) delegate to. The helper has no
+    /// IPC dependency, so the unit test exercises the rule directly
+    /// rather than spinning up clap or a `MockClient`.
+    #[test]
+    fn dispatch_overview_implies_follow() {
+        // `--overview` alone is shorthand for `--follow --overview`.
+        assert_eq!(resolve_follow_overview(false, true), (true, true));
+        // `--follow` alone leaves `overview` false.
+        assert_eq!(resolve_follow_overview(true, false), (true, false));
+        // Both flags off → both stay off (the default no-op path).
+        assert_eq!(resolve_follow_overview(false, false), (false, false));
+        // Explicit `--follow --overview` is the canonical form, idempotent.
+        assert_eq!(resolve_follow_overview(true, true), (true, true));
+    }
 }
