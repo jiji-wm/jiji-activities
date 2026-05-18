@@ -76,27 +76,29 @@
 //!   [`crate::assign_workspace::focused_workspace`].
 
 use anyhow::{Context, Result};
-use niri_ipc::{Action, Activity, Request, Workspace, WorkspaceReferenceArg};
+use niri_ipc::{Action, Activity, Request, Response, Workspace, WorkspaceReferenceArg};
 
 use crate::error::{CliError, MalformedResponseSource};
-use crate::ipc::NiriClient;
-use crate::ipc_helpers::{send_expect_activities, send_expect_handled, send_expect_workspaces};
-use crate::picker::PickerOutcome;
+use crate::ipc::{IpcError, NiriClient};
+use crate::ipc_helpers::{
+    send_expect_activities, send_expect_handled, send_expect_workspaces, variant_name,
+};
+use crate::picker::{NameOutcome, PickerOutcome};
 
 // ---- Stage sentinels -------------------------------------------------------
 
-// Each stage of the move-window picker carries a single sentinel string:
-// the unicode form is preferred, and the underscore-fallback form is
-// substituted iff a collision against the user-visible row set is
-// detected at composition time. Both sentinels are CLI-internal (never
-// emitted on the wire) and resolved by strict string equality in the
-// stage resolvers.
+// Stage 1 carries two sentinel rows (`« Current activity »`,
+// `« New activity »`); stage 2 carries one (`« New workspace »`). The
+// unicode form is preferred for each, and the underscore-fallback form
+// is substituted iff a collision against the user-visible row set is
+// detected at composition time. All sentinels are CLI-internal (never
+// emitted on the wire) and resolved by strict string equality.
 //
-// Contrast with [`crate::picker::multi_select::SentinelNames`], which is
-// a genuine matched pair of distinct sentinels carried atomically — that
-// shape is justified there and intentionally retained. Here, each stage
-// has only one sentinel, so a plain `&'static str` threads through the
-// composer/resolver pair with no abstraction in between.
+// Stage 1's two sentinels are carried as a typed [`Stage1Sentinels`]
+// struct so the matched pair travels atomically between composer and
+// resolver — same pattern as [`crate::picker::multi_select::SentinelNames`].
+// Stage 2 still carries a plain `&'static str` because it only has one
+// sentinel.
 
 /// Stage-1 sentinel (preferred unicode form): the `« Current activity »`
 /// row that opens stage 2 against the focused activity.
@@ -107,6 +109,15 @@ const UNICODE_CURRENT_ACTIVITY: &str = "« Current activity »";
 /// against the live activity name set.
 const FALLBACK_CURRENT_ACTIVITY: &str = "__niri_activities_current_activity__";
 
+/// Stage-1 sentinel (preferred unicode form): the `« New activity »`
+/// row that prompts the user for a name, creates the activity over IPC,
+/// and proceeds to stage 2 against the new activity.
+const UNICODE_NEW_ACTIVITY: &str = "« New activity »";
+
+/// Stage-1 sentinel fallback used iff any activity name collides with
+/// the unicode form for the new-activity row. Selected by [`sentinel_names`].
+const FALLBACK_NEW_ACTIVITY: &str = "__niri_activities_new_activity__";
+
 /// Stage-2 sentinel (preferred unicode form): the `« New workspace »`
 /// row that resolves to the active activity's trailing-empty workspace.
 const UNICODE_NEW_WORKSPACE: &str = "« New workspace »";
@@ -116,12 +127,31 @@ const UNICODE_NEW_WORKSPACE: &str = "« New workspace »";
 /// invocation against the live workspace label set.
 const FALLBACK_NEW_WORKSPACE: &str = "__niri_activities_new_workspace__";
 
+/// Stage-1 sentinel pair produced by [`sentinel_names`] for a given
+/// activity-name slice. Both fields are CLI-internal `&'static str`s —
+/// the unicode form when no collision is detected, the underscore
+/// fallback otherwise. They are chosen independently per row, so a
+/// fixture with one colliding name but not the other still ends up
+/// using unicode for the non-colliding side.
+#[derive(Debug, Clone, Copy)]
+struct Stage1Sentinels {
+    current: &'static str,
+    new_activity: &'static str,
+}
+
 // ---- Stage-resolution enums ------------------------------------------------
 
 /// Post-picker resolution for stage 1.
 #[derive(Debug)]
 enum Stage1Resolution<'a> {
+    /// User picked the `« Current activity »` sentinel — open stage 2
+    /// against the currently-active activity.
     CurrentActivity,
+    /// User picked the `« New activity »` sentinel — prompt for a name,
+    /// dispatch `Action::CreateActivity`, refetch `Activities`, then
+    /// open stage 2 against the freshly-created activity.
+    NewActivity,
+    /// User picked a literal activity name.
     Selected(&'a Activity),
     Cancelled,
     /// The stage-1 picker returned a row that was not in the items we
@@ -250,30 +280,43 @@ pub(crate) fn run(client: &mut dyn NiriClient, activity_name: &str) -> Result<()
 ///    single-line stderr diagnostic and returns `Ok(())` — the
 ///    stage-1 picker is never spawned.
 /// 2. Opens stage 1 (activity picker) with a `« Current activity »`
-///    sentinel as the first row. Cancellation returns `Ok(())`.
-/// 3. Dispatches to [`dispatch_stage2_with_new`] (active activity, or
-///    `« Current activity »` sentinel) or
-///    [`dispatch_stage2_literal_only`] (non-active activity), per the
-///    `Stage1Resolution::Selected(activity).is_active` discriminator.
+///    sentinel as the first row and a `« New activity »` sentinel as
+///    the last row. Cancellation returns `Ok(())`.
+/// 3. If the user picked `« New activity »`, prompts for a name via
+///    `prompt_name_fn`, dispatches `Action::CreateActivity { name }`,
+///    refetches `Activities`, and proceeds to stage 2 against the new
+///    activity. Empty-name input is rejected client-side as
+///    [`CliError::Usage`] (exit 64) **before** any IPC is issued.
+/// 4. Otherwise dispatches to [`dispatch_stage2_with_new`] (active
+///    activity, or `« Current activity »` sentinel, or freshly-created
+///    activity that lands as active) or [`dispatch_stage2_literal_only`]
+///    (non-active activity).
 ///    The dispatch helpers issue `Request::Workspaces`, filter to
 ///    workspaces in the chosen activity on the focused output, and
 ///    manage zero-case diagnostics and sentinel composition.
-/// 4. **Zero-case:** on the literal-only path, when the filtered
+/// 5. **Zero-case:** on the literal-only path, when the filtered
 ///    workspace list is empty, the helper writes a stderr diagnostic and
 ///    returns `Ok(())` — stage 2 is **not** spawned. On the with-new
 ///    path the `« New workspace »` sentinel covers the empty case so no
 ///    short-circuit fires there.
-/// 5. Opens stage 2 (workspace picker). `« New workspace »` is only
+/// 6. Opens stage 2 (workspace picker). `« New workspace »` is only
 ///    offered on the with-new path. Cancellation returns `Ok(())`.
-/// 6. Dispatches `Action::MoveWindowToWorkspace { window_id: None,
+/// 7. Dispatches `Action::MoveWindowToWorkspace { window_id: None,
 ///    reference: Id(ws.id), focus: false }`.
 ///
-/// The `pick` parameter is a closure (not `FnOnce`) because it is called
-/// twice — once per stage. Production wiring passes
-/// [`crate::picker::pick_one`].
-pub(crate) fn run_picker<F>(client: &mut dyn NiriClient, pick: F) -> Result<()>
+/// The `pick` parameter is a closure (not `FnOnce`) because it is
+/// called twice — once per stage. The `prompt_name_fn` parameter fires
+/// at most once, only when the user picks the `« New activity »`
+/// sentinel. Production wiring passes [`crate::picker::pick_one`] and
+/// [`crate::picker::prompt_name`] respectively.
+pub(crate) fn run_picker<F, P>(
+    client: &mut dyn NiriClient,
+    pick: F,
+    prompt_name_fn: P,
+) -> Result<()>
 where
     F: Fn(&str, &[String]) -> Result<PickerOutcome, CliError>,
+    P: FnOnce(&str) -> Result<NameOutcome, CliError>,
 {
     let activities = send_expect_activities(client).context("requesting activities")?;
     if activities.is_empty() {
@@ -282,11 +325,11 @@ where
     }
 
     let activity_name_refs: Vec<&str> = activities.iter().map(|a| a.name.as_str()).collect();
-    let stage1_sentinel = sentinel_names(&activity_name_refs);
-    let stage1_items = compose_stage1_items(&activities, stage1_sentinel);
+    let stage1_sentinels = sentinel_names(&activity_name_refs);
+    let stage1_items = compose_stage1_items(&activities, &stage1_sentinels);
     let stage1_picked = pick("Move window to activity:", &stage1_items)?;
 
-    match resolve_stage1(stage1_picked, stage1_sentinel, &activities) {
+    match resolve_stage1(stage1_picked, &stage1_sentinels, &activities) {
         Stage1Resolution::Cancelled => Ok(()),
         Stage1Resolution::CurrentActivity => {
             let id = current_activity_id(&activities)?;
@@ -303,6 +346,41 @@ where
             let name = activity.name.clone();
             dispatch_stage2_literal_only(client, activity.id, &name, &pick)
         }
+        Stage1Resolution::NewActivity => {
+            // Prompt for a name in the same fuzzel-shaped UI. Pre-reject
+            // empty-Enter client-side as CliError::Usage so the user
+            // sees an actionable diagnostic without an IPC round-trip.
+            let outcome = prompt_name_fn("new activity name:")?;
+            let new_name = match outcome {
+                NameOutcome::Cancelled => return Ok(()),
+                NameOutcome::Unnamed => {
+                    return Err(
+                        CliError::Usage("new activity name must not be empty".to_owned()).into(),
+                    );
+                }
+                NameOutcome::Typed(s) => s,
+            };
+            create_activity_via_ipc(client, &new_name)?;
+            // Refetch Activities so the new activity's id is in scope.
+            // The compositor mints the id when CreateActivity is
+            // handled; the post-create snapshot is the only authority
+            // for that id from the CLI's perspective.
+            let after =
+                send_expect_activities(client).context("requesting activities after create")?;
+            let new_activity = after.iter().find(|a| a.name == new_name).ok_or_else(|| {
+                CliError::MalformedResponse(MalformedResponseSource::Server(
+                    "newly-created activity not present in post-create Activities snapshot"
+                        .to_owned(),
+                ))
+            })?;
+            if new_activity.is_active {
+                dispatch_stage2_with_new(client, new_activity.id, &pick)
+                    .context("dispatching stage 2 against newly-created activity")
+            } else {
+                dispatch_stage2_literal_only(client, new_activity.id, &new_name, &pick)
+                    .context("dispatching stage 2 against newly-created activity")
+            }
+        }
         Stage1Resolution::Unknown(row) => Err(CliError::MalformedResponse(
             MalformedResponseSource::Server(format!(
                 "stage-1 picker returned row not in items: {row:?}"
@@ -310,6 +388,51 @@ where
         )
         .into()),
     }
+}
+
+/// Dispatches `Action::CreateActivity { name }` and maps the compositor's
+/// wire-error matrix verbatim to the same `CliError` variants used by
+/// [`crate::create::run`]:
+///
+/// - `CreateActivityError::DuplicateName` display → [`CliError::CantCreate`].
+/// - `CreateActivityError::EmptyName` display → [`CliError::Usage`].
+/// - other `IpcError::Server(_)` → [`MalformedResponseSource::Server`].
+///
+/// **Why not [`crate::create::run`]:** the stage-1 new-activity flow
+/// is a multi-IPC pipeline (CreateActivity → re-fetch Activities →
+/// dispatch_stage2_*), so this is a step of that pipeline rather than a
+/// terminal verb invocation. Open-coding the dispatch here keeps the
+/// pipeline's error-context layer (`"creating activity from move-window
+/// picker"`) attachable without misroute-by-strings between
+/// `creating activity` (the standalone verb's context) and the picker's
+/// context.
+///
+/// **Synthetic-string discipline.** The `"creating activity from
+/// move-window picker"` context label is a CLI-internal string — it is
+/// not on the wire. Same audit-skip discipline as
+/// [`focused_workspace`]'s `"no focused workspace"`.
+fn create_activity_via_ipc(client: &mut dyn NiriClient, name: &str) -> Result<()> {
+    let req = Request::Action(Action::CreateActivity {
+        name: name.to_owned(),
+    });
+    let result: anyhow::Result<()> = match client.send(req) {
+        Ok(Response::Handled) => Ok(()),
+        Ok(other) => Err(
+            CliError::MalformedResponse(MalformedResponseSource::WrongVariant {
+                expected: "Response::Handled",
+                got: variant_name(&other).into(),
+            })
+            .into(),
+        ),
+        Err(IpcError::Server(msg)) if msg == "activity name already exists" => {
+            Err(CliError::CantCreate(format!("activity \"{name}\" already exists")).into())
+        }
+        Err(IpcError::Server(msg)) if msg == "activity name must not be empty" => {
+            Err(CliError::Usage("activity name must not be empty".to_owned()).into())
+        }
+        Err(other) => Err(CliError::from(other).into()),
+    };
+    result.context("creating activity from move-window picker")
 }
 
 /// Single-stage picker form for `move-window-here`.
@@ -604,14 +727,24 @@ fn trailing_empty_workspace<'a>(filtered: &[&'a Workspace]) -> Option<&'a Worksp
         .copied()
 }
 
-/// Returns the stage-1 sentinel guaranteed not to collide with any element
-/// of `activity_names`. Prefers the unicode form; substitutes the
-/// underscore fallback iff a collision would occur.
-fn sentinel_names(activity_names: &[&str]) -> &'static str {
-    if activity_names.contains(&UNICODE_CURRENT_ACTIVITY) {
+/// Returns the stage-1 sentinel pair guaranteed not to collide with any
+/// element of `activity_names`. Each row prefers its unicode form and
+/// falls back to its underscore form independently — a fixture with one
+/// colliding name does not force both sentinels to use fallbacks.
+fn sentinel_names(activity_names: &[&str]) -> Stage1Sentinels {
+    let current = if activity_names.contains(&UNICODE_CURRENT_ACTIVITY) {
         FALLBACK_CURRENT_ACTIVITY
     } else {
         UNICODE_CURRENT_ACTIVITY
+    };
+    let new_activity = if activity_names.contains(&UNICODE_NEW_ACTIVITY) {
+        FALLBACK_NEW_ACTIVITY
+    } else {
+        UNICODE_NEW_ACTIVITY
+    };
+    Stage1Sentinels {
+        current,
+        new_activity,
     }
 }
 
@@ -626,19 +759,22 @@ fn workspace_sentinel_names(workspace_labels: &[&str]) -> &'static str {
     }
 }
 
-/// Composes the stage-1 item list: `« Current activity »` (or its
-/// underscore fallback) first, then compositor-supplied activity names
-/// in their original order.
+/// Composes the stage-1 item list: `« Current activity »` first
+/// (sentinels.current), then compositor-supplied activity names in
+/// their original order, then `« New activity »` last
+/// (sentinels.new_activity).
 ///
-/// **Ordering invariant.** The sentinel is **always** the first row;
-/// activity order is **never** reshuffled by `names_focused_first` —
-/// the sentinel already covers the focused-activity shortcut.
-fn compose_stage1_items(activities: &[Activity], sentinel: &str) -> Vec<String> {
-    let mut out = Vec::with_capacity(activities.len() + 1);
-    out.push(sentinel.to_owned());
+/// **Ordering invariant.** Sentinels bookend the list. The activity
+/// names are **never** reshuffled by `names_focused_first` — the
+/// `« Current activity »` row already covers the focused-activity
+/// shortcut.
+fn compose_stage1_items(activities: &[Activity], sentinels: &Stage1Sentinels) -> Vec<String> {
+    let mut out = Vec::with_capacity(activities.len() + 2);
+    out.push(sentinels.current.to_owned());
     for a in activities {
         out.push(a.name.clone());
     }
+    out.push(sentinels.new_activity.to_owned());
     out
 }
 
@@ -669,26 +805,29 @@ fn compose_stage2_items_literal_only(workspaces: &[&Workspace]) -> Vec<String> {
     workspaces.iter().map(|w| workspace_label(w)).collect()
 }
 
-/// Resolves the stage-1 picker outcome to one of four branches:
-/// cancellation, the `« Current activity »` sentinel, a literal
-/// activity selection, or `Unknown` when the stage-1 picker returns a
-/// row not in the items we passed (a picker-side contract violation).
+/// Resolves the stage-1 picker outcome to one of five branches:
+/// cancellation, the `« Current activity »` sentinel, the
+/// `« New activity »` sentinel, a literal activity selection, or
+/// `Unknown` when the stage-1 picker returns a row not in the items we
+/// passed (a picker-side contract violation).
 ///
-/// Sentinel match is strict equality against the unicode or
-/// underscore-fallback form passed as `sentinel`. Activity match walks
+/// Sentinel matches are strict equality against the unicode or
+/// underscore-fallback form passed as `sentinels`. Activity match walks
 /// the snapshot by name. `Unknown(name)` is returned rather than
 /// silently folding contract violations into `Cancelled` so callers
 /// can surface the anomaly as `MalformedResponse`.
 fn resolve_stage1<'a>(
     picked: PickerOutcome,
-    sentinel: &str,
+    sentinels: &Stage1Sentinels,
     activities: &'a [Activity],
 ) -> Stage1Resolution<'a> {
     match picked {
         PickerOutcome::Cancelled => Stage1Resolution::Cancelled,
         PickerOutcome::Selected(name) => {
-            if name == sentinel {
+            if name == sentinels.current {
                 Stage1Resolution::CurrentActivity
+            } else if name == sentinels.new_activity {
+                Stage1Resolution::NewActivity
             } else if let Some(a) = activities.iter().find(|a| a.name == name) {
                 Stage1Resolution::Selected(a)
             } else {
@@ -874,6 +1013,16 @@ mod tests {
             reference: WorkspaceReferenceArg::Id(ws_id),
             focus: false,
         })
+    }
+
+    /// Default `prompt_name` fake for `run_picker` tests that do **not**
+    /// exercise the `« New activity »` sentinel branch. Panicking on
+    /// invocation pins that the test under cuts the stage-1 dispatch
+    /// before reaching the new-activity prompt — a regression that
+    /// accidentally routed a non-new-activity row through the prompt
+    /// would surface as the panic.
+    fn no_new_activity_prompt(_prompt: &str) -> Result<NameOutcome, CliError> {
+        panic!("prompt_name_fn must NOT be invoked for this test");
     }
 
     // ---- focused_workspace / focused_output_name ---------------------------
@@ -1107,14 +1256,29 @@ mod tests {
     fn sentinel_names_no_collision_uses_unicode() {
         let names = vec!["Work", "Personal"];
         let s = sentinel_names(&names);
-        assert_eq!(s, "« Current activity »");
+        assert_eq!(s.current, "« Current activity »");
+        assert_eq!(s.new_activity, "« New activity »");
     }
 
     #[test]
     fn sentinel_names_collision_with_current_activity_uses_underscore_fallback() {
+        // Per-row fallback: only `current` is colliding, so `new_activity`
+        // still uses its unicode form.
         let names = vec!["Work", "« Current activity »"];
         let s = sentinel_names(&names);
-        assert_eq!(s, "__niri_activities_current_activity__");
+        assert_eq!(s.current, "__niri_activities_current_activity__");
+        assert_eq!(s.new_activity, "« New activity »");
+    }
+
+    #[test]
+    fn sentinel_names_falls_back_when_activity_named_new_activity() {
+        // Per-row fallback: only `new_activity` is colliding, so
+        // `current` still uses its unicode form. Pins that collision
+        // detection is independent per sentinel.
+        let names = vec!["Work", "« New activity »"];
+        let s = sentinel_names(&names);
+        assert_eq!(s.current, "« Current activity »");
+        assert_eq!(s.new_activity, "__niri_activities_new_activity__");
     }
 
     #[test]
@@ -1136,8 +1300,8 @@ mod tests {
     #[test]
     fn compose_stage1_items_puts_current_activity_sentinel_first() {
         let acts = vec![act(1, "Work", false), act(2, "Personal", true)];
-        let sentinel = sentinel_names(&["Work", "Personal"]);
-        let items = compose_stage1_items(&acts, sentinel);
+        let sentinels = sentinel_names(&["Work", "Personal"]);
+        let items = compose_stage1_items(&acts, &sentinels);
         assert_eq!(items[0], "« Current activity »");
         assert_eq!(items[1], "Work");
         assert_eq!(items[2], "Personal");
@@ -1145,13 +1309,34 @@ mod tests {
 
     #[test]
     fn compose_stage1_items_preserves_compositor_order_no_focused_first_reorder() {
-        // 'Personal' is active here, but the sentinel covers the
-        // focused-activity shortcut — the activity slice must NOT be
-        // reordered to hoist 'Personal' above 'Work'.
+        // 'Personal' is active here, but the « Current activity »
+        // sentinel covers the focused-activity shortcut — the activity
+        // slice must NOT be reordered to hoist 'Personal' above 'Work'.
         let acts = vec![act(1, "Work", false), act(2, "Personal", true)];
-        let sentinel = sentinel_names(&["Work", "Personal"]);
-        let items = compose_stage1_items(&acts, sentinel);
-        assert_eq!(items, vec!["« Current activity »", "Work", "Personal"]);
+        let sentinels = sentinel_names(&["Work", "Personal"]);
+        let items = compose_stage1_items(&acts, &sentinels);
+        assert_eq!(
+            items,
+            vec![
+                "« Current activity »",
+                "Work",
+                "Personal",
+                "« New activity »",
+            ],
+        );
+    }
+
+    #[test]
+    fn compose_stage1_includes_new_activity_sentinel_at_end() {
+        // The « New activity » sentinel must be the last row so the
+        // user has a single-keystroke (or End-key) affordance to reach
+        // the new-activity prompt regardless of how many activities
+        // exist.
+        let acts = vec![act(1, "Work", false), act(2, "Personal", true)];
+        let sentinels = sentinel_names(&["Work", "Personal"]);
+        let items = compose_stage1_items(&acts, &sentinels);
+        assert_eq!(items.last().map(String::as_str), Some("« New activity »"));
+        assert_eq!(items.len(), 4);
     }
 
     #[test]
@@ -1204,13 +1389,26 @@ mod tests {
     #[test]
     fn resolve_stage1_recognises_current_activity_sentinel_with_underscore_fallback() {
         let acts = vec![act(1, "Work", true)];
-        // Force the underscore fallback by passing a colliding name.
-        let sentinel = sentinel_names(&["« Current activity »"]);
-        assert_eq!(sentinel, "__niri_activities_current_activity__");
+        // Force the underscore fallback for `current` by passing a
+        // colliding name.
+        let sentinels = sentinel_names(&["« Current activity »"]);
+        assert_eq!(sentinels.current, "__niri_activities_current_activity__");
         let picked = PickerOutcome::Selected("__niri_activities_current_activity__".into());
-        match resolve_stage1(picked, sentinel, &acts) {
+        match resolve_stage1(picked, &sentinels, &acts) {
             Stage1Resolution::CurrentActivity => {}
             other => panic!("expected CurrentActivity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_stage1_recognises_new_activity_sentinel() {
+        let acts = vec![act(1, "Work", true)];
+        let sentinels = sentinel_names(&["Work"]);
+        assert_eq!(sentinels.new_activity, "« New activity »");
+        let picked = PickerOutcome::Selected("« New activity »".into());
+        match resolve_stage1(picked, &sentinels, &acts) {
+            Stage1Resolution::NewActivity => {}
+            other => panic!("expected NewActivity, got {other:?}"),
         }
     }
 
@@ -1233,9 +1431,9 @@ mod tests {
         // Picker returned a row that wasn't in the items (contract
         // violation). Must surface as Unknown, not silently as Cancelled.
         let acts = vec![act(1, "Work", true)];
-        let sentinel = sentinel_names(&["Work"]);
+        let sentinels = sentinel_names(&["Work"]);
         let picked = PickerOutcome::Selected("NotAnActivity".into());
-        match resolve_stage1(picked, sentinel, &acts) {
+        match resolve_stage1(picked, &sentinels, &acts) {
             Stage1Resolution::Unknown(row) => assert_eq!(row, "NotAnActivity"),
             other => panic!("expected Unknown, got {other:?}"),
         }
@@ -1324,7 +1522,7 @@ mod tests {
                 Ok(PickerOutcome::Selected("« New workspace »".into()))
             }
         };
-        let err = run_picker(&mut client, pick).expect_err(
+        let err = run_picker(&mut client, pick, no_new_activity_prompt).expect_err(
             "synthetic sentinel on literal-only path must surface as MalformedResponse",
         );
         let cli_err = err
@@ -1458,7 +1656,8 @@ mod tests {
         let pick = |_prompt: &str, _items: &[String]| -> Result<PickerOutcome, CliError> {
             panic!("stage-1 picker must NOT be spawned for empty activities list");
         };
-        run_picker(&mut client, pick).expect("empty activities must exit Ok");
+        run_picker(&mut client, pick, no_new_activity_prompt)
+            .expect("empty activities must exit Ok");
         client.assert_consumed_in_order();
     }
 
@@ -1472,7 +1671,7 @@ mod tests {
         let pick = |_prompt: &str, _items: &[String]| -> Result<PickerOutcome, CliError> {
             Ok(PickerOutcome::Cancelled)
         };
-        run_picker(&mut client, pick).expect("stage1 cancel is silent Ok");
+        run_picker(&mut client, pick, no_new_activity_prompt).expect("stage1 cancel is silent Ok");
         client.assert_consumed_in_order();
     }
 
@@ -1515,7 +1714,7 @@ mod tests {
                 panic!("unexpected prompt: {prompt}");
             }
         };
-        run_picker(&mut client, pick).expect("happy path succeeds");
+        run_picker(&mut client, pick, no_new_activity_prompt).expect("happy path succeeds");
         client.assert_consumed_in_order();
     }
 
@@ -1544,7 +1743,7 @@ mod tests {
                 Ok(PickerOutcome::Cancelled)
             }
         };
-        run_picker(&mut client, pick).expect("stage2 cancel is silent Ok");
+        run_picker(&mut client, pick, no_new_activity_prompt).expect("stage2 cancel is silent Ok");
         client.assert_consumed_in_order();
     }
 
@@ -1574,7 +1773,8 @@ mod tests {
                 Ok(PickerOutcome::Selected("« New workspace »".into()))
             }
         };
-        run_picker(&mut client, pick).expect("new-workspace sentinel succeeds");
+        run_picker(&mut client, pick, no_new_activity_prompt)
+            .expect("new-workspace sentinel succeeds");
         client.assert_consumed_in_order();
     }
 
@@ -1605,7 +1805,7 @@ mod tests {
                 panic!("stage 2 must NOT be spawned for non-active activity with no workspaces");
             }
         };
-        run_picker(&mut client, pick).expect("zero-case must exit Ok");
+        run_picker(&mut client, pick, no_new_activity_prompt).expect("zero-case must exit Ok");
         client.assert_consumed_in_order();
     }
 
@@ -1621,7 +1821,8 @@ mod tests {
         let pick = |_prompt: &str, _items: &[String]| -> Result<PickerOutcome, CliError> {
             panic!("stage 1 must NOT be spawned on malformed Activities response");
         };
-        let err = run_picker(&mut client, pick).expect_err("wrong variant must fail");
+        let err = run_picker(&mut client, pick, no_new_activity_prompt)
+            .expect_err("wrong variant must fail");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())
@@ -1654,7 +1855,8 @@ mod tests {
                 panic!("stage 2 must NOT be spawned on malformed Workspaces response");
             }
         };
-        let err = run_picker(&mut client, pick).expect_err("wrong variant must fail");
+        let err = run_picker(&mut client, pick, no_new_activity_prompt)
+            .expect_err("wrong variant must fail");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())
@@ -1783,6 +1985,282 @@ mod tests {
         client.assert_consumed_in_order();
     }
 
+    #[test]
+    fn run_picker_stage1_new_activity_empty_name_rejects_as_usage_exit_64() {
+        // User picks « New activity » and presses Enter on an empty
+        // prompt. The CLI MUST reject client-side as
+        // CliError::Usage (exit 64) BEFORE any IPC round-trip — the
+        // compositor would also reject "" via CreateActivityError::EmptyName,
+        // but a CLI-side pre-reject is faster and produces a clearer error.
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![act(1, "Work", true)])),
+        );
+        // No further IPC expected — the Usage rejection short-circuits
+        // before CreateActivity is dispatched.
+        let pick = |_prompt: &str, _items: &[String]| -> Result<PickerOutcome, CliError> {
+            Ok(PickerOutcome::Selected("« New activity »".into()))
+        };
+        let prompt = |_prompt: &str| -> Result<NameOutcome, CliError> { Ok(NameOutcome::Unnamed) };
+        let err =
+            run_picker(&mut client, pick, prompt).expect_err("empty-Enter must surface as Usage");
+        let cli_err = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<CliError>())
+            .expect("CliError must be in chain");
+        assert_eq!(cli_err.exit_code(), 64);
+        match cli_err {
+            CliError::Usage(msg) => {
+                assert!(
+                    msg.contains("must not be empty"),
+                    "Usage message must explain the empty-name cause; got: {msg}",
+                );
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+        client.assert_consumed_in_order();
+    }
+
+    // ---- create_activity_via_ipc wire-error matrix -------------------------
+
+    fn create_activity_req(name: &str) -> Request {
+        Request::Action(Action::CreateActivity {
+            name: name.to_owned(),
+        })
+    }
+
+    #[test]
+    fn create_activity_via_ipc_name_already_exists_maps_to_cant_create() {
+        let mut client = MockClient::new();
+        client.expect(
+            create_activity_req("Work"),
+            Err("activity name already exists".to_owned()),
+        );
+        let err = create_activity_via_ipc(&mut client, "Work").expect_err("collision must fail");
+        let cli_err = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<CliError>())
+            .expect("CliError must be in chain");
+        match cli_err {
+            CliError::CantCreate(msg) => {
+                assert!(
+                    msg.contains("already exists"),
+                    "message must mention cause; got: {msg}"
+                );
+            }
+            other => panic!("expected CantCreate, got {other:?}"),
+        }
+        assert_eq!(cli_err.exit_code(), 73);
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn create_activity_via_ipc_name_must_not_be_empty_maps_to_usage() {
+        let mut client = MockClient::new();
+        client.expect(
+            create_activity_req("   "),
+            Err("activity name must not be empty".to_owned()),
+        );
+        let err = create_activity_via_ipc(&mut client, "   ").expect_err("empty-name must fail");
+        let cli_err = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<CliError>())
+            .expect("CliError must be in chain");
+        match cli_err {
+            CliError::Usage(msg) => {
+                assert_eq!(msg, "activity name must not be empty");
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+        assert_eq!(cli_err.exit_code(), 64);
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn create_activity_via_ipc_name_already_exists_suffixed_routes_to_malformed_response_server() {
+        // Pins strict-equality on the DuplicateName wire-string match.
+        // A suffixed variant ("activity name already exists: Work") must NOT route
+        // to CantCreate; it must fall through to MalformedResponse(Server).
+        let mut client = MockClient::new();
+        client.expect(
+            create_activity_req("Work"),
+            Err("activity name already exists: Work".to_owned()),
+        );
+        let err = create_activity_via_ipc(&mut client, "Work")
+            .expect_err("suffixed string must not match CantCreate");
+        let cli_err = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<CliError>())
+            .expect("CliError must be in chain");
+        match cli_err {
+            CliError::MalformedResponse(MalformedResponseSource::Server(_)) => {}
+            other => panic!("expected MalformedResponse(Server), not CantCreate; got {other:?}"),
+        }
+        assert_eq!(cli_err.exit_code(), 65);
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn create_activity_via_ipc_name_must_not_be_empty_capitalized_routes_to_malformed_response_server()
+     {
+        // Pins strict-equality on the EmptyName wire-string match.
+        // A capitalized variant ("Activity name must not be empty") must NOT
+        // route to Usage — it must fall through to MalformedResponse(Server).
+        let mut client = MockClient::new();
+        client.expect(
+            create_activity_req("   "),
+            Err("Activity name must not be empty".to_owned()),
+        );
+        let err = create_activity_via_ipc(&mut client, "   ")
+            .expect_err("capitalized string must not match Usage");
+        let cli_err = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<CliError>())
+            .expect("CliError must be in chain");
+        match cli_err {
+            CliError::MalformedResponse(MalformedResponseSource::Server(_)) => {}
+            other => panic!("expected MalformedResponse(Server), not Usage; got {other:?}"),
+        }
+        assert_eq!(cli_err.exit_code(), 65);
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn create_activity_via_ipc_context_wrapper_does_not_bury_cli_error_variants() {
+        // Pins that CliError variants survive the `.context("creating activity
+        // from move-window picker")` wrapper: `err.chain().find_map(downcast_ref
+        // ::<CliError>())` must still find them.
+        let mut client = MockClient::new();
+        client.expect(
+            create_activity_req("Work"),
+            Err("activity name already exists".to_owned()),
+        );
+        let err = create_activity_via_ipc(&mut client, "Work").expect_err("must fail");
+        // The anyhow chain must contain the context string.
+        let formatted = format!("{err:#}");
+        assert!(
+            formatted.contains("creating activity from move-window picker"),
+            "context string missing from error chain: {formatted}",
+        );
+        // And the typed CliError must still be findable via downcast.
+        let cli_err = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<CliError>())
+            .expect("CliError must survive .context() wrapping");
+        assert!(
+            matches!(cli_err, CliError::CantCreate(_)),
+            "CantCreate variant must survive .context(); got {cli_err:?}",
+        );
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn run_picker_new_activity_happy_path_creates_then_dispatches_stage2() {
+        // Full NewActivity flow:
+        // 1. Stage-1 activities fetch (Work, active).
+        // 2. Stage-1 picker: user picks « New activity ».
+        // 3. prompt_name_fn returns Typed("Personal").
+        // 4. CreateActivity IPC dispatched → Handled.
+        // 5. Activities refetched: now [Work(active), Personal(non-active)].
+        // 6. Personal is not active → literal-only stage-2 path.
+        // 7. Stage-2 Workspaces fetch.
+        // 8. Stage-2 picker: user picks Personal's workspace.
+        // 9. MoveWindowToWorkspace dispatched.
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![act(1, "Work", true)])),
+        );
+        client.expect(
+            Request::Action(Action::CreateActivity {
+                name: "Personal".to_owned(),
+            }),
+            Reply::Ok(Response::Handled),
+        );
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![
+                act(1, "Work", true),
+                act(2, "Personal", false),
+            ])),
+        );
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![
+                ws(10, 0, true, Some("DP-1"), vec![1], Some(99)),
+                ws(20, 0, false, Some("DP-1"), vec![2], None),
+            ])),
+        );
+        client.expect(move_req(20), Reply::Ok(Response::Handled));
+
+        let pick = |prompt: &str, _items: &[String]| -> Result<PickerOutcome, CliError> {
+            if prompt == "Move window to activity:" {
+                Ok(PickerOutcome::Selected("« New activity »".into()))
+            } else {
+                // Stage 2: pick the only workspace in Personal.
+                Ok(PickerOutcome::Selected("id 20".into()))
+            }
+        };
+        let prompt = |_prompt: &str| -> Result<NameOutcome, CliError> {
+            Ok(NameOutcome::Typed("Personal".to_owned()))
+        };
+        run_picker(&mut client, pick, prompt).expect("new-activity happy path must succeed");
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn run_picker_new_activity_is_active_uses_with_new_stage2_path() {
+        // When the newly-created activity lands as is_active=true,
+        // the with-new stage-2 path is selected (« New workspace » sentinel offered).
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![act(1, "Work", true)])),
+        );
+        client.expect(
+            Request::Action(Action::CreateActivity {
+                name: "Personal".to_owned(),
+            }),
+            Reply::Ok(Response::Handled),
+        );
+        // Post-create snapshot: Personal is now active.
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![
+                act(1, "Work", false),
+                act(2, "Personal", true),
+            ])),
+        );
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![
+                ws(10, 0, false, Some("DP-1"), vec![1], None),
+                // Personal's trailing-empty workspace.
+                ws(20, 0, true, Some("DP-1"), vec![2], None),
+            ])),
+        );
+        client.expect(move_req(20), Reply::Ok(Response::Handled));
+
+        let pick = |prompt: &str, items: &[String]| -> Result<PickerOutcome, CliError> {
+            if prompt == "Move window to activity:" {
+                Ok(PickerOutcome::Selected("« New activity »".into()))
+            } else {
+                // Stage 2 on with-new path: « New workspace » must be offered.
+                assert!(
+                    items.last().is_some_and(|s| s == "« New workspace »"),
+                    "with-new path must offer « New workspace »; items: {items:?}",
+                );
+                Ok(PickerOutcome::Selected("« New workspace »".into()))
+            }
+        };
+        let prompt_fn = |_prompt: &str| -> Result<NameOutcome, CliError> {
+            Ok(NameOutcome::Typed("Personal".to_owned()))
+        };
+        run_picker(&mut client, pick, prompt_fn).expect("new-activity active path must succeed");
+        client.assert_consumed_in_order();
+    }
+
     // ---- dispatch_stage2_{with_new,literal_only} ---------------------------
 
     #[test]
@@ -1815,7 +2293,7 @@ mod tests {
                 panic!("stage 2 must NOT be spawned on literal-only empty zero-case");
             }
         };
-        run_picker(&mut client, pick).expect("zero-case must exit Ok");
+        run_picker(&mut client, pick, no_new_activity_prompt).expect("zero-case must exit Ok");
         client.assert_consumed_in_order();
     }
 

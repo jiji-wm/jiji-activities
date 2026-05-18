@@ -147,7 +147,7 @@ fn cmd_move_window(name: Option<String>) -> Result<()> {
             // produce on a disconnected socket.
             picker::ensure_available().context("verifying move-window picker availability")?;
             let mut client = ipc::make_client();
-            move_window::run_picker(client.as_mut(), picker::pick_one)
+            move_window::run_picker(client.as_mut(), picker::pick_one, picker::prompt_name)
                 .context("running move-window picker")
         }
     }
