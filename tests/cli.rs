@@ -15,6 +15,47 @@ use predicates::str::contains;
 
 const BIN: &str = "niri-activities";
 
+/// Multi-reply Unix-socket listener that accepts one connection per reply
+/// and sends a fixed reply to each, in order.  `SocketClient` opens a new
+/// Unix-socket connection for every `send` call, so each IPC request from
+/// the binary arrives as an independent `accept()`.  Used for subcommands
+/// that issue more than one IPC request per invocation.
+fn spawn_scripted_listener(tag: &str, replies: Vec<&'static str>) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let sock_path = std::env::temp_dir().join(format!(
+        "niri-activities-cli-test-scripted-{}-{}-{}.sock",
+        std::process::id(),
+        n,
+        tag,
+    ));
+    let _ = std::fs::remove_file(&sock_path);
+    let listener = UnixListener::bind(&sock_path).expect("bind scripted socket");
+    let sock_path_clone = sock_path.clone();
+    thread::spawn(move || {
+        for reply in replies {
+            // Accept one connection per queued reply.
+            if let Ok((mut sock, _)) = listener.accept() {
+                let read_clone = sock.try_clone().expect("clone socket");
+                let mut reader = BufReader::new(read_clone);
+                let mut _req_line = String::new();
+                let _ = reader.read_line(&mut _req_line);
+                let _ = sock.write_all(reply.as_bytes());
+                let _ = sock.write_all(b"\n");
+            }
+        }
+        let _ = std::fs::remove_file(&sock_path_clone);
+    });
+    // Spin until the socket file appears (up to ~500 ms).
+    for _ in 0..50 {
+        if sock_path.exists() {
+            break;
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    sock_path
+}
+
 /// One-shot Unix-socket listener that accepts one connection, reads one
 /// request line, writes a `Reply::Ok(Response::Handled)` reply, and
 /// captures the raw request JSON to `capture_path`. Used to pin the
@@ -468,4 +509,39 @@ fn completions_unknown_shell_exits_64() {
         .args(["completions", "bogus-shell"])
         .assert()
         .code(64);
+}
+
+#[test]
+fn move_window_named_prints_confirmation_to_stderr_on_success() {
+    // Pins that `move-window <activity>` writes the post-move confirmation
+    // line to stderr on success.  A regression that deletes the
+    // `print_move_confirmation` call would produce exit 0 with no stderr
+    // output, which this test would catch.
+    //
+    // IPC script (3 requests):
+    //   1. Activities  → [Work(active, id=1), Personal(inactive, id=2)]
+    //   2. Workspaces  → focused ws id=10 (activity 1, output DP-1,
+    //                    active_window_id=42), trailing-empty ws id=20
+    //                    (activity 2, output DP-1).
+    //   3. Action::MoveWindowToWorkspace → Handled.
+    //
+    // The compositor JSON for Activities and Workspaces is inline — it
+    // matches the niri-ipc wire format.
+    let activities_reply = r#"{"Ok":{"Activities":[{"id":1,"name":"Work","is_active":true,"is_config_declared":true,"is_urgent":false},{"id":2,"name":"Personal","is_active":false,"is_config_declared":true,"is_urgent":false}]}}"#;
+    let workspaces_reply = r#"{"Ok":{"Workspaces":[{"id":10,"idx":0,"name":null,"output":"DP-1","is_urgent":false,"is_active":false,"is_focused":true,"active_window_id":42,"activities":[1],"is_sticky":false,"is_in_active_activity":true},{"id":20,"idx":0,"name":null,"output":"DP-1","is_urgent":false,"is_active":false,"is_focused":false,"active_window_id":null,"activities":[2],"is_sticky":false,"is_in_active_activity":false}]}}"#;
+    let handled_reply = r#"{"Ok":"Handled"}"#;
+
+    let sock = spawn_scripted_listener(
+        "move-window-confirm",
+        vec![activities_reply, workspaces_reply, handled_reply],
+    );
+
+    Command::cargo_bin(BIN)
+        .unwrap()
+        .args(["move-window", "Personal"])
+        .env("NIRI_SOCKET", &sock)
+        .assert()
+        .success()
+        .stderr(contains("moved window"))
+        .stderr(contains("'Personal'"));
 }
