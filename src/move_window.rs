@@ -276,10 +276,15 @@ enum Stage2ResolutionLiteralOnly<'a> {
 ///   `MalformedResponse(Server("focused workspace has no output"))` (exit 65).
 /// - Compositor reply variant / server-error handling matches
 ///   [`send_expect_handled_or_no_op`].
+///
+/// **`follow`.** When `true`, the focused-window id is captured from the
+/// in-scope `Workspaces` snapshot and threaded into the dispatch — see
+/// [`decide_window_id_for_dispatch`]. The default (`false`) preserves the
+/// pre-`--follow` wire shape (`window_id: None`).
 pub(crate) fn run(
     client: &mut dyn NiriClient,
     activity_name: &str,
-    _follow: bool,
+    follow: bool,
     _overview: bool,
 ) -> Result<()> {
     let activities = send_expect_activities(client).context("requesting activities")?;
@@ -307,8 +312,9 @@ pub(crate) fn run(
         return Ok(());
     };
     let ws_id = ws.id;
+    let window_id_for_dispatch = decide_window_id_for_dispatch(follow, &workspaces);
     handle_move_outcome(
-        dispatch_move(client, ws_id)?,
+        dispatch_move(client, ws_id, window_id_for_dispatch)?,
         ws_id,
         activity_name,
         &workspaces,
@@ -430,11 +436,16 @@ fn print_already_current_breadcrumb(ws_id: u64, workspaces: &[Workspace]) {
 /// at most once, only when the user picks the `« New activity »`
 /// sentinel. Production wiring passes [`crate::picker::pick_one`] and
 /// [`crate::picker::prompt_name`] respectively.
+///
+/// **`follow`.** When `true`, the focused-window id is captured from the
+/// in-scope `Workspaces` snapshot (fetched in stage 2) and threaded into
+/// the dispatch — see [`decide_window_id_for_dispatch`]. The default
+/// (`false`) preserves the pre-`--follow` wire shape (`window_id: None`).
 pub(crate) fn run_picker<F, P>(
     client: &mut dyn NiriClient,
     pick: F,
     prompt_name_fn: P,
-    _follow: bool,
+    follow: bool,
     _overview: bool,
 ) -> Result<()>
 where
@@ -460,7 +471,7 @@ where
         Stage1Resolution::CurrentActivity => {
             let active = current_activity(&activities)?;
             let name = active.name.clone();
-            dispatch_stage2_with_new(client, active.id, &name, &activity_names, &pick)
+            dispatch_stage2_with_new(client, active.id, &name, &activity_names, &pick, follow)
         }
         // Active activity → with-new path (compositor trailing-empty
         // invariant guarantees a landing slot for « New workspace »).
@@ -468,11 +479,11 @@ where
         // trailing-empty, so no sentinel offered).
         Stage1Resolution::Selected(activity) if activity.is_active => {
             let name = activity.name.clone();
-            dispatch_stage2_with_new(client, activity.id, &name, &activity_names, &pick)
+            dispatch_stage2_with_new(client, activity.id, &name, &activity_names, &pick, follow)
         }
         Stage1Resolution::Selected(activity) => {
             let name = activity.name.clone();
-            dispatch_stage2_literal_only(client, activity.id, &name, &activity_names, &pick)
+            dispatch_stage2_literal_only(client, activity.id, &name, &activity_names, &pick, follow)
         }
         Stage1Resolution::NewActivity => {
             // Prompt for a name in the same fuzzel-shaped UI. Pre-reject
@@ -513,6 +524,7 @@ where
                     &new_name,
                     &activity_names_after,
                     &pick,
+                    follow,
                 )
                 .context("dispatching stage 2 against newly-created activity")
             } else {
@@ -522,6 +534,7 @@ where
                     &new_name,
                     &activity_names_after,
                     &pick,
+                    follow,
                 )
                 .context("dispatching stage 2 against newly-created activity")
             }
@@ -596,10 +609,15 @@ fn create_activity_via_ipc(client: &mut dyn NiriClient, name: &str) -> Result<()
 /// - No focused workspace / focused workspace has no output — same
 ///   synthetics as [`run`].
 /// - Reply / variant handling matches [`send_expect_handled_or_no_op`].
+///
+/// **`follow`.** When `true`, the focused-window id is captured from the
+/// in-scope `Workspaces` snapshot and threaded into the dispatch — see
+/// [`decide_window_id_for_dispatch`]. The default (`false`) preserves the
+/// pre-`--follow` wire shape (`window_id: None`).
 pub(crate) fn run_here_picker<F>(
     client: &mut dyn NiriClient,
     pick: F,
-    _follow: bool,
+    follow: bool,
     _overview: bool,
 ) -> Result<()>
 where
@@ -611,7 +629,14 @@ where
     let activity_name = active.name.clone();
     let activity_names: HashMap<u64, String> =
         activities.iter().map(|a| (a.id, a.name.clone())).collect();
-    dispatch_stage2_with_new(client, activity_id, &activity_name, &activity_names, pick)
+    dispatch_stage2_with_new(
+        client,
+        activity_id,
+        &activity_name,
+        &activity_names,
+        pick,
+        follow,
+    )
 }
 
 // ---- Stage-2 dispatch (with-new vs literal-only) ---------------------------
@@ -650,6 +675,7 @@ fn dispatch_stage2_with_new<F>(
     target_activity_name: &str,
     activity_names: &HashMap<u64, String>,
     pick: F,
+    follow: bool,
 ) -> Result<()>
 where
     F: FnOnce(&str, &[String]) -> Result<PickerOutcome, CliError>,
@@ -692,7 +718,8 @@ where
         Stage2ResolutionWithNew::Cancelled => Ok(()),
         Stage2ResolutionWithNew::Selected(ws) => {
             let ws_id = ws.id;
-            let outcome = dispatch_move(client, ws_id)?;
+            let window_id_for_dispatch = decide_window_id_for_dispatch(follow, &workspaces);
+            let outcome = dispatch_move(client, ws_id, window_id_for_dispatch)?;
             handle_move_outcome(outcome, ws_id, target_activity_name, &workspaces)?;
             Ok(())
         }
@@ -721,7 +748,8 @@ where
                 .into());
             };
             let ws_id = ws.id;
-            let outcome = dispatch_move(client, ws_id)?;
+            let window_id_for_dispatch = decide_window_id_for_dispatch(follow, &workspaces);
+            let outcome = dispatch_move(client, ws_id, window_id_for_dispatch)?;
             handle_move_outcome(outcome, ws_id, target_activity_name, &workspaces)?;
             Ok(())
         }
@@ -745,6 +773,7 @@ fn dispatch_stage2_literal_only<F>(
     target_activity_name: &str,
     activity_names: &HashMap<u64, String>,
     pick: F,
+    follow: bool,
 ) -> Result<()>
 where
     F: FnOnce(&str, &[String]) -> Result<PickerOutcome, CliError>,
@@ -797,7 +826,8 @@ where
         Stage2ResolutionLiteralOnly::Cancelled => Ok(()),
         Stage2ResolutionLiteralOnly::Selected(ws) => {
             let ws_id = ws.id;
-            let outcome = dispatch_move(client, ws_id)?;
+            let window_id_for_dispatch = decide_window_id_for_dispatch(follow, &workspaces);
+            let outcome = dispatch_move(client, ws_id, window_id_for_dispatch)?;
             handle_move_outcome(outcome, ws_id, target_activity_name, &workspaces)?;
             Ok(())
         }
@@ -837,10 +867,14 @@ where
 /// Dispatches the `MoveWindowToWorkspace` action against `ws_id` and
 /// returns the compositor's reply classification.
 ///
-/// `window_id: None`, `focus: false`, `reference: Id(ws_id)` are all
-/// load-bearing — see module docs for the rationale. The IPC error is
-/// wrapped with `.context("moving window to workspace")` so the
-/// operation surfaces in the stderr chain.
+/// `focus: false` and `reference: Id(ws_id)` are load-bearing — see
+/// module docs for the rationale. `window_id` is now caller-supplied:
+/// the default `None` path (operate on the focused window) and the
+/// `Some(captured_id)` path used under `--follow` (so the post-move
+/// `FocusWindow` step has an authoritative id even if focus drifts
+/// between the snapshot read and the compositor processing the move).
+/// The IPC error is wrapped with `.context("moving window to
+/// workspace")` so the operation surfaces in the stderr chain.
 ///
 /// **Why [`HandledOutcome`] and not `()`.** The compositor's
 /// `MoveWindowToWorkspace` handler may reply with
@@ -853,13 +887,74 @@ where
 /// [`HandledOutcome::NoOp`] path (which renders the already-current
 /// breadcrumb). Other reply variants surface as
 /// [`MalformedResponseSource::WrongVariant`] via the helper's contract.
-fn dispatch_move(client: &mut dyn NiriClient, ws_id: u64) -> Result<HandledOutcome> {
+fn dispatch_move(
+    client: &mut dyn NiriClient,
+    ws_id: u64,
+    window_id: Option<u64>,
+) -> Result<HandledOutcome> {
     let req = Request::Action(Action::MoveWindowToWorkspace {
-        window_id: None,
+        window_id,
         reference: WorkspaceReferenceArg::Id(ws_id),
         focus: false,
     });
     send_expect_handled_or_no_op(client, req).context("moving window to workspace")
+}
+
+/// Returns the `active_window_id` of the focused workspace, or `None`
+/// when no workspace is focused OR the focused workspace has no active
+/// window.
+///
+/// **Why pure.** The two "cannot capture" cases collapse to a single
+/// `None` because the caller treats them identically: emit a stderr
+/// fallback diagnostic and dispatch with `window_id: None`. The
+/// "no focused workspace at all" condition is already surfaced as
+/// [`CliError::MalformedResponse(Server("no focused workspace"))`] by
+/// [`focused_workspace`] / [`focused_output_name`], which fire before
+/// this helper in every dispatcher; if execution reaches here, the
+/// focused-workspace probe has already passed, so this helper's `None`
+/// strictly means "focused workspace has no active window."
+///
+/// **No new IPC call.** Reads from the `Workspaces` snapshot already in
+/// scope at the dispatch site.
+fn capture_focused_window_id(workspaces: &[Workspace]) -> Option<u64> {
+    focused_workspace(workspaces).ok()?.active_window_id
+}
+
+/// Decides what to pass as `Action::MoveWindowToWorkspace.window_id`
+/// based on the `--follow` flag and the focused-window snapshot.
+///
+/// - `follow: false` → `None` (default behavior; compositor operates on
+///   the focused window at dispatch time).
+/// - `follow: true` and a focused window exists → `Some(captured_id)`.
+/// - `follow: true` and no window can be captured → `None` plus a
+///   stderr fallback diagnostic noting that the post-follow window
+///   refocus will be skipped. The user's primary intent (move) is
+///   preserved; the partial-fulfillment is surfaced via stderr.
+///
+/// **Why a helper.** The decision is duplicated across four
+/// `dispatch_move` call sites, each reading against a different in-scope
+/// `workspaces` binding. Pulling the eprintln + decision into one place
+/// keeps the call sites three-liners and pins the fallback message in a
+/// single location.
+///
+/// **Synthetic-string discipline.** The eprintln literal is a
+/// CLI-internal diagnostic — it is **not** emitted on the wire by the
+/// niri compositor. A future grep that audits compositor wire-string
+/// matches must skip this site. Same audit-skip discipline as
+/// [`focused_workspace`]'s `"no focused workspace"`.
+fn decide_window_id_for_dispatch(follow: bool, workspaces: &[Workspace]) -> Option<u64> {
+    if !follow {
+        return None;
+    }
+    let captured = capture_focused_window_id(workspaces);
+    if captured.is_none() {
+        eprintln!(
+            "niri-activities: --follow set but no focused window to capture; \
+             dispatching move with compositor-resolved window (no window-id \
+             refocus will fire after follow)"
+        );
+    }
+    captured
 }
 
 /// Renders the post-move confirmation line shown on stderr after a
@@ -1427,6 +1522,17 @@ mod tests {
     fn move_req(ws_id: u64) -> Request {
         Request::Action(Action::MoveWindowToWorkspace {
             window_id: None,
+            reference: WorkspaceReferenceArg::Id(ws_id),
+            focus: false,
+        })
+    }
+
+    /// Variant of [`move_req`] that pins `window_id: Some(_)` — used by
+    /// the `--follow` thread-through tests to assert the captured id
+    /// reaches the wire.
+    fn move_req_with_window(ws_id: u64, window_id: u64) -> Request {
+        Request::Action(Action::MoveWindowToWorkspace {
+            window_id: Some(window_id),
             reference: WorkspaceReferenceArg::Id(ws_id),
             focus: false,
         })
@@ -3290,6 +3396,154 @@ mod tests {
             }
             other => panic!("expected MalformedResponse(Server), got {other:?}"),
         }
+        client.assert_consumed_in_order();
+    }
+
+    // ---- capture_focused_window_id / --follow thread-through ---------------
+
+    #[test]
+    fn capture_focused_window_id_returns_active_window_when_focused_workspace_has_window() {
+        let workspaces = vec![
+            ws(1, 0, false, Some("DP-1"), vec![1], None),
+            ws(2, 1, true, Some("DP-1"), vec![1], Some(42)),
+        ];
+        assert_eq!(capture_focused_window_id(&workspaces), Some(42));
+    }
+
+    #[test]
+    fn capture_focused_window_id_returns_none_when_focused_workspace_has_no_active_window() {
+        // Focused workspace exists but `active_window_id: None`. The
+        // "empty focused workspace" case the helper must collapse to
+        // None (the dispatcher then emits the eprintln fallback).
+        let workspaces = vec![ws(1, 0, true, Some("DP-1"), vec![1], None)];
+        assert_eq!(capture_focused_window_id(&workspaces), None);
+    }
+
+    #[test]
+    fn capture_focused_window_id_returns_none_when_no_workspace_is_focused() {
+        // Defensive: in production `focused_workspace` already surfaces
+        // this as `MalformedResponse(Server("no focused workspace"))`
+        // before any caller reaches `capture_focused_window_id`. Pinned
+        // here so a refactor that bypasses the `focused_workspace`
+        // probe cannot silently turn this into a panic.
+        let workspaces = vec![ws(1, 0, false, Some("DP-1"), vec![1], Some(42))];
+        assert_eq!(capture_focused_window_id(&workspaces), None);
+    }
+
+    #[test]
+    fn run_with_follow_and_captured_window_dispatches_move_with_window_id_some() {
+        // Named-arg form with `--follow` set and a focused window present.
+        // `dispatch_move` must be called with `window_id: Some(99)`; the
+        // MockClient queue compares the full Request payload, so a
+        // regression to `None` would surface as a request-mismatch
+        // failure on the third `send`.
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![
+                act(1, "Work", true),
+                act(2, "Personal", false),
+            ])),
+        );
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![
+                ws(10, 0, true, Some("DP-1"), vec![1], Some(99)),
+                ws(20, 0, false, Some("DP-1"), vec![2], None),
+            ])),
+        );
+        client.expect(move_req_with_window(20, 99), Reply::Ok(Response::Handled));
+
+        run(&mut client, "Personal", true, false).expect("--follow named-arg succeeds");
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn run_with_follow_and_no_captured_window_falls_back_to_window_id_none_with_eprintln() {
+        // Named-arg form with `--follow` set BUT the focused workspace
+        // has `active_window_id: None`. The helper must still dispatch
+        // (preserving the user's primary intent) — with `window_id: None`
+        // — and `decide_window_id_for_dispatch` will emit a stderr
+        // fallback diagnostic that this test does not capture but
+        // structurally relies on (covered by the helper's rustdoc).
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![
+                act(1, "Work", true),
+                act(2, "Personal", false),
+            ])),
+        );
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![
+                // Focused workspace has NO active window.
+                ws(10, 0, true, Some("DP-1"), vec![1], None),
+                ws(20, 0, false, Some("DP-1"), vec![2], None),
+            ])),
+        );
+        client.expect(move_req(20), Reply::Ok(Response::Handled));
+
+        run(&mut client, "Personal", true, false).expect("--follow fallback succeeds");
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn run_without_follow_keeps_window_id_none_regardless_of_active_window() {
+        // No-regression pin: `--follow` off must always dispatch with
+        // `window_id: None`, even when an `active_window_id` is present
+        // in the focused-workspace snapshot. Wire-shape regression on
+        // the no-follow path is one of the spec's review-stop
+        // conditions.
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![
+                act(1, "Work", true),
+                act(2, "Personal", false),
+            ])),
+        );
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![
+                ws(10, 0, true, Some("DP-1"), vec![1], Some(99)),
+                ws(20, 0, false, Some("DP-1"), vec![2], None),
+            ])),
+        );
+        // window_id: None, not Some(99) — `--follow` is off.
+        client.expect(move_req(20), Reply::Ok(Response::Handled));
+
+        run(&mut client, "Personal", false, false).expect("no-follow named-arg succeeds");
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn dispatch_stage2_with_new_with_follow_threads_captured_window_id_into_move() {
+        // Drive `dispatch_stage2_with_new` via `run_here_picker` with
+        // `--follow: true`. The user picks a non-(current) row (id 20);
+        // the dispatched `MoveWindowToWorkspace` must carry the
+        // captured focused-window id (99).
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![act(1, "Work", true)])),
+        );
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![
+                ws(10, 0, true, Some("DP-1"), vec![1], Some(99)),
+                ws(20, 1, false, Some("DP-1"), vec![1], None),
+            ])),
+        );
+        client.expect(move_req_with_window(20, 99), Reply::Ok(Response::Handled));
+
+        let pick = |_prompt: &str, items: &[String]| -> Result<PickerOutcome, CliError> {
+            // Skip items[0] (the focused row with `(current)`) and pick
+            // items[1] to drive an actual dispatch.
+            assert_eq!(items[0], "idx 0 (current)");
+            Ok(PickerOutcome::Selected(items[1].clone()))
+        };
+        run_here_picker(&mut client, pick, true, false).expect("--follow stage 2 succeeds");
         client.assert_consumed_in_order();
     }
 }
