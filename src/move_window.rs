@@ -584,6 +584,8 @@ where
         stage2_sentinel,
         &filtered,
         focused_workspace_id,
+        target_activity_id,
+        activity_names,
     ) {
         Stage2ResolutionWithNew::Cancelled => Ok(()),
         Stage2ResolutionWithNew::Selected(ws) => {
@@ -691,6 +693,8 @@ where
         stage2_sentinel,
         &filtered,
         focused_workspace_id,
+        target_activity_id,
+        activity_names,
     ) {
         Stage2ResolutionLiteralOnly::Cancelled => Ok(()),
         Stage2ResolutionLiteralOnly::Selected(ws) => {
@@ -1037,6 +1041,8 @@ fn resolve_stage2_with_new<'a>(
     sentinel: &str,
     candidates: &'a [&'a Workspace],
     focused_workspace_id: Option<u64>,
+    target_activity_id: u64,
+    activity_names: &HashMap<u64, String>,
 ) -> Stage2ResolutionWithNew<'a> {
     match picked {
         PickerOutcome::Cancelled => Stage2ResolutionWithNew::Cancelled,
@@ -1045,12 +1051,28 @@ fn resolve_stage2_with_new<'a>(
                 Stage2ResolutionWithNew::NewWorkspace
             } else if let Some(ws) = focused_workspace_id
                 .and_then(|focused_id| candidates.iter().find(|w| w.id == focused_id).copied())
-                .filter(|ws| label == format!("{} (current)", workspace_label(ws)))
+                .filter(|ws| {
+                    // Match the full composed label including membership
+                    // suffix — the helper's suffix-ordering invariant
+                    // (`{base}{membership}{current}`) is what the
+                    // composer emits, so the resolver matches against
+                    // the same shape.
+                    label
+                        == workspace_label_with_annotations(
+                            ws,
+                            target_activity_id,
+                            true,
+                            activity_names,
+                        )
+                })
             {
                 Stage2ResolutionWithNew::AlreadyCurrent(ws.id)
             } else if let Some(ws) = candidates
                 .iter()
-                .find(|w| workspace_label(w) == label)
+                .find(|w| {
+                    workspace_label_with_annotations(w, target_activity_id, false, activity_names)
+                        == label
+                })
                 .copied()
             {
                 debug_assert!(
@@ -1088,6 +1110,8 @@ fn resolve_stage2_literal_only<'a>(
     sentinel: &str,
     candidates: &'a [&'a Workspace],
     focused_workspace_id: Option<u64>,
+    target_activity_id: u64,
+    activity_names: &HashMap<u64, String>,
 ) -> Stage2ResolutionLiteralOnly<'a> {
     match picked {
         PickerOutcome::Cancelled => Stage2ResolutionLiteralOnly::Cancelled,
@@ -1096,12 +1120,23 @@ fn resolve_stage2_literal_only<'a>(
                 Stage2ResolutionLiteralOnly::NewWorkspace
             } else if let Some(ws) = focused_workspace_id
                 .and_then(|focused_id| candidates.iter().find(|w| w.id == focused_id).copied())
-                .filter(|ws| label == format!("{} (current)", workspace_label(ws)))
+                .filter(|ws| {
+                    label
+                        == workspace_label_with_annotations(
+                            ws,
+                            target_activity_id,
+                            true,
+                            activity_names,
+                        )
+                })
             {
                 Stage2ResolutionLiteralOnly::AlreadyCurrent(ws.id)
             } else if let Some(ws) = candidates
                 .iter()
-                .find(|w| workspace_label(w) == label)
+                .find(|w| {
+                    workspace_label_with_annotations(w, target_activity_id, false, activity_names)
+                        == label
+                })
                 .copied()
             {
                 debug_assert!(
@@ -1158,33 +1193,67 @@ fn workspace_label(ws: &Workspace) -> String {
 /// Annotations (suffix order is **load-bearing** and pinned by tests):
 ///
 /// 1. **Base** — [`workspace_label`] output.
-/// 2. **Membership suffix** — currently a no-op placeholder; reserved
-///    for a future ` [sticky]` / ` [also in: <names>]` extension that
-///    will land alongside the multi-activity disclosure work. The
-///    parameters `target_activity_id` and `activity_names` are accepted
-///    today so the call-site signatures do not churn when that
-///    extension lands.
+/// 2. **Membership suffix** — discloses cross-activity membership of the
+///    workspace:
+///    - If `ws.is_sticky == true`: ` [sticky]`. Sticky takes
+///      precedence over `[also in: …]` because a sticky workspace is
+///      conceptually in every activity, so listing the other activity
+///      names by name would be noisy and misleading.
+///    - Else if `ws.activities.len() > 1`: ` [also in: <names>]`,
+///      where `<names>` is the alphabetically-sorted list of the
+///      activity names from `activity_names` whose ids appear in
+///      `ws.activities` and are not `target_activity_id`. Ids absent
+///      from `activity_names` are silently skipped (defensive: a
+///      compositor-supplied id with no matching name is not a CLI
+///      crash condition).
+///    - Else: no membership suffix (the workspace is in exactly one
+///      activity and not sticky).
 /// 3. **Current suffix** — ` (current)` iff `is_current == true`.
 ///
 /// **Suffix-ordering invariant.** The final shape is always
 /// `{base}{membership}{current}` — membership annotations come BEFORE
 /// the `(current)` marker. This ordering is the resolver's source of
 /// truth for label matching: future extensions to this function must
-/// preserve it. The invariant is pinned by the
-/// `workspace_label_*_in_correct_order` tests when membership lands.
+/// preserve it. The invariant is pinned by
+/// `workspace_label_sticky_plus_current_renders_in_correct_order` in
+/// the test module.
+///
+/// This helper is the **single source of truth** for stage-2 label shape.
+/// Both composers (`compose_stage2_items_with_new`, `compose_stage2_items_literal_only`)
+/// call it forward; both resolvers (`resolve_stage2_with_new`, `resolve_stage2_literal_only`)
+/// call it for backward string-matching. Changing the output here cascades through all
+/// four sites — keep them in sync or split the helper into separate emit/parse halves.
 fn workspace_label_with_annotations(
     ws: &Workspace,
-    _target_activity_id: u64,
+    target_activity_id: u64,
     is_current: bool,
-    _activity_names: &HashMap<u64, String>,
+    activity_names: &HashMap<u64, String>,
 ) -> String {
     let base = workspace_label(ws);
-    // Extension point: the multi-activity / sticky membership suffix
-    // slots in here (between `base` and `current`). Keep this site as
-    // the single source of suffix order — the resolver matches against
-    // the composed output.
+    let membership = if ws.is_sticky {
+        " [sticky]".to_string()
+    } else if ws.activities.len() > 1 {
+        let mut others: Vec<&str> = ws
+            .activities
+            .iter()
+            .filter(|&&id| id != target_activity_id)
+            // Race-window: `Activities` and `Workspaces` are fetched in separate IPC
+            // round-trips; a new activity can land between them, appearing in
+            // `ws.activities` before `activity_names` sees it. Silently skipping the
+            // unknown id keeps the label clean (no stray `[also in: ]` artifact).
+            .filter_map(|id| activity_names.get(id).map(String::as_str))
+            .collect();
+        if others.is_empty() {
+            String::new()
+        } else {
+            others.sort_unstable();
+            format!(" [also in: {}]", others.join(", "))
+        }
+    } else {
+        String::new()
+    };
     let current = if is_current { " (current)" } else { "" };
-    format!("{base}{current}")
+    format!("{base}{membership}{current}")
 }
 
 #[cfg(test)]
@@ -1709,7 +1778,8 @@ mod tests {
         let filtered = vec![&w, &other];
         let sentinel = workspace_sentinel_names(&[]);
         let picked = PickerOutcome::Selected("idx 3 (current)".into());
-        match resolve_stage2_with_new(picked, sentinel, &filtered, Some(7)) {
+        let names = activity_lookup(&[(1, "Work")]);
+        match resolve_stage2_with_new(picked, sentinel, &filtered, Some(7), 1, &names) {
             Stage2ResolutionWithNew::AlreadyCurrent(id) => assert_eq!(id, 7),
             other => panic!("expected AlreadyCurrent(7), got {other:?}"),
         }
@@ -1723,9 +1793,44 @@ mod tests {
         let filtered = vec![&w];
         let sentinel = workspace_sentinel_names(&[]);
         let picked = PickerOutcome::Selected("idx 3 (current)".into());
-        match resolve_stage2_literal_only(picked, sentinel, &filtered, Some(7)) {
+        let names = activity_lookup(&[(1, "Work")]);
+        match resolve_stage2_literal_only(picked, sentinel, &filtered, Some(7), 1, &names) {
             Stage2ResolutionLiteralOnly::AlreadyCurrent(id) => assert_eq!(id, 7),
             other => panic!("expected AlreadyCurrent(7), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_stage2_with_new_picked_multi_activity_label_returns_selected() {
+        // Workspace id 7 belongs to activities [1, 2]. The picker returns the
+        // fully-annotated label (including the [also in: Personal] suffix).
+        // The resolver must map this to Selected(ws) — not Unknown.
+        let mut w = ws(7, 3, false, Some("DP-1"), vec![1, 2], None);
+        w.is_in_active_activity = true;
+        let filtered = vec![&w];
+        let sentinel = workspace_sentinel_names(&[]);
+        let names = activity_lookup(&[(1, "Work"), (2, "Personal")]);
+        // Reconstruct the expected label the same way the composer would.
+        let expected_label = workspace_label_with_annotations(&w, 1, false, &names);
+        let picked = PickerOutcome::Selected(expected_label);
+        match resolve_stage2_with_new(picked, sentinel, &filtered, None, 1, &names) {
+            Stage2ResolutionWithNew::Selected(ws) => assert_eq!(ws.id, 7),
+            other => panic!("expected Selected(7), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_stage2_literal_only_picked_multi_activity_label_returns_selected() {
+        // Same pattern against the literal-only resolver.
+        let w = ws_hidden(7, 0, Some("DP-1"), vec![1, 2], None);
+        let filtered = vec![&w];
+        let sentinel = workspace_sentinel_names(&[]);
+        let names = activity_lookup(&[(1, "Work"), (2, "Personal")]);
+        let expected_label = workspace_label_with_annotations(&w, 2, false, &names);
+        let picked = PickerOutcome::Selected(expected_label);
+        match resolve_stage2_literal_only(picked, sentinel, &filtered, None, 2, &names) {
+            Stage2ResolutionLiteralOnly::Selected(ws) => assert_eq!(ws.id, 7),
+            other => panic!("expected Selected(7), got {other:?}"),
         }
     }
 
@@ -1826,6 +1931,140 @@ mod tests {
         );
     }
 
+    // ---- workspace_label_with_annotations / membership disclosure ---------
+
+    #[test]
+    fn workspace_label_sticky_appends_sticky_suffix() {
+        // is_sticky = true → label ends with " [sticky]". The sticky
+        // suffix does NOT include any " [also in: …]" disclosure (the
+        // sticky branch is taken in preference; a sticky workspace is
+        // conceptually in every activity so an enumerated also-in list
+        // would be misleading).
+        let mut w = ws(7, 2, false, Some("DP-1"), vec![1, 2], None);
+        w.is_in_active_activity = true;
+        w.is_sticky = true;
+        let names = activity_lookup(&[(1, "Work"), (2, "Personal")]);
+        let label = workspace_label_with_annotations(&w, 1, false, &names);
+        assert!(
+            label.ends_with(" [sticky]"),
+            "sticky workspaces must carry [sticky] suffix; got: {label}",
+        );
+        assert!(
+            !label.contains("[also in:"),
+            "sticky branch must NOT emit [also in: …]; got: {label}",
+        );
+    }
+
+    #[test]
+    fn workspace_label_multi_activity_lists_others_alphabetized() {
+        // activities = [1, 2, 3], target = 1; the other names must be
+        // sorted alphabetically and the target excluded.
+        let mut w = ws(7, 2, false, Some("DP-1"), vec![1, 2, 3], None);
+        w.is_in_active_activity = true;
+        // Names chosen so the unsorted compositor order (2, 3) is the
+        // OPPOSITE of the sorted output (Archive, Research) — pins the
+        // sort_unstable call.
+        let names = activity_lookup(&[(1, "Work"), (2, "Research"), (3, "Archive")]);
+        let label = workspace_label_with_annotations(&w, 1, false, &names);
+        assert!(
+            label.ends_with(" [also in: Archive, Research]"),
+            "multi-activity label must list other names alphabetized; got: {label}",
+        );
+    }
+
+    #[test]
+    fn workspace_label_single_membership_has_no_also_in_annotation() {
+        // activities = [1]: workspace is in exactly one activity, so
+        // neither [also in:] nor [sticky] is emitted.
+        let mut w = ws(7, 2, false, Some("DP-1"), vec![1], None);
+        w.is_in_active_activity = true;
+        let names = activity_lookup(&[(1, "Work")]);
+        let label = workspace_label_with_annotations(&w, 1, false, &names);
+        assert!(
+            !label.contains("[also in:"),
+            "single-membership workspace must NOT emit [also in: …]; got: {label}",
+        );
+        assert!(
+            !label.contains("[sticky]"),
+            "non-sticky workspace must NOT emit [sticky]; got: {label}",
+        );
+    }
+
+    #[test]
+    fn workspace_label_sticky_takes_precedence_over_also_in() {
+        // is_sticky = true AND activities.len() > 1: the sticky branch
+        // wins; no also-in is emitted.
+        let mut w = ws(7, 2, false, Some("DP-1"), vec![1, 2, 3], None);
+        w.is_in_active_activity = true;
+        w.is_sticky = true;
+        let names = activity_lookup(&[(1, "Work"), (2, "Personal"), (3, "Archive")]);
+        let label = workspace_label_with_annotations(&w, 1, false, &names);
+        assert!(
+            label.contains("[sticky]"),
+            "sticky must be emitted; got: {label}",
+        );
+        assert!(
+            !label.contains("[also in:"),
+            "sticky must take precedence over [also in: …]; got: {label}",
+        );
+    }
+
+    #[test]
+    fn workspace_label_unknown_activity_id_in_activities_list_is_skipped() {
+        // activities = [1, 2, 99]; only ids 1 and 2 are in the name
+        // map. Id 99 is silently skipped (defensive: a compositor-
+        // supplied id without a corresponding name is not a CLI crash
+        // condition).
+        let mut w = ws(7, 2, false, Some("DP-1"), vec![1, 2, 99], None);
+        w.is_in_active_activity = true;
+        let names = activity_lookup(&[(1, "Work"), (2, "Personal")]);
+        let label = workspace_label_with_annotations(&w, 1, false, &names);
+        assert!(
+            !label.contains("99"),
+            "unknown id must not leak into the rendered label; got: {label}",
+        );
+        assert!(
+            label.contains("Personal"),
+            "known names must still be listed; got: {label}",
+        );
+        assert_eq!(
+            label.matches("[also in:").count(),
+            1,
+            "exactly one [also in: …] substring expected; got: {label}",
+        );
+    }
+
+    #[test]
+    fn workspace_label_sticky_plus_current_renders_in_correct_order() {
+        // Suffix-ordering invariant: when BOTH membership and current
+        // suffixes fire, the order is {base}{membership}{current}.
+        // Pinned here with is_sticky + is_current → ends with
+        // "[sticky] (current)".
+        let mut w = ws(7, 2, false, Some("DP-1"), vec![1, 2], None);
+        w.is_in_active_activity = true;
+        w.is_sticky = true;
+        let names = activity_lookup(&[(1, "Work"), (2, "Personal")]);
+        let label = workspace_label_with_annotations(&w, 1, true, &names);
+        assert!(
+            label.ends_with("[sticky] (current)"),
+            "suffix order must be {{base}}{{membership}}{{current}}; got: {label}",
+        );
+    }
+
+    #[test]
+    fn workspace_label_multi_activity_plus_current_renders_in_correct_order() {
+        // Suffix-ordering invariant: [also in: …] precedes (current).
+        // activities = [1, 2], is_current = true → ends with "[also in: Personal] (current)".
+        let mut w = ws(7, 2, false, Some("DP-1"), vec![1, 2], None);
+        w.is_in_active_activity = true;
+        let names = activity_lookup(&[(1, "Work"), (2, "Personal")]);
+        let label = workspace_label_with_annotations(&w, 1, true, &names);
+        assert!(
+            label.ends_with("[also in: Personal] (current)"),
+            "suffix order must be {{base}}{{membership}}{{current}}; got: {label}",
+        );
+    }
+
     // ---- resolve_stage1 / resolve_stage2_{with_new,literal_only} ----------
 
     #[test]
@@ -1862,7 +2101,7 @@ mod tests {
         let sentinel = workspace_sentinel_names(&["« New workspace »"]);
         assert_eq!(sentinel, "__niri_activities_new_workspace__");
         let picked = PickerOutcome::Selected("__niri_activities_new_workspace__".into());
-        match resolve_stage2_with_new(picked, sentinel, &filtered, None) {
+        match resolve_stage2_with_new(picked, sentinel, &filtered, None, 1, &HashMap::new()) {
             Stage2ResolutionWithNew::NewWorkspace => {}
             other => panic!("expected NewWorkspace, got {other:?}"),
         }
@@ -1889,7 +2128,7 @@ mod tests {
         let filtered = vec![&a];
         let sentinel = workspace_sentinel_names(&["idx 0"]);
         let picked = PickerOutcome::Selected("not-a-workspace".into());
-        match resolve_stage2_with_new(picked, sentinel, &filtered, None) {
+        match resolve_stage2_with_new(picked, sentinel, &filtered, None, 1, &HashMap::new()) {
             Stage2ResolutionWithNew::Unknown(label) => assert_eq!(label, "not-a-workspace"),
             other => panic!("expected Unknown, got {other:?}"),
         }
@@ -1904,7 +2143,7 @@ mod tests {
         let filtered = vec![&a];
         let sentinel = workspace_sentinel_names(&["idx 0"]);
         let picked = PickerOutcome::Selected("not-a-workspace".into());
-        match resolve_stage2_literal_only(picked, sentinel, &filtered, None) {
+        match resolve_stage2_literal_only(picked, sentinel, &filtered, None, 1, &HashMap::new()) {
             Stage2ResolutionLiteralOnly::Unknown(label) => assert_eq!(label, "not-a-workspace"),
             other => panic!("expected Unknown, got {other:?}"),
         }
@@ -1922,7 +2161,7 @@ mod tests {
         let filtered = vec![&a];
         let sentinel = workspace_sentinel_names(&["idx 0"]);
         let picked = PickerOutcome::Selected(sentinel.to_owned());
-        match resolve_stage2_literal_only(picked, sentinel, &filtered, None) {
+        match resolve_stage2_literal_only(picked, sentinel, &filtered, None, 1, &HashMap::new()) {
             Stage2ResolutionLiteralOnly::NewWorkspace => {}
             other => panic!("expected NewWorkspace, got {other:?}"),
         }
