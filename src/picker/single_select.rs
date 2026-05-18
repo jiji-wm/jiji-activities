@@ -44,6 +44,35 @@ pub(crate) enum PickerOutcome {
     Cancelled,
 }
 
+/// Outcome of a [`prompt_name`] invocation.
+///
+/// `fuzzel --dmenu` with empty stdin acts as a free-text prompt: the user
+/// can type any string and press Enter. The wire-level outcomes map onto
+/// three CLI-meaningful cases:
+///
+/// - [`Self::Typed`] — non-empty stdout after trim. The user typed
+///   something and pressed Enter.
+/// - [`Self::Unnamed`] — empty stdout with exit success (or any
+///   defensive fallback that reads as "user pressed Enter without
+///   typing"). Distinct from [`Self::Cancelled`] because the caller may
+///   want to reject empty-Enter as a usage error rather than fold it
+///   into cancellation.
+/// - [`Self::Cancelled`] — user dismissed the prompt (Escape, ctrl-C).
+///   Same semantics as [`PickerOutcome::Cancelled`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum NameOutcome {
+    /// User typed a non-empty string and pressed Enter. The carried
+    /// `String` is the first line of `fuzzel`'s stdout, trimmed.
+    Typed(String),
+    /// Success exit with empty (or whitespace-only) first-line stdout.
+    /// Distinguished from `Cancelled` so the caller can pre-reject empty
+    /// input as `CliError::Usage` rather than silently treating it as
+    /// cancellation.
+    Unnamed,
+    /// User dismissed the prompt without submitting.
+    Cancelled,
+}
+
 /// Stderr message attached to the missing-`fuzzel` failure.
 ///
 /// Used **only** for the `NotFound` arm of `ensure_available`: when
@@ -159,6 +188,86 @@ pub(crate) fn pick_one(prompt: &str, items: &[String]) -> Result<PickerOutcome, 
         }
     }
     Ok(classify_output(output.status.success(), &output.stdout))
+}
+
+/// Runs `fuzzel --dmenu --prompt <prompt>` with **no** stdin items and
+/// returns whatever the user typed (or a cancellation / empty-Enter
+/// signal).
+///
+/// `fuzzel`'s `--dmenu` mode with no candidates behaves as a free-text
+/// prompt: the user types into the search field and presses Enter; their
+/// input echoes verbatim on stdout. We pipe an empty stdin (sending only
+/// EOF) so fuzzel doesn't deadlock waiting for the candidate list.
+///
+/// **Contract:**
+/// - `Ok(NameOutcome::Typed(name))` — success exit + non-empty
+///   trimmed first line. `name` is that trimmed first line.
+/// - `Ok(NameOutcome::Unnamed)` — success exit + empty stdout. The
+///   user pressed Enter without typing. The caller decides whether
+///   that's a usage error or a meaningful "no name."
+/// - `Ok(NameOutcome::Cancelled)` — non-success exit. Matches
+///   [`pick_one`]'s cancellation contract (Escape, ctrl-C, dismissal).
+/// - `Err(CliError::PickerUnavailable)` — fuzzel not on `$PATH` or
+///   spawn / wait failure. Same failure mapping as [`pick_one`].
+pub(crate) fn prompt_name(prompt: &str) -> Result<NameOutcome, CliError> {
+    // Same belt-and-suspenders as pick_one — see its comment for the
+    // rationale.
+    ensure_available()?;
+
+    let mut child = Command::new("fuzzel")
+        .args(["--dmenu", "--prompt", prompt])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(CliError::PickerUnavailable)?;
+
+    {
+        // Drop stdin immediately to send EOF. fuzzel --dmenu reads the
+        // candidate list to EOF before drawing the prompt; with no items
+        // we just close the pipe.
+        let stdin = child.stdin.take().ok_or_else(|| {
+            CliError::PickerUnavailable(std::io::Error::other(
+                "fuzzel: stdin pipe missing after spawn",
+            ))
+        })?;
+        drop(stdin);
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(CliError::PickerUnavailable)?;
+    if !output.stderr.is_empty() {
+        let stderr_text = String::from_utf8_lossy(&output.stderr);
+        for line in stderr_text.lines() {
+            eprintln!("fuzzel: {line}");
+        }
+    }
+    Ok(decode_name_outcome(output.status.success(), &output.stdout))
+}
+
+/// Classifies the child's exit status + stdout into a [`NameOutcome`].
+///
+/// Pure-helper sibling of [`classify_output`]; the free-text contract
+/// collapses fuzzel's defensive non-zero+stdout case into plain
+/// `Cancelled` because there is no meaningful "name" to recover from a
+/// dismissed prompt. (By contrast, [`classify_output`] has a fourth arm
+/// for non-zero+non-empty stdout that logs a diagnostic before folding
+/// into `Cancelled`.)
+///
+/// - success + non-empty first-line-trimmed stdout → `Typed(name)`.
+/// - success + empty (or whitespace-only) first-line → `Unnamed`.
+/// - failure (any exit) → `Cancelled`. The user dismissed; we ignore
+///   stdout because there's no useful "name" to extract from a
+///   cancellation.
+fn decode_name_outcome(success: bool, stdout: &[u8]) -> NameOutcome {
+    let text = String::from_utf8_lossy(stdout);
+    let first = text.lines().next().map(str::trim).unwrap_or("");
+    match (success, first.is_empty()) {
+        (true, false) => NameOutcome::Typed(first.to_owned()),
+        (true, true) => NameOutcome::Unnamed,
+        (false, _) => NameOutcome::Cancelled,
+    }
 }
 
 /// Joins `items` with newlines, with a trailing newline so the last item
@@ -358,6 +467,56 @@ mod tests {
         match classify_output(true, b"  Work  \nPersonal\n") {
             PickerOutcome::Selected(name) => assert_eq!(name, "Work"),
             PickerOutcome::Cancelled => panic!("expected Selected"),
+        }
+    }
+
+    // ---- decode_name_outcome ---------------------------------------------
+
+    #[test]
+    fn name_outcome_from_picker_typed_text() {
+        // Canonical happy path: user typed a name and pressed Enter →
+        // fuzzel exits 0 with the line on stdout.
+        match decode_name_outcome(true, b"new-name\n") {
+            NameOutcome::Typed(s) => assert_eq!(s, "new-name"),
+            other => panic!("expected Typed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn name_outcome_from_picker_empty_text_means_unnamed() {
+        // User pressed Enter without typing → fuzzel exits 0 with empty
+        // stdout. Distinct from Cancelled so the caller can pre-reject
+        // empty-Enter as Usage instead of silently treating it as
+        // cancellation.
+        assert!(matches!(
+            decode_name_outcome(true, b""),
+            NameOutcome::Unnamed
+        ));
+    }
+
+    #[test]
+    fn name_outcome_from_picker_cancelled() {
+        // Non-success exit → Cancelled regardless of stdout content.
+        // Mirrors pick_one's Cancelled contract.
+        assert!(matches!(
+            decode_name_outcome(false, b""),
+            NameOutcome::Cancelled
+        ));
+        assert!(matches!(
+            decode_name_outcome(false, b"stale-final-frame\n"),
+            NameOutcome::Cancelled
+        ));
+    }
+
+    #[test]
+    fn name_outcome_trims_trailing_newline() {
+        // Defensive: fuzzel emits the typed text followed by a newline.
+        // We take only the first line and strip surrounding whitespace —
+        // the carried String must NOT include the trailing newline or
+        // stray padding.
+        match decode_name_outcome(true, b"  spaced  \nignored\n") {
+            NameOutcome::Typed(s) => assert_eq!(s, "spaced"),
+            other => panic!("expected Typed, got {other:?}"),
         }
     }
 

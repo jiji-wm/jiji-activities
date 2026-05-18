@@ -30,4 +30,6 @@ mod single_select;
 // future test or doc reference doesn't have to know about the
 // single_select submodule split.
 #[allow(unused_imports)]
-pub(crate) use single_select::{PICKER_MISSING_MESSAGE, PickerOutcome, ensure_available, pick_one};
+pub(crate) use single_select::{
+    NameOutcome, PICKER_MISSING_MESSAGE, PickerOutcome, ensure_available, pick_one, prompt_name,
+};
