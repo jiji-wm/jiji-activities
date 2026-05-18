@@ -468,6 +468,50 @@ This sub-phase closes both with Stage 2 label annotations.
 
 **Commit boundary:** one code commit per behavioral task (Task 2b = one commit; Task 2c = one commit), plus one DD commit (Task 4). Task 3 is a manual gate with no commit.
 
+### Phase 3.6d — Optional post-action `--follow` flag for move/assign verbs
+
+A move (single-target) or assign (multi-target) verb today succeeds silently from a user-orientation standpoint: the eprintln confirmation tells you *that* the move happened, not *where to look*. For interactive use, the user often wants the next gesture to be "show me where it went so I can confirm placement or rearrange" — currently this requires a separate keybind (`niri msg action focus-workspace --reference Id N` or `Mod+1..9`) and a manual mental map of which workspace id the move targeted.
+
+This sub-phase adds a `--follow` flag to the four mutating verbs. With `--follow`, after a successful move/assign, the CLI spawns a tiny fuzzel picker offering the destination workspace(s). Selecting one dispatches `Action::FocusWorkspace { reference: Id(N) }` + `Action::ToggleOverview` (or the fork's equivalent overview-open action) and exits. Escape on the follow-up picker exits 0 silently — the move/assign already happened, the follow is purely navigational.
+
+**Why default off and gated on a flag.** Keybind invocations (`spawn "niri-activities" "move-window" "Personal"`) don't want a follow-up picker interrupting the keystroke flow. `--follow` is opt-in per invocation; the user adds it to keybinds they explicitly want interactive ("show me where it went after I pick the activity"). Scripts and pipelines stay unaffected.
+
+**Why one `FocusWorkspace` instead of `SwitchActivity` + `FocusWorkspace`.** In the workspace-as-atom model, focusing a workspace in another activity automatically activates that activity — one IPC call covers both transitions. Reduces the IPC roundtrip count and avoids a brief mid-transition state where the activity has switched but the workspace hasn't.
+
+**Why no window-id refocus on `move-window --follow`.** Per the Phase 3.6b Task 6 finding, the moved window's identity is snapshot-vs-dispatch racy when dispatched with `window_id: None`. The follow shows the *workspace*, not the window — the user sees their window via the overview (which renders all tiles in all visible workspaces), and overview's normal Enter/click semantics let them confirm or rearrange.
+
+**Follow-target shape per verb:**
+
+| Verb | Targets | Picker shape |
+|---|---|---|
+| `move-window [<name>] --follow` | One: destination workspace in the target activity | Single-row fuzzel: `Follow window to <workspace_label> in <activity>?`. Plus a `« Stay »` sentinel row. Enter on row → `FocusWorkspace { Id(workspace_id) }` + overview. Escape / `« Stay »` → exit 0. |
+| `move-window-here --follow` | One: destination workspace in the active activity | Same as above; activity name is the active activity. The workspace is the one selected via the in-active picker. |
+| `move-workspace [<name>] --follow` | One: the moved workspace in its new target activity | Single-row fuzzel: `Follow workspace to <activity>?`. The workspace id stays the same (`MoveWorkspaceToActivity` reassigns membership without minting a new workspace); the activity changes. Plus `« Stay »`. |
+| `assign-workspace --follow` | N: one row per activity the workspace was assigned to (post-rofi save) | Multi-row fuzzel (single-select, not the multi-select rofi pattern — the user is picking one viewing context, not editing membership): one row per activity in the saved membership set. Plus `« Stay »`. |
+
+**Implementer-grade spec lives in the workspace repo's plan layer** (to be authored as part of Phase 3.6d's cli-architect spec). The DD entry below pins the contract; the architect produces the per-task TDD breakdown when the sub-phase opens.
+
+**Scope:**
+
+- [ ] Task 1 — Add `--follow` clap flag to `move-window`, `move-window-here`, `move-workspace`, and `assign-workspace`. Pass through to each verb's runner function as a `bool` parameter. No behavior change yet — flag is parsed but ignored. Pins the CLI surface contract before any IPC plumbing.
+- [ ] Task 2 — Helper module `src/follow.rs` (or co-located in `move_window.rs` if it stays under ~50 LOC): `dispatch_follow(client, workspace_id: u64) -> Result<()>` issues `Action::FocusWorkspace { reference: Id(workspace_id) }` followed by `Action::ToggleOverview` (architect resolves exact action name during spec — `ToggleOverview` may need to be replaced with a non-toggle variant like `Action::Overview { open: true }` if available, to avoid closing an already-open overview). Tests pin: two-call dispatch sequence; both calls expect `Reply::Handled`; client errors propagate.
+- [ ] Task 3 — Single-target follow picker for `move-window`, `move-window-here`, `move-workspace`. Behavior: spawn fuzzel with `[Follow … to …?, « Stay »]` (or just `[« Stay »]` if the destination workspace is the focused window's current workspace — the no-op-self-move case from Phase 3.6c). Enter on the follow row → `dispatch_follow(client, target_ws_id)`. Enter on `« Stay »` or Escape → exit 0. Tests pin: shape of picker rows; selection routing; Escape no-op.
+- [ ] Task 4 — Multi-target follow picker for `assign-workspace`. Behavior: after the multi-select rofi save dispatches `SetWorkspaceActivities`, query the post-save state (the membership set is what was passed in; no re-query needed) and spawn a fuzzel with one row per activity in the saved set + `« Stay »`. Selecting an activity → resolve that activity's workspace-on-focused-output (the same workspace id, viewed through a different activity context) → `dispatch_follow(client, workspace_id)`. Note: the workspace itself is unchanged; only the *active activity* changes via `FocusWorkspace`'s automatic-activity-switch behavior. Tests pin: row count matches assigned set; selection routing; Escape no-op.
+- [ ] Task 5 — Verify behavior under `--follow` interacts cleanly with Phase 3.6c's `AlreadyCurrent` no-op routing: when the move would have been a self-move and is now a no-op, the `--follow` picker should NOT spawn (nothing moved, nothing to follow). Test pins this — the eprintln breadcrumb from 3.6c fires; the follow picker does not.
+- [ ] Task 6 — Manual verification: with `--follow`, run each verb interactively; confirm the follow picker appears, that selecting routes to the destination with overview open, and that Escape exits cleanly. Pin overview-open behavior in the live niri.
+- [ ] Task 7 — DD update: this section's `Reviewed: YYYY-MM-DD (<sha>, ...)` line filled in by the cli-scribe.
+
+**Out of scope:**
+
+- A `move-window-and-follow` shortcut verb that bundles move+follow without the flag — `--follow` is the explicit opt-in; adding a verb alias is YAGNI until users ask.
+- "Smart default" for `--follow` based on tty detection — keybinds and scripts read identical to the CLI; the explicit flag is the right interface for opt-in.
+- Refocusing a specific window within the destination workspace after `move-window --follow` — see "no window-id refocus" rationale above.
+- Closing the overview from the CLI after a timeout or follow-up keystroke — overview's lifecycle is the user's, not the CLI's.
+
+**Test count delta target:** roughly +6 (1 per task on Tasks 2–5, plus the negative-space "follow picker not spawned on self-move no-op" test).
+
+**Commit boundary:** Task 1 (flag plumbing) lands as one commit since it's pure clap surface + parameter threading with no behavioral change yet. Tasks 2 + 3 land together (helper + first verb consumer) — the helper is dead code without a consumer, so co-landing earns its keep. Task 4 lands as a second commit (multi-target picker). Task 5 is a test-only commit. Task 6 has no commit (manual gate). Task 7 is the DD scribe commit.
+
 ### Phase 3.7 — Polish & v0.1.0
 
 - [x] README install/usage docs (currently a stub) — usage examples for every subcommand. Landed as `23ec8ee`. README rewritten from 32-line stub to v0.1.0 release docs; documents eight implemented subcommands, two runtime picker deps (fuzzel + rofi), source-only build path, exit-code table with stderr-prefix disambiguation for shared codes, and v1 caveats.
