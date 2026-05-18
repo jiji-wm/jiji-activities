@@ -697,23 +697,36 @@ fn resolve_stage2_literal_only<'a>(
 
 /// Renders a workspace as a single-line label for the stage-2 picker menu.
 ///
-/// Format:
-/// - Named workspace → `<name> (idx N)`.
-/// - Unnamed workspace → `idx N`.
+/// Format (chosen by `ws.is_in_active_activity`):
+/// - Active-activity workspace, named → `<name> (idx N)`.
+/// - Active-activity workspace, unnamed → `idx N`.
+/// - Hidden-activity workspace, named → `<name> (id N)`.
+/// - Hidden-activity workspace, unnamed → `id N`.
 ///
-/// `idx` is included unconditionally so the user can disambiguate two
-/// workspaces that share a name (or none); the compositor invariant that
-/// `idx` is only meaningful when `is_in_active_activity == true` is
-/// acceptable here because both stage 2 paths filter to workspaces in
-/// the chosen activity, and when the chosen activity is non-active the
-/// label still distinguishes rows uniquely by `id` ordering — duplicate
-/// idx values across non-active workspaces are tolerated as long as the
-/// resolution path (which walks the same filtered slice) picks the
-/// first match.
+/// The asymmetry is load-bearing. The compositor's contract is that
+/// `Workspace.idx` is only meaningful when `is_in_active_activity ==
+/// true`; hidden-activity workspaces all carry `idx = 0`, so labelling
+/// them by `idx` produced indistinguishable rows that fuzzel collapses
+/// into a single unselectable entry. Labelling by the stable, globally-
+/// unique `id` is the fix: two hidden workspaces produce two distinct
+/// rows. The single-activity-per-invocation invariant (both stage-2
+/// dispatchers filter to one activity at a time) means the user never
+/// sees a popup mixing `idx N` and `id N` rows — every row in a given
+/// popup uses the same scheme.
 fn workspace_label(ws: &Workspace) -> String {
+    let unit = if ws.is_in_active_activity {
+        "idx"
+    } else {
+        "id"
+    };
+    let value = if ws.is_in_active_activity {
+        u64::from(ws.idx)
+    } else {
+        ws.id
+    };
     match &ws.name {
-        Some(name) => format!("{name} (idx {})", ws.idx),
-        None => format!("idx {}", ws.idx),
+        Some(name) => format!("{name} ({unit} {value})"),
+        None => format!("{unit} {value}"),
     }
 }
 
@@ -744,6 +757,10 @@ mod tests {
         activities: Vec<u64>,
         active_window: Option<u64>,
     ) -> Workspace {
+        // Default test fixture mirrors the common case: focused implies
+        // the workspace is in the active activity. Tests that need a
+        // hidden-activity workspace (`is_in_active_activity = false`)
+        // build a workspace via this helper and clear the flag explicitly.
         Workspace {
             id,
             idx,
@@ -757,6 +774,22 @@ mod tests {
             is_sticky: false,
             is_in_active_activity: focused,
         }
+    }
+
+    /// Same as [`ws`] but the produced workspace is **not** in the active
+    /// activity (`is_in_active_activity = false`). Used by the
+    /// `workspace_label` tests that pin the hidden-activity → `id N`
+    /// labelling branch.
+    fn ws_hidden(
+        id: u64,
+        idx: u8,
+        output: Option<&str>,
+        activities: Vec<u64>,
+        active_window: Option<u64>,
+    ) -> Workspace {
+        let mut w = ws(id, idx, false, output, activities, active_window);
+        w.is_in_active_activity = false;
+        w
     }
 
     fn move_req(ws_id: u64) -> Request {
@@ -871,15 +904,50 @@ mod tests {
 
     #[test]
     fn workspace_label_named_workspace_includes_name_and_idx() {
+        // Active-activity workspace → labelled by idx.
         let mut w = ws(1, 3, false, Some("DP-1"), vec![1], None);
+        w.is_in_active_activity = true;
         w.name = Some("Work".into());
         assert_eq!(workspace_label(&w), "Work (idx 3)");
     }
 
     #[test]
     fn workspace_label_unnamed_workspace_shows_idx_only() {
-        let w = ws(1, 7, false, Some("DP-1"), vec![1], None);
+        // Active-activity workspace → labelled by idx.
+        let mut w = ws(1, 7, false, Some("DP-1"), vec![1], None);
+        w.is_in_active_activity = true;
         assert_eq!(workspace_label(&w), "idx 7");
+    }
+
+    #[test]
+    fn workspace_label_named_hidden_workspace_uses_id() {
+        // Hidden-activity workspace → labelled by id (idx is not meaningful
+        // for workspaces outside the active activity).
+        let mut w = ws_hidden(42, 0, Some("DP-1"), vec![2], None);
+        w.name = Some("Reading".into());
+        assert_eq!(workspace_label(&w), "Reading (id 42)");
+    }
+
+    #[test]
+    fn workspace_label_unnamed_hidden_workspace_uses_id() {
+        let w = ws_hidden(7, 0, Some("DP-1"), vec![2], None);
+        assert_eq!(workspace_label(&w), "id 7");
+    }
+
+    #[test]
+    fn workspace_label_two_hidden_workspaces_with_idx_zero_produce_distinct_labels() {
+        // Regression pin for the daily-driver bug: two hidden-activity
+        // workspaces both have idx 0 (compositor contract: idx is only
+        // meaningful for the active activity). Labelling by idx produces
+        // a single collapsed/unselectable row in fuzzel; labelling by id
+        // distinguishes them.
+        let a = ws_hidden(11, 0, Some("DP-1"), vec![3], None);
+        let b = ws_hidden(12, 0, Some("DP-1"), vec![3], None);
+        let la = workspace_label(&a);
+        let lb = workspace_label(&b);
+        assert_ne!(la, lb, "hidden workspaces must produce distinct labels");
+        assert_eq!(la, "id 11");
+        assert_eq!(lb, "id 12");
     }
 
     // ---- trailing_empty_workspace ------------------------------------------
