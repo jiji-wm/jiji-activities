@@ -3,15 +3,21 @@
 //! Mirrors niri's own `niri completions <shell>` subcommand. Fish output is
 //! augmented with dynamic activity-name completion appended after the
 //! `clap_complete` base: tab-completing the positional `name` argument of
-//! `switch`, `move-window`, `move-workspace`, `remove`, `save`, and
-//! `assign-workspace` shells back into `niri-activities list --format=name`
-//! for live candidates. Bash, zsh, elvish, and PowerShell receive the static
-//! base only; dynamic variants for those shells are out of scope until there
-//! is concrete demand.
+//! `switch`, `move-window`, `move-workspace`, `remove`, and `save` shells
+//! back into `niri-activities list --format=name` for live candidates.
+//! Bash, zsh, elvish, and PowerShell receive the static base only; dynamic
+//! variants for those shells are out of scope until there is concrete
+//! demand.
 //!
-//! `create <name>` is intentionally absent from the dynamic set — the
-//! argument is a new name, and completing against existing names would be
-//! misleading.
+//! Verbs deliberately absent from the dynamic set:
+//!
+//! - `create <name>` — the argument is a new name; completing against
+//!   existing names would be misleading.
+//! - `assign-workspace` — takes no positional argument. The picker
+//!   handles multi-select internally; the CLI surface itself is a unit
+//!   variant. Any completion at `assign-workspace <TAB>` is wrong.
+//! - `switch-previous`, `move-window-here`, `list`, `completions` —
+//!   no activity-name positional.
 //!
 //! ## Position-aware conditions
 //!
@@ -25,11 +31,12 @@
 //! - `__niri_activities_no_positional_yet` — emitted by this module;
 //!   true when no positional arg has been provided after the subcommand.
 //!   Combined with the using-subcommand check, this restricts completion
-//!   to the *first* positional position for single-arg verbs (`switch`,
-//!   `move-window`, `move-workspace`, `remove`, `save`).
+//!   to the *first* positional position for single-arg verbs.
 //!
-//! `assign-workspace` is variadic, so it uses the using-subcommand check
-//! only — completion fires for every positional position.
+//! All current dynamic verbs accept exactly one positional, so the
+//! combined condition is uniform. If a future verb accepts multiple
+//! activity-name positionals (variadic), drop the `no_positional_yet`
+//! guard for that verb so completion fires at every position.
 
 use std::io::{self, Write};
 
@@ -45,10 +52,6 @@ use crate::cli::Cli;
 /// completion stops offering candidates.
 const FISH_SINGLE_ARG_VERBS: [&str; 5] =
     ["switch", "move-window", "move-workspace", "remove", "save"];
-
-/// Subcommands accepting one or more activity-name positionals. Completion
-/// fires at every positional position (no `no_positional_yet` guard).
-const FISH_VARIADIC_VERBS: [&str; 1] = ["assign-workspace"];
 
 /// Shell command invoked at fish tab-completion time to enumerate candidate
 /// activity names. `2>/dev/null` swallows the "niri socket unavailable"
@@ -80,14 +83,6 @@ fn emit_fish_dynamic<W: Write>(w: &mut W) -> io::Result<()> {
             "complete -c niri-activities \
              -n \"__fish_niri_activities_using_subcommand {verb}; \
              and __niri_activities_no_positional_yet\" \
-             -f -a \"({FISH_NAMES_CMD})\"",
-        )?;
-    }
-    for verb in FISH_VARIADIC_VERBS {
-        writeln!(
-            w,
-            "complete -c niri-activities \
-             -n \"__fish_niri_activities_using_subcommand {verb}\" \
              -f -a \"({FISH_NAMES_CMD})\"",
         )?;
     }
@@ -132,27 +127,12 @@ mod tests {
     }
 
     #[test]
-    fn fish_dynamic_emits_using_subcommand_line_for_every_dynamic_verb() {
-        let out = String::from_utf8(fish_dynamic_bytes()).unwrap();
-        for verb in FISH_SINGLE_ARG_VERBS
-            .iter()
-            .chain(FISH_VARIADIC_VERBS.iter())
-        {
-            let needle = format!("__fish_niri_activities_using_subcommand {verb}");
-            assert!(
-                out.contains(&needle),
-                "fish dynamic output missing using_subcommand condition for `{verb}`:\n{out}",
-            );
-        }
-    }
-
-    #[test]
-    fn fish_dynamic_guards_single_arg_verbs_with_no_positional_yet() {
-        // Single-arg verbs must combine the using_subcommand check with
-        // the no-positional-yet helper, so completion does not fire after
-        // the user has already provided a name (the bug this guards
-        // against: `niri-activities switch Foo <TAB>` offering activity
-        // names for a non-existent second positional).
+    fn fish_dynamic_guards_every_verb_with_no_positional_yet() {
+        // Every current dynamic verb takes exactly one positional name, so
+        // the combined position guard applies uniformly. This also pins
+        // the bug fixed at d16a08d (loose `__fish_seen_subcommand_from`
+        // fires anywhere the verb has been seen — including after a name
+        // is already typed).
         let out = String::from_utf8(fish_dynamic_bytes()).unwrap();
         for verb in FISH_SINGLE_ARG_VERBS {
             let needle = format!(
@@ -161,24 +141,7 @@ mod tests {
             );
             assert!(
                 out.contains(&needle),
-                "single-arg verb `{verb}` missing combined position guard:\n{out}",
-            );
-        }
-    }
-
-    #[test]
-    fn fish_dynamic_does_not_guard_variadic_verbs_with_no_positional_yet() {
-        // Variadic verbs accept multiple positionals; the position guard
-        // would incorrectly stop completion after the first name.
-        let out = String::from_utf8(fish_dynamic_bytes()).unwrap();
-        for verb in FISH_VARIADIC_VERBS {
-            let pattern_with_guard = format!(
-                "__fish_niri_activities_using_subcommand {verb}; \
-                 and __niri_activities_no_positional_yet"
-            );
-            assert!(
-                !out.contains(&pattern_with_guard),
-                "variadic verb `{verb}` must not carry the no_positional_yet guard:\n{out}",
+                "verb `{verb}` missing combined position guard:\n{out}",
             );
         }
     }
@@ -187,11 +150,26 @@ mod tests {
     fn fish_dynamic_does_not_emit_line_for_create() {
         // `create <name>` takes a new name; completing against existing
         // names would be misleading. Guards against an accidental addition
-        // of "create" to either verb const.
+        // of "create" to `FISH_SINGLE_ARG_VERBS`.
         let out = String::from_utf8(fish_dynamic_bytes()).unwrap();
         assert!(
             !out.contains("__fish_niri_activities_using_subcommand create"),
             "fish dynamic output must not include `create`:\n{out}",
+        );
+    }
+
+    #[test]
+    fn fish_dynamic_does_not_emit_line_for_assign_workspace() {
+        // `assign-workspace` is a unit variant — no positional name.
+        // The picker handles multi-select internally; tab-completing at
+        // `assign-workspace <TAB>` would offer activity names where none
+        // are accepted. Guards against the regression that landed at
+        // 28658d8 (misclassified as variadic).
+        let out = String::from_utf8(fish_dynamic_bytes()).unwrap();
+        assert!(
+            !out.contains("__fish_niri_activities_using_subcommand assign-workspace"),
+            "fish dynamic output must not include `assign-workspace` \
+             (it is a unit variant, picker-only):\n{out}",
         );
     }
 
