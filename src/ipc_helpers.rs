@@ -1,6 +1,6 @@
 //! Shared IPC plumbing reused across subcommand modules.
 //!
-//! Five helpers live here:
+//! The following helpers live here:
 //!
 //! - [`variant_name`] — static name for a [`Response`] variant, used
 //!   by every `Response::Handled`-or-mismatch site to populate the
@@ -10,6 +10,11 @@
 //!   expects `Response::Handled`, routing the compositor's
 //!   `"activity not found"` wire string to the typed
 //!   [`CliError::ActivityNotFound`] when an activity name is in scope.
+//! - [`send_expect_handled_or_no_op`] — like [`send_expect_handled`] but
+//!   additionally accepts [`Response::NoOp`] as a non-error outcome,
+//!   surfacing the reason via [`HandledOutcome`]. Used by the
+//!   `MoveWindowToWorkspace*` dispatchers, whose compositor handlers
+//!   may legitimately reply with a durable no-op signal.
 //! - [`send_expect_activities`] — wraps a `client.send(Request::Activities)`
 //!   call that expects `Response::Activities`; mismatched variants surface
 //!   as `WrongVariant`.
@@ -26,10 +31,25 @@
 //! and `crate::move_window`, and closes the latent risk that
 //! independent definitions drift apart.
 
-use niri_ipc::{Activity, Request, Response, Workspace};
+use niri_ipc::{Activity, NoOpReason, Request, Response, Workspace};
 
 use crate::error::{CliError, MalformedResponseSource};
 use crate::ipc::{IpcError, NiriClient};
+
+/// Outcome of a dispatch that may legitimately resolve to a no-op.
+///
+/// Strictly mirrors the two compositor reply variants
+/// [`send_expect_handled_or_no_op`] accepts: [`Response::Handled`] (state
+/// changed) and [`Response::NoOp`] (preconditions met, target already
+/// matched current state). Any other reply variant is treated as a
+/// contract violation and surfaces as
+/// [`MalformedResponseSource::WrongVariant`] from the helper — it does
+/// NOT reach this enum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HandledOutcome {
+    Handled,
+    NoOp(NoOpReason),
+}
 
 /// Static variant name for a [`Response`].
 ///
@@ -43,6 +63,7 @@ use crate::ipc::{IpcError, NiriClient};
 pub(crate) fn variant_name(r: &Response) -> &'static str {
     match r {
         Response::Handled => "Response::Handled",
+        Response::NoOp(_) => "Response::NoOp",
         Response::Version(_) => "Response::Version",
         Response::Outputs(_) => "Response::Outputs",
         Response::Workspaces(_) => "Response::Workspaces",
@@ -106,6 +127,50 @@ pub(crate) fn send_expect_handled(
             Some(name) => Err(CliError::ActivityNotFound(name.to_owned()).into()),
             None => Err(CliError::MalformedResponse(MalformedResponseSource::Server(msg)).into()),
         },
+        Err(other) => Err(CliError::from(other).into()),
+    }
+}
+
+/// Like [`send_expect_handled`], but additionally accepts
+/// [`Response::NoOp`] as a non-error outcome.
+///
+/// **Contract:**
+/// - `Ok(Response::Handled)` → `Ok(HandledOutcome::Handled)`.
+/// - `Ok(Response::NoOp(reason))` → `Ok(HandledOutcome::NoOp(reason))`.
+/// - `Ok(other)` →
+///   `CliError::MalformedResponse(WrongVariant { expected:
+///   "Response::Handled | Response::NoOp", got: variant_name(&other) })`.
+/// - `Err(IpcError::Server(msg))` →
+///   `CliError::MalformedResponse(Server(msg))` (server errors flow
+///   through the existing mapping; this helper has no activity-name
+///   routing because its only callers — `MoveWindowToWorkspace*`
+///   dispatches — reference workspaces by id, not activities by name).
+/// - Other `Err(IpcError::*)` flow through the existing
+///   `IpcError → CliError` `From` mapping unchanged.
+///
+/// **Intended caller family:** `Action::MoveWindowToWorkspace` /
+/// `Action::MoveWindowToWorkspaceById` dispatches (and any future action
+/// whose compositor handler may legitimately reply with
+/// [`Response::NoOp`]). Other dispatches MUST continue to use
+/// [`send_expect_handled`] — accepting `NoOp` on, e.g., `CreateActivity`
+/// would be a silent contract drift.
+pub(crate) fn send_expect_handled_or_no_op(
+    client: &mut dyn NiriClient,
+    req: Request,
+) -> anyhow::Result<HandledOutcome> {
+    match client.send(req) {
+        Ok(Response::Handled) => Ok(HandledOutcome::Handled),
+        Ok(Response::NoOp(reason)) => Ok(HandledOutcome::NoOp(reason)),
+        Ok(other) => Err(
+            CliError::MalformedResponse(MalformedResponseSource::WrongVariant {
+                expected: "Response::Handled | Response::NoOp",
+                got: variant_name(&other).into(),
+            })
+            .into(),
+        ),
+        Err(IpcError::Server(msg)) => {
+            Err(CliError::MalformedResponse(MalformedResponseSource::Server(msg)).into())
+        }
         Err(other) => Err(CliError::from(other).into()),
     }
 }
@@ -186,7 +251,7 @@ pub(crate) fn names_focused_first(activities: &[Activity]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use niri_ipc::{Activity, Reply, Request, Response};
+    use niri_ipc::{Activity, NoOpReason, Reply, Request, Response};
 
     use super::*;
     use crate::error::{CliError, MalformedResponseSource};
@@ -233,9 +298,13 @@ mod tests {
     /// `variant_name` match arm above. Both must move together.
     #[test]
     fn variant_name_covers_all_known_variants() {
-        use niri_ipc::{KeyboardLayouts, OutputConfigChanged, Overview, Response};
+        use niri_ipc::{KeyboardLayouts, NoOpReason, OutputConfigChanged, Overview, Response};
         let cases: &[(&Response, &str)] = &[
             (&Response::Handled, "Response::Handled"),
+            (
+                &Response::NoOp(NoOpReason::AlreadyOnTarget { workspace_id: 0 }),
+                "Response::NoOp",
+            ),
             (&Response::Version("v".into()), "Response::Version"),
             (
                 &Response::Outputs(std::collections::HashMap::new()),
@@ -368,6 +437,78 @@ mod tests {
                 assert_eq!(msg, "some other failure");
             }
             other => panic!("expected MalformedResponse(Server), got {other:?}"),
+        }
+        client.assert_consumed_in_order();
+    }
+
+    // ---- send_expect_handled_or_no_op ----
+
+    #[test]
+    fn send_expect_handled_or_no_op_handled_is_ok() {
+        let mut client = MockClient::new();
+        client.expect(Request::Version, Reply::Ok(Response::Handled));
+        let outcome = send_expect_handled_or_no_op(&mut client, Request::Version)
+            .expect("Handled reply must succeed");
+        assert_eq!(outcome, HandledOutcome::Handled);
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn send_expect_handled_or_no_op_no_op_is_returned() {
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Version,
+            Reply::Ok(Response::NoOp(NoOpReason::AlreadyOnTarget {
+                workspace_id: 42,
+            })),
+        );
+        let outcome = send_expect_handled_or_no_op(&mut client, Request::Version)
+            .expect("NoOp reply must succeed");
+        assert_eq!(
+            outcome,
+            HandledOutcome::NoOp(NoOpReason::AlreadyOnTarget { workspace_id: 42 }),
+        );
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn send_expect_handled_or_no_op_server_error_routes_to_malformed() {
+        let mut client = MockClient::new();
+        client.expect(Request::Version, Err("some server failure".to_owned()));
+        let err = send_expect_handled_or_no_op(&mut client, Request::Version)
+            .expect_err("server error must fail");
+        let cli_err = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<CliError>())
+            .expect("CliError must be in chain");
+        match cli_err {
+            CliError::MalformedResponse(MalformedResponseSource::Server(msg)) => {
+                assert_eq!(msg, "some server failure");
+            }
+            other => panic!("expected MalformedResponse(Server), got {other:?}"),
+        }
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn send_expect_handled_or_no_op_wrong_variant_is_malformed() {
+        let mut client = MockClient::new();
+        client.expect(Request::Version, Reply::Ok(Response::Version("v".into())));
+        let err = send_expect_handled_or_no_op(&mut client, Request::Version)
+            .expect_err("wrong variant must fail");
+        let cli_err = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<CliError>())
+            .expect("CliError must be in chain");
+        match cli_err {
+            CliError::MalformedResponse(MalformedResponseSource::WrongVariant {
+                expected,
+                got,
+            }) => {
+                assert_eq!(*expected, "Response::Handled | Response::NoOp");
+                assert_eq!(got, "Response::Version");
+            }
+            other => panic!("expected WrongVariant, got {other:?}"),
         }
         client.assert_consumed_in_order();
     }

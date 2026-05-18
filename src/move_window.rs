@@ -50,10 +50,17 @@
 //!
 //! ## Error model
 //!
-//! - `Action::MoveWindowToWorkspace` reply handling mirrors the
-//!   `move-workspace` matrix via [`send_expect_handled`] (with
-//!   `activity_name: None` — there is no activity-name in scope for the
-//!   final dispatch, only a workspace id).
+//! - `Action::MoveWindowToWorkspace` reply handling goes through
+//!   [`send_expect_handled_or_no_op`], which additionally accepts
+//!   [`Response::NoOp(NoOpReason::AlreadyOnTarget)`] as a non-error
+//!   outcome — the compositor's durable signal that the focused window
+//!   already lived on the target workspace. The dispatcher consumes the
+//!   resulting [`HandledOutcome`] and routes
+//!   [`HandledOutcome::Handled`] → post-move stderr confirmation,
+//!   [`HandledOutcome::NoOp`] → un-annotated `workspace_label`
+//!   breadcrumb identical to the eager
+//!   [`Stage2ResolutionWithNew::AlreadyCurrent`] /
+//!   [`Stage2ResolutionLiteralOnly::AlreadyCurrent`] paths.
 //! - Client-side `ActivityNotFound` (named-arg only) is produced by
 //!   walking the `Activities` snapshot, mirroring how
 //!   `move-workspace` lets the compositor produce it.
@@ -78,12 +85,13 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use niri_ipc::{Action, Activity, Request, Response, Workspace, WorkspaceReferenceArg};
+use niri_ipc::{Action, Activity, NoOpReason, Request, Response, Workspace, WorkspaceReferenceArg};
 
 use crate::error::{CliError, MalformedResponseSource};
 use crate::ipc::{IpcError, NiriClient};
 use crate::ipc_helpers::{
-    send_expect_activities, send_expect_handled, send_expect_workspaces, variant_name,
+    HandledOutcome, send_expect_activities, send_expect_handled_or_no_op, send_expect_workspaces,
+    variant_name,
 };
 use crate::picker::{NameOutcome, PickerOutcome};
 
@@ -267,7 +275,7 @@ enum Stage2ResolutionLiteralOnly<'a> {
 /// - The focused workspace has no output → synthetic
 ///   `MalformedResponse(Server("focused workspace has no output"))` (exit 65).
 /// - Compositor reply variant / server-error handling matches
-///   [`send_expect_handled`].
+///   [`send_expect_handled_or_no_op`].
 pub(crate) fn run(client: &mut dyn NiriClient, activity_name: &str) -> Result<()> {
     let activities = send_expect_activities(client).context("requesting activities")?;
     let activity = activities
@@ -294,9 +302,91 @@ pub(crate) fn run(client: &mut dyn NiriClient, activity_name: &str) -> Result<()
         return Ok(());
     };
     let ws_id = ws.id;
-    dispatch_move(client, ws_id)?;
-    print_move_confirmation(ws_id, activity_name);
+    handle_move_outcome(
+        dispatch_move(client, ws_id)?,
+        ws_id,
+        activity_name,
+        &workspaces,
+    )?;
     Ok(())
+}
+
+/// Renders the post-`dispatch_move` stderr line for a given
+/// [`HandledOutcome`]. Threaded through every `dispatch_move` call site so
+/// each one routes the [`HandledOutcome::Handled`] path through
+/// [`print_move_confirmation`] and the [`HandledOutcome::NoOp`] path
+/// through the un-annotated `workspace_label` breadcrumb identical to the
+/// one rendered by the eager [`Stage2ResolutionWithNew::AlreadyCurrent`]
+/// arm.
+///
+/// For the [`NoOpReason::AlreadyOnTarget`] case, the lookup key is the
+/// `workspace_id` carried in the [`NoOpReason`] payload, not the local
+/// `ws_id` we dispatched against — the wire payload is the authoritative
+/// signal of which workspace the focused window already lived on. In
+/// well-behaved compositor replies the two are equal, but the wire value
+/// is the contract.
+///
+/// **Error return.** `NoOpReason` is `#[non_exhaustive]`; the catch-all
+/// arm routes to `MalformedResponse(Server(_))` rather than silently
+/// treating an unknown future variant as a benign no-op. This forces a
+/// CLI rev whenever the compositor adds a `NoOpReason` variant — the
+/// correct friction for maintaining the contract. When a new variant
+/// warrants distinct user-facing text, hoist it out of the catch-all
+/// explicitly (matching its name above the `_` arm) and return `Ok(())`.
+fn handle_move_outcome(
+    outcome: HandledOutcome,
+    ws_id: u64,
+    activity_name: &str,
+    workspaces: &[Workspace],
+) -> Result<()> {
+    match outcome {
+        HandledOutcome::Handled => print_move_confirmation(ws_id, activity_name),
+        HandledOutcome::NoOp(NoOpReason::AlreadyOnTarget {
+            workspace_id: payload_id,
+        }) => {
+            if payload_id != ws_id {
+                eprintln!(
+                    "niri-activities: warning: compositor reported AlreadyOnTarget for ws {payload_id} but we dispatched against ws {ws_id}"
+                );
+            }
+            print_already_current_breadcrumb(payload_id, workspaces);
+        }
+        // `NoOpReason` is `#[non_exhaustive]`. An unknown future variant
+        // routes to `MalformedResponse(Server)` so contract drift surfaces
+        // as exit 65 rather than a silent success. Hoist a known variant
+        // explicitly above to give it a distinct user-facing path.
+        HandledOutcome::NoOp(other) => {
+            return Err(
+                CliError::MalformedResponse(MalformedResponseSource::Server(format!(
+                    "unexpected NoOpReason variant: {other:?}"
+                )))
+                .into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Returns the breadcrumb message shown when the move resolves to a no-op
+/// (either via eager picker shortcut or via the compositor's
+/// `Response::NoOp(AlreadyOnTarget)` reply). The label is looked up against
+/// the workspace snapshot we already have in hand; if the id is absent, fall
+/// back to a bare `id <n>` form so the user still gets a useful diagnostic.
+///
+/// Extracted as a pure formatter so tests can assert the rendered string
+/// without stderr-capture machinery.
+fn format_already_current_breadcrumb(ws_id: u64, workspaces: &[Workspace]) -> String {
+    let label = workspaces
+        .iter()
+        .find(|w| w.id == ws_id)
+        .map(workspace_label)
+        .unwrap_or_else(|| format!("id {ws_id}"));
+    format!("niri-activities: focused window is already in workspace {label}; nothing to move")
+}
+
+/// Prints the breadcrumb returned by [`format_already_current_breadcrumb`].
+fn print_already_current_breadcrumb(ws_id: u64, workspaces: &[Workspace]) {
+    eprintln!("{}", format_already_current_breadcrumb(ws_id, workspaces));
 }
 
 /// Two-stage picker form for `move-window`.
@@ -498,7 +588,7 @@ fn create_activity_via_ipc(client: &mut dyn NiriClient, name: &str) -> Result<()
 ///   `MalformedResponse(WrongVariant { ... })` (exit 65).
 /// - No focused workspace / focused workspace has no output — same
 ///   synthetics as [`run`].
-/// - Reply / variant handling matches [`send_expect_handled`].
+/// - Reply / variant handling matches [`send_expect_handled_or_no_op`].
 pub(crate) fn run_here_picker<F>(client: &mut dyn NiriClient, pick: F) -> Result<()>
 where
     F: FnOnce(&str, &[String]) -> Result<PickerOutcome, CliError>,
@@ -590,23 +680,19 @@ where
         Stage2ResolutionWithNew::Cancelled => Ok(()),
         Stage2ResolutionWithNew::Selected(ws) => {
             let ws_id = ws.id;
-            dispatch_move(client, ws_id)?;
-            print_move_confirmation(ws_id, target_activity_name);
+            let outcome = dispatch_move(client, ws_id)?;
+            handle_move_outcome(outcome, ws_id, target_activity_name, &workspaces)?;
             Ok(())
         }
         Stage2ResolutionWithNew::AlreadyCurrent(ws_id) => {
-            // Use the un-annotated `workspace_label` here: the stderr message already
-            // says "already in workspace", so a trailing `(current)` would be redundant.
-            // Membership disclosure (`[sticky]`, `[also in: …]`) is also elided — the
-            // user just clicked this row, they know where the window lives.
-            let label = workspaces
-                .iter()
-                .find(|w| w.id == ws_id)
-                .map(workspace_label)
-                .unwrap_or_else(|| format!("id {ws_id}"));
-            eprintln!(
-                "niri-activities: focused window is already in workspace {label}; nothing to move"
-            );
+            // Eager pre-dispatch breadcrumb when the user picked the
+            // `(current)`-annotated row. Same un-annotated label as the
+            // post-dispatch `Response::NoOp` arm: the message already
+            // says "already in workspace", so a trailing `(current)`
+            // would be redundant, and membership disclosure
+            // (`[sticky]`, `[also in: …]`) is elided — the user just
+            // clicked this row, they know where the window lives.
+            print_already_current_breadcrumb(ws_id, &workspaces);
             Ok(())
         }
         Stage2ResolutionWithNew::Unknown(label) => Err(CliError::MalformedResponse(
@@ -623,8 +709,8 @@ where
                 .into());
             };
             let ws_id = ws.id;
-            dispatch_move(client, ws_id)?;
-            print_move_confirmation(ws_id, target_activity_name);
+            let outcome = dispatch_move(client, ws_id)?;
+            handle_move_outcome(outcome, ws_id, target_activity_name, &workspaces)?;
             Ok(())
         }
     }
@@ -699,20 +785,13 @@ where
         Stage2ResolutionLiteralOnly::Cancelled => Ok(()),
         Stage2ResolutionLiteralOnly::Selected(ws) => {
             let ws_id = ws.id;
-            dispatch_move(client, ws_id)?;
-            print_move_confirmation(ws_id, target_activity_name);
+            let outcome = dispatch_move(client, ws_id)?;
+            handle_move_outcome(outcome, ws_id, target_activity_name, &workspaces)?;
             Ok(())
         }
         Stage2ResolutionLiteralOnly::AlreadyCurrent(ws_id) => {
             // See dispatch_stage2_with_new for the rationale on rendering the un-annotated label here.
-            let label = workspaces
-                .iter()
-                .find(|w| w.id == ws_id)
-                .map(workspace_label)
-                .unwrap_or_else(|| format!("id {ws_id}"));
-            eprintln!(
-                "niri-activities: focused window is already in workspace {label}; nothing to move"
-            );
+            print_already_current_breadcrumb(ws_id, &workspaces);
             Ok(())
         }
         Stage2ResolutionLiteralOnly::Unknown(label) => Err(CliError::MalformedResponse(
@@ -743,19 +822,32 @@ where
     }
 }
 
-/// Dispatches the `MoveWindowToWorkspace` action against `ws_id`.
+/// Dispatches the `MoveWindowToWorkspace` action against `ws_id` and
+/// returns the compositor's reply classification.
 ///
 /// `window_id: None`, `focus: false`, `reference: Id(ws_id)` are all
 /// load-bearing — see module docs for the rationale. The IPC error is
 /// wrapped with `.context("moving window to workspace")` so the
 /// operation surfaces in the stderr chain.
-fn dispatch_move(client: &mut dyn NiriClient, ws_id: u64) -> Result<()> {
+///
+/// **Why [`HandledOutcome`] and not `()`.** The compositor's
+/// `MoveWindowToWorkspace` handler may reply with
+/// [`Response::NoOp(NoOpReason::AlreadyOnTarget)`] when the focused
+/// window already lives on the target workspace — a durable signal that
+/// the action's preconditions were met but no state change was needed.
+/// Routing through [`send_expect_handled_or_no_op`] lets the caller
+/// distinguish the state-changing [`HandledOutcome::Handled`] path
+/// (which renders the post-move confirmation) from the
+/// [`HandledOutcome::NoOp`] path (which renders the already-current
+/// breadcrumb). Other reply variants surface as
+/// [`MalformedResponseSource::WrongVariant`] via the helper's contract.
+fn dispatch_move(client: &mut dyn NiriClient, ws_id: u64) -> Result<HandledOutcome> {
     let req = Request::Action(Action::MoveWindowToWorkspace {
         window_id: None,
         reference: WorkspaceReferenceArg::Id(ws_id),
         focus: false,
     });
-    send_expect_handled(client, req, None).context("moving window to workspace")
+    send_expect_handled_or_no_op(client, req).context("moving window to workspace")
 }
 
 /// Renders the post-move confirmation line shown on stderr after a
@@ -1258,7 +1350,9 @@ fn workspace_label_with_annotations(
 
 #[cfg(test)]
 mod tests {
-    use niri_ipc::{Action, Activity, Reply, Request, Response, Workspace, WorkspaceReferenceArg};
+    use niri_ipc::{
+        Action, Activity, NoOpReason, Reply, Request, Response, Workspace, WorkspaceReferenceArg,
+    };
 
     use super::*;
     use crate::ipc::MockClient;
@@ -1910,6 +2004,148 @@ mod tests {
         };
         run_picker(&mut client, pick, no_new_activity_prompt).expect("AlreadyCurrent must exit Ok");
         client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn dispatch_stage2_with_new_handles_response_no_op_already_on_target() {
+        // Durable no-op signaling: user picks a non-(current) row (id 20),
+        // but the compositor's reply is Response::NoOp(AlreadyOnTarget) —
+        // a snapshot race (the window's workspace already matched the
+        // target by the time the action was processed) or any other
+        // compositor-side reason for the move to resolve to no-op.
+        //
+        // The dispatcher must return Ok(()) and consume the queued
+        // move_req. assert_consumed_in_order pins that the dispatcher
+        // does NOT issue any extra IPC after the no-op.
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![act(1, "Work", true)])),
+        );
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![
+                ws(10, 0, true, Some("DP-1"), vec![1], Some(99)),
+                ws(20, 1, false, Some("DP-1"), vec![1], None),
+            ])),
+        );
+        client.expect(
+            move_req(20),
+            Reply::Ok(Response::NoOp(NoOpReason::AlreadyOnTarget {
+                workspace_id: 20,
+            })),
+        );
+
+        let pick = |prompt: &str, items: &[String]| -> Result<PickerOutcome, CliError> {
+            if prompt == "Move window to activity:" {
+                Ok(PickerOutcome::Selected("Work".into()))
+            } else {
+                // Pick the non-(current) row to drive dispatch through
+                // to the compositor; items[0] is the focused row with
+                // `(current)`, so pick items[1].
+                assert_eq!(items[0], "idx 0 (current)");
+                Ok(PickerOutcome::Selected(items[1].clone()))
+            }
+        };
+        run_picker(&mut client, pick, no_new_activity_prompt).expect("NoOp reply must exit Ok");
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn dispatch_stage2_literal_only_handles_response_no_op_already_on_target() {
+        // Symmetric to dispatch_stage2_with_new_handles_response_no_op_already_on_target
+        // on the literal-only (non-active activity) path.
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![
+                act(1, "Work", true),
+                act(2, "Personal", false),
+            ])),
+        );
+        // Two workspaces in Personal (id 2, non-active) on DP-1; the
+        // focused workspace (id 10) lives in Personal so the (current)
+        // row sits at items[0] and items[1] is the dispatch target.
+        let mut focused_ws = ws(10, 0, true, Some("DP-1"), vec![2], Some(99));
+        focused_ws.is_in_active_activity = false;
+        let other_ws = ws_hidden(20, 1, Some("DP-1"), vec![2], None);
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![focused_ws, other_ws])),
+        );
+        client.expect(
+            move_req(20),
+            Reply::Ok(Response::NoOp(NoOpReason::AlreadyOnTarget {
+                workspace_id: 20,
+            })),
+        );
+
+        let pick = |prompt: &str, items: &[String]| -> Result<PickerOutcome, CliError> {
+            if prompt == "Move window to activity:" {
+                Ok(PickerOutcome::Selected("Personal".into()))
+            } else {
+                // Pick the non-(current) row; items[0] is the focused
+                // row with `(current)`. Non-active-activity labels use
+                // `id <n>` (not `idx <n>`) per `workspace_label`'s
+                // `is_in_active_activity = false` branch.
+                assert_eq!(items[0], "id 10 (current)");
+                Ok(PickerOutcome::Selected(items[1].clone()))
+            }
+        };
+        run_picker(&mut client, pick, no_new_activity_prompt).expect("NoOp reply must exit Ok");
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn handle_move_outcome_no_op_payload_id_diverges_uses_payload_id_label() {
+        // Regression pin for the payload_id != ws_id divergence case.
+        // The compositor reports AlreadyOnTarget for workspace 99, but we
+        // dispatched against workspace 20. Workspace 99 IS in the snapshot
+        // so the breadcrumb resolves to its label (not workspace-20's).
+        // This exercises the wire-payload-is-authoritative discipline: the
+        // formatter must key the label lookup on payload_id (99 / "idx 5"),
+        // not ws_id (20 / "idx 1").
+        let ws_20 = ws(20, 1, false, Some("DP-1"), vec![1], None);
+        let mut ws_99 = ws(99, 5, false, Some("DP-1"), vec![1], None);
+        ws_99.is_in_active_activity = true;
+        let workspaces = vec![ws_20, ws_99];
+
+        // Assert the formatter resolves using payload_id (99), whose idx is 5.
+        let msg = format_already_current_breadcrumb(99, &workspaces);
+        assert!(
+            msg.contains("idx 5"),
+            "breadcrumb must contain workspace-99's label 'idx 5', got: {msg:?}",
+        );
+        assert!(
+            !msg.contains("idx 1"),
+            "breadcrumb must NOT contain workspace-20's label 'idx 1', got: {msg:?}",
+        );
+
+        // Also verify handle_move_outcome (which calls the formatter with
+        // payload_id) returns Ok for this divergence case.
+        let outcome = HandledOutcome::NoOp(NoOpReason::AlreadyOnTarget { workspace_id: 99 });
+        handle_move_outcome(outcome, 20, "Work", &workspaces)
+            .expect("AlreadyOnTarget with diverged ids must return Ok");
+    }
+
+    #[test]
+    fn handle_move_outcome_known_no_op_variant_returns_ok() {
+        // Smoke check: the known `AlreadyOnTarget` variant routes to `Ok(())`.
+        //
+        // `NoOpReason` is `#[non_exhaustive]`. We cannot construct a
+        // truly-unknown variant from this crate, so the catch-all
+        // `HandledOutcome::NoOp(other) => Err(MalformedResponse(...))` arm
+        // cannot be reached in tests today. The compiler's exhaustiveness
+        // check is the structural pin for that arm: once a new `NoOpReason`
+        // variant lands in `niri-ipc`, this file must add an explicit match
+        // arm for it (or map it here), keeping the catch-all honest.
+        //
+        // TODO(when NoOpReason gains a variant): add a dedicated catch-all
+        // behavior test once a second unknown variant can be constructed.
+        let workspaces = vec![ws(10, 0, true, Some("DP-1"), vec![1], None)];
+        let outcome = HandledOutcome::NoOp(NoOpReason::AlreadyOnTarget { workspace_id: 10 });
+        let result = handle_move_outcome(outcome, 10, "Work", &workspaces);
+        assert!(result.is_ok(), "known AlreadyOnTarget must return Ok");
     }
 
     #[test]
