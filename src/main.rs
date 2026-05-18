@@ -13,6 +13,7 @@ mod cli;
 mod completions;
 mod create;
 mod error;
+mod follow;
 mod ipc;
 mod ipc_helpers;
 mod list;
