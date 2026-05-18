@@ -37,13 +37,16 @@ The `completions` subcommand emits `clap_complete`'s output plus a dynamic fish 
 
 | Change to `Cmd` enum | Action in `src/completions.rs` |
 |---|---|
-| Add a verb whose first positional is an existing activity name (`switch`-like) | Add to `FISH_SINGLE_ARG_VERBS`. |
-| Add a verb taking many existing activity names (variadic, like `assign-workspace`) | Add to `FISH_VARIADIC_VERBS`. |
-| Add a verb taking a *new* name (like `create`) | Leave OUT of both consts. Optionally pin the intent with a new test. |
+| Add a verb whose first positional is an *existing* activity name (`switch`-like) | Add to `FISH_SINGLE_ARG_VERBS`. |
+| Add a verb taking a *new* name (like `create`) | Leave OUT of `FISH_SINGLE_ARG_VERBS`. Optionally pin the intent with a new negative-space test. |
+| Add a verb taking no positional at all (unit variant, picker-driven like `assign-workspace`) | Leave OUT entirely. The unit-variant shape `Cmd::Foo,` (no field block) is the authoritative signal — not the docstring. |
+| Add a variadic-positional verb (multiple activity names; **none currently exist**) | Follow the future-variadic pattern documented in the module rustdoc: emit the verb's `complete` line *without* the `no_positional_yet` guard so completion fires at every positional. Probably also rename `FISH_SINGLE_ARG_VERBS` and split. |
 | Rename or remove a subcommand | Update or drop the corresponding const entry. |
 | Rename `list --format=name` or change its output format | Update `FISH_NAMES_CMD`. |
 
-The unit tests in `completions::tests` iterate the consts, so a renamed verb that breaks the iteration surfaces immediately. **But a forgotten *addition* is silent** — the new verb just won't get dynamic completion. Audit explicitly.
+The unit tests in `completions::tests` iterate the const, so a renamed verb that breaks the iteration surfaces immediately. **But a forgotten *addition* is silent** — the new verb just won't get dynamic completion. Audit explicitly.
+
+**Read the `Cmd` variant shape, not the docstring.** This rule was added after `29e304d` corrected my misclassification of `assign-workspace` as variadic. Its docstring (`"Assign the focused workspace to one or more activities via picker"`) led me to put it in `FISH_VARIADIC_VERBS`, but the variant shape `Cmd::AssignWorkspace,` (no field block) makes clear it takes no positional. The "one or more" referred to picker rows, not CLI args. The clap variant shape is the only authoritative signal.
 
 After any sync, run:
 
