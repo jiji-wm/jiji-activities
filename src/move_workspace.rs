@@ -46,33 +46,150 @@
 use anyhow::{Context, Result};
 use niri_ipc::{Action, ActivityReferenceArg, Request};
 
-use crate::error::CliError;
+use crate::error::{CliError, MalformedResponseSource};
+use crate::follow::{self, dispatch_follow_workspace};
 use crate::ipc::NiriClient;
-use crate::ipc_helpers::{names_focused_first, send_expect_activities, send_expect_handled};
+use crate::ipc_helpers::{
+    names_focused_first, send_expect_activities, send_expect_handled, send_expect_workspaces,
+};
 use crate::picker::PickerOutcome;
 
-/// Moves the focused workspace to the activity named `name`.
+/// Moves the focused workspace to the activity named `name`, optionally
+/// running a follow picker that lets the user opt into focusing the
+/// destination workspace (and revealing it in the Overview).
 ///
-/// **Contract:** issues exactly one `MoveWorkspaceToActivity` IPC
-/// request (focused workspace, move-only, no focus-follow) and
-/// expects `Response::Handled`. See module docs for the full error
-/// matrix.
+/// **Contract:** the default path (`follow: false`) issues exactly one
+/// `MoveWorkspaceToActivity` IPC request (focused workspace, move-only,
+/// no focus-follow) and expects `Response::Handled`. See module docs for
+/// the full error matrix.
 ///
-/// The IPC error is wrapped with
-/// `.context("moving workspace to activity")` so the operation
-/// surfaces in the stderr chain.
-pub(crate) fn run(
+/// **`--follow` path.** When `follow: true`, an extra `Request::Workspaces`
+/// fires BEFORE the move so the focused workspace's id is captured (the
+/// move reassigns activity membership; the workspace id is invariant per
+/// the compositor's workspace-as-atom contract). After a successful
+/// dispatch, a single-select picker is spawned with two rows: a
+/// follow-confirmation row and a [`STAY_UNICODE`][stay] sentinel. On
+/// confirmation [`dispatch_follow_workspace`] is invoked against the
+/// captured id. Cancellation (Escape) and the stay-sentinel are both
+/// silent exit-0 outcomes.
+///
+/// **Snapshot-vs-dispatch race.** The captured id is the "workspace I was
+/// moving" at snapshot time, not at dispatch time. If focus drifts
+/// between the snapshot and the compositor processing the move, the
+/// follow target may be the workspace that *was* focused (now moved into
+/// the new activity), which is precisely the user's intent for
+/// `--follow`. Same precedent as the existing named-arg
+/// `--follow` flows in `src/move_window.rs`.
+///
+/// [stay]: crate::follow::STAY_UNICODE
+///
+/// The `pick` parameter is a closure so unit tests can inject a stub
+/// without spawning `fuzzel`; production wiring passes
+/// [`crate::picker::pick_one`]. It is invoked at most once, only when
+/// `follow: true` AND the move dispatched successfully.
+pub(crate) fn run<F>(
     client: &mut dyn NiriClient,
     name: &str,
-    _follow: bool,
-    _overview: bool,
-) -> Result<()> {
+    pick: F,
+    follow: bool,
+    overview: bool,
+) -> Result<()>
+where
+    F: FnOnce(&str, &[String]) -> Result<PickerOutcome, CliError>,
+{
+    // Capture the focused workspace id BEFORE the move dispatches, so a
+    // subsequent FocusWorkspace can target the moved workspace by id (id
+    // is invariant across MoveWorkspaceToActivity per the workspace-as-
+    // atom contract). The capture is gated on `follow` so the default
+    // path retains the pre-`--follow` single-IPC shape.
+    let focused_id = if follow {
+        let workspaces =
+            send_expect_workspaces(client).context("requesting workspaces for --follow capture")?;
+        Some(focused_workspace_id(&workspaces)?)
+    } else {
+        None
+    };
+
     let req = Request::Action(Action::MoveWorkspaceToActivity {
         workspace: None,
         activity: ActivityReferenceArg::Name(name.to_owned()),
         focus: false,
     });
-    send_expect_handled(client, req, Some(name)).context("moving workspace to activity")
+    send_expect_handled(client, req, Some(name)).context("moving workspace to activity")?;
+
+    if let Some(ws_id) = focused_id {
+        run_move_workspace_follow_picker(client, pick, name, ws_id, overview)?;
+    }
+    Ok(())
+}
+
+/// Returns the `id` of the workspace whose `is_focused` flag is `true`.
+///
+/// **Synthetic-string discipline.** The literal `"no focused workspace"`
+/// is a **CLI-internal** value — it is **not** emitted on the wire by
+/// the niri compositor. A future grep that audits compositor wire-string
+/// matches must skip this site. Same pattern as
+/// `crate::assign_workspace::focused_workspace`'s `"no focused workspace"`.
+fn focused_workspace_id(workspaces: &[niri_ipc::Workspace]) -> Result<u64, CliError> {
+    workspaces
+        .iter()
+        .find(|w| w.is_focused)
+        .map(|w| w.id)
+        .ok_or_else(|| {
+            CliError::MalformedResponse(MalformedResponseSource::Server(
+                "no focused workspace".to_owned(),
+            ))
+        })
+}
+
+/// Spawns the follow picker after a successful `MoveWorkspaceToActivity`
+/// dispatch. Two rows: a confirmation row and the `« Stay »` sentinel.
+///
+/// **Picker contract:**
+/// - `PickerOutcome::Cancelled` → `Ok(())` (silent exit 0).
+/// - `PickerOutcome::Selected(stay)` → `Ok(())` (silent exit 0). Stay is
+///   resolved via [`crate::follow::stay_sentinel`] against the
+///   confirmation row to dodge any collision with the activity name.
+/// - `PickerOutcome::Selected(confirm)` →
+///   `dispatch_follow_workspace(client, ws_id, overview)`.
+/// - `PickerOutcome::Selected(other)` →
+///   `CliError::MalformedResponse(Server("follow picker returned row not
+///   in items: ..."))` (exit 65). Contract-violation routing — NEVER
+///   folded into `Cancelled`, which would be a silent-failure anti-pattern.
+///
+/// **Synthetic-string discipline.** The
+/// `"follow picker returned row not in items: …"` literal is a
+/// CLI-internal value, not on the wire. Same discipline as
+/// [`crate::assign_workspace::focused_workspace`]'s `"no focused
+/// workspace"`.
+fn run_move_workspace_follow_picker<F>(
+    client: &mut dyn NiriClient,
+    pick: F,
+    activity_name: &str,
+    ws_id: u64,
+    overview: bool,
+) -> Result<()>
+where
+    F: FnOnce(&str, &[String]) -> Result<PickerOutcome, CliError>,
+{
+    let confirm_row = format!("Follow workspace to activity '{activity_name}'?");
+    let rows = [confirm_row.as_str()];
+    let stay = follow::stay_sentinel(&rows);
+    let items: Vec<String> = vec![confirm_row.clone(), stay.to_owned()];
+    let outcome = pick("Follow?", &items).context("running move-workspace follow picker")?;
+    match outcome {
+        PickerOutcome::Cancelled => Ok(()),
+        PickerOutcome::Selected(row) if row == confirm_row => {
+            dispatch_follow_workspace(client, ws_id, overview)
+        }
+        PickerOutcome::Selected(row) if row == stay => Ok(()),
+        PickerOutcome::Selected(row) => Err(CliError::MalformedResponse(
+            MalformedResponseSource::Server(format!(
+                "follow picker returned row not in items: {row:?}"
+            )),
+        )
+        .into()),
+    }
 }
 
 /// Opens a single-select picker over the current activity list, then
@@ -91,17 +208,21 @@ pub(crate) fn run(
 ///   `Request::Action(MoveWorkspaceToActivity)`).
 /// - On `Cancelled`, returns `Ok(())` — user dismissal is exit 0.
 ///
-/// The `pick` parameter is a closure so unit tests can inject a stub
-/// without spawning `fuzzel`; production wiring passes
-/// [`crate::picker::pick_one`].
+/// The `pick` parameter is `Fn` (not `FnOnce`) because `pick` is invoked
+/// twice from this function: once at stage 1 (the activity picker above),
+/// then again inside [`run`] via `&pick` for the post-move follow picker.
+/// `FnOnce` would be consumed by the first call, leaving nothing to borrow
+/// for the inner [`run`] call. `follow` and `overview` are forwarded
+/// verbatim to [`run`] so the follow picker fires for the picker-entry path
+/// as well. Production wiring passes [`crate::picker::pick_one`].
 pub(crate) fn run_picker<F>(
     client: &mut dyn NiriClient,
     pick: F,
-    _follow: bool,
-    _overview: bool,
+    follow: bool,
+    overview: bool,
 ) -> Result<()>
 where
-    F: FnOnce(&str, &[String]) -> Result<PickerOutcome, CliError>,
+    F: Fn(&str, &[String]) -> Result<PickerOutcome, CliError>,
 {
     let activities = send_expect_activities(client).context("requesting activities")?;
     if activities.is_empty() {
@@ -112,17 +233,25 @@ where
     match pick("Move workspace to activity:", &names)? {
         PickerOutcome::Cancelled => Ok(()),
         PickerOutcome::Selected(name) => {
-            // `_follow` / `_overview` are accepted by `run` but ignored
-            // this commit; Task 1 lands surface-only and pins the
-            // signature shape before any behavioral consumption.
-            run(client, &name, false, false)
+            // Thread `follow` / `overview` through to `run` so the
+            // post-move follow picker fires for the picker entry path
+            // too. The `pick` closure is invoked twice from this
+            // function: once above for stage 1, then once inside `run`
+            // via `&pick` (the post-move follow picker). Hence the
+            // `Fn` bound on the outer signature — `FnOnce` would
+            // consume `pick` at the stage-1 call site and leave
+            // nothing to borrow for the inner `run` call.
+            run(client, &name, &pick, follow, overview)
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use niri_ipc::{Action, Activity, ActivityReferenceArg, Reply, Request, Response};
+    use niri_ipc::{
+        Action, Activity, ActivityReferenceArg, Reply, Request, Response, Workspace,
+        WorkspaceReferenceArg,
+    };
 
     use super::*;
     use crate::error::{CliError, MalformedResponseSource};
@@ -136,6 +265,28 @@ mod tests {
         })
     }
 
+    /// Pick stub that panics when invoked — used by `run` tests where
+    /// `--follow` is off, so the follow picker must NOT spawn.
+    fn no_follow_pick(_: &str, _: &[String]) -> Result<PickerOutcome, CliError> {
+        panic!("follow picker must NOT be invoked when --follow is off");
+    }
+
+    fn ws(id: u64, focused: bool, activities: Vec<u64>) -> Workspace {
+        Workspace {
+            id,
+            idx: 0,
+            name: None,
+            output: Some("DP-1".into()),
+            is_urgent: false,
+            is_active: false,
+            is_focused: focused,
+            active_window_id: None,
+            activities,
+            is_sticky: false,
+            is_in_active_activity: focused,
+        }
+    }
+
     #[test]
     fn move_workspace_dispatches_action_with_name_arg() {
         // Pins three load-bearing fields:
@@ -146,7 +297,8 @@ mod tests {
         // that flipped focus or pinned a workspace id would fail here.
         let mut client = MockClient::new();
         client.expect(move_req("Work"), Reply::Ok(Response::Handled));
-        run(&mut client, "Work", false, false).expect("move-workspace succeeds on Handled");
+        run(&mut client, "Work", no_follow_pick, false, false)
+            .expect("move-workspace succeeds on Handled");
         client.assert_consumed_in_order();
     }
 
@@ -154,7 +306,8 @@ mod tests {
     fn move_workspace_unknown_name_maps_to_activity_not_found() {
         let mut client = MockClient::new();
         client.expect(move_req("Work"), Err("activity not found".to_owned()));
-        let err = run(&mut client, "Work", false, false).expect_err("unknown activity must fail");
+        let err = run(&mut client, "Work", no_follow_pick, false, false)
+            .expect_err("unknown activity must fail");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())
@@ -176,7 +329,7 @@ mod tests {
         // workspace-miss wire string would be misleading.
         let mut client = MockClient::new();
         client.expect(move_req("Work"), Err("workspace not found".to_owned()));
-        let err = run(&mut client, "Work", false, false).expect_err("must fail");
+        let err = run(&mut client, "Work", no_follow_pick, false, false).expect_err("must fail");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())
@@ -203,7 +356,7 @@ mod tests {
             move_req("Work"),
             Err("workspace not in active activity".to_owned()),
         );
-        let err = run(&mut client, "Work", false, false).expect_err("must fail");
+        let err = run(&mut client, "Work", no_follow_pick, false, false).expect_err("must fail");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())
@@ -222,7 +375,8 @@ mod tests {
     fn move_workspace_wrong_response_variant_is_malformed() {
         let mut client = MockClient::new();
         client.expect(move_req("Work"), Reply::Ok(Response::Version("v".into())));
-        let err = run(&mut client, "Work", false, false).expect_err("wrong variant must fail");
+        let err = run(&mut client, "Work", no_follow_pick, false, false)
+            .expect_err("wrong variant must fail");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())
@@ -248,7 +402,8 @@ mod tests {
             move_req("Work"),
             Err("activity switch blocked: gesture".to_owned()),
         );
-        let err = run(&mut client, "Work", false, false).expect_err("server error must surface");
+        let err = run(&mut client, "Work", no_follow_pick, false, false)
+            .expect_err("server error must surface");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())
@@ -267,7 +422,7 @@ mod tests {
     fn move_workspace_preserves_context_in_error_chain() {
         let mut client = MockClient::new();
         client.expect(move_req("Work"), Err("activity not found".to_owned()));
-        let err = run(&mut client, "Work", false, false).expect_err("must fail");
+        let err = run(&mut client, "Work", no_follow_pick, false, false).expect_err("must fail");
         let formatted = format!("{err:#}");
         assert!(
             formatted.contains("moving workspace to activity"),
@@ -383,6 +538,172 @@ mod tests {
             other => panic!("expected WrongVariant, got {other:?}"),
         }
         assert_eq!(cli_err.exit_code(), 65);
+        client.assert_consumed_in_order();
+    }
+
+    // ---- --follow ---------------------------------------------------------
+
+    fn focus_workspace_req(ws_id: u64) -> Request {
+        Request::Action(Action::FocusWorkspace {
+            reference: WorkspaceReferenceArg::Id(ws_id),
+        })
+    }
+
+    /// `--follow` path issues `Request::Workspaces` BEFORE the move so the
+    /// focused workspace id is captured. After a successful
+    /// `MoveWorkspaceToActivity`, the follow picker spawns; on the
+    /// confirmation row a `FocusWorkspace { Id(captured) }` fires.
+    /// Pins the strict IPC ordering: Workspaces → Move → FocusWorkspace.
+    #[test]
+    fn move_workspace_run_follow_captures_workspace_id_via_workspaces_snapshot() {
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![ws(42, true, vec![1])])),
+        );
+        client.expect(move_req("Personal"), Reply::Ok(Response::Handled));
+        client.expect(focus_workspace_req(42), Reply::Ok(Response::Handled));
+
+        let pick = |prompt: &str, items: &[String]| -> Result<PickerOutcome, CliError> {
+            assert_eq!(prompt, "Follow?");
+            // Items: [confirm_row, « Stay »]. Confirmation row is the
+            // first item; sentinel is the second.
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[1], "« Stay »");
+            Ok(PickerOutcome::Selected(items[0].clone()))
+        };
+
+        run(&mut client, "Personal", pick, true, false).expect("--follow succeeds");
+        client.assert_consumed_in_order();
+    }
+
+    /// `--follow` with picker returning a row NOT in the items: contract
+    /// violation routed to `MalformedResponse(Server)` (exit 65), NOT
+    /// folded into `Cancelled`. Mirrors the
+    /// `Stage1Resolution::Unknown` / `Stage2Resolution*::Unknown`
+    /// discipline.
+    #[test]
+    fn move_workspace_run_follow_picker_unknown_row_routes_to_malformed_server() {
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![ws(42, true, vec![1])])),
+        );
+        client.expect(move_req("Personal"), Reply::Ok(Response::Handled));
+
+        let pick = |_: &str, _: &[String]| -> Result<PickerOutcome, CliError> {
+            Ok(PickerOutcome::Selected("definitely-not-an-item".to_owned()))
+        };
+        let err = run(&mut client, "Personal", pick, true, false)
+            .expect_err("unknown row must route to MalformedResponse");
+        let cli_err = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<CliError>())
+            .expect("CliError must be in chain");
+        match cli_err {
+            CliError::MalformedResponse(MalformedResponseSource::Server(msg)) => {
+                assert!(
+                    msg.contains("follow picker returned row not in items"),
+                    "expected synthetic discipline message, got: {msg}",
+                );
+            }
+            other => panic!("expected MalformedResponse(Server), got {other:?}"),
+        }
+        assert_eq!(cli_err.exit_code(), 65);
+        client.assert_consumed_in_order();
+    }
+
+    /// `--follow` with no focused workspace in the snapshot: the
+    /// synthetic `"no focused workspace"` error fires BEFORE the move
+    /// dispatches. No `MoveWorkspaceToActivity` is sent.
+    #[test]
+    fn move_workspace_run_follow_no_focused_workspace_exits_65_before_move() {
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![ws(42, false, vec![1])])),
+        );
+        let err = run(&mut client, "Personal", no_follow_pick, true, false)
+            .expect_err("no focused workspace must fail with exit 65 before move");
+        let cli_err = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<CliError>())
+            .expect("CliError must be in chain");
+        match cli_err {
+            CliError::MalformedResponse(MalformedResponseSource::Server(msg)) => {
+                assert_eq!(msg, "no focused workspace");
+            }
+            other => panic!("expected MalformedResponse(Server), got {other:?}"),
+        }
+        assert_eq!(cli_err.exit_code(), 65);
+        client.assert_consumed_in_order();
+    }
+
+    /// `run_picker → run` delegation threads `follow` / `overview`
+    /// through. Pins that the previous hardcoded `false, false` no
+    /// longer drops the flags on the floor.
+    #[test]
+    fn move_workspace_run_picker_threads_follow_flag_to_run() {
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![act(1, "Work", true)])),
+        );
+        // `--follow: true` so `run` issues Workspaces BEFORE Move.
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![ws(99, true, vec![1])])),
+        );
+        client.expect(move_req("Work"), Reply::Ok(Response::Handled));
+        client.expect(focus_workspace_req(99), Reply::Ok(Response::Handled));
+
+        let pick = |prompt: &str, items: &[String]| -> Result<PickerOutcome, CliError> {
+            if prompt == "Move workspace to activity:" {
+                Ok(PickerOutcome::Selected("Work".to_owned()))
+            } else {
+                // Follow picker — confirm.
+                assert_eq!(prompt, "Follow?");
+                Ok(PickerOutcome::Selected(items[0].clone()))
+            }
+        };
+
+        run_picker(&mut client, pick, true, false).expect("delegation threads --follow");
+        client.assert_consumed_in_order();
+    }
+
+    /// `run_picker → run` delegation threads `overview: true` through.
+    /// Pins that `OpenOverview` fires after `FocusWorkspace` when the
+    /// `--overview` flag is set alongside `--follow`.
+    #[test]
+    fn move_workspace_run_picker_threads_overview_flag_to_run() {
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![act(1, "Work", true)])),
+        );
+        // `--follow: true` so `run` issues Workspaces BEFORE Move.
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![ws(99, true, vec![1])])),
+        );
+        client.expect(move_req("Work"), Reply::Ok(Response::Handled));
+        client.expect(focus_workspace_req(99), Reply::Ok(Response::Handled));
+        client.expect(
+            Request::Action(Action::OpenOverview {}),
+            Reply::Ok(Response::Handled),
+        );
+
+        let pick = |prompt: &str, items: &[String]| -> Result<PickerOutcome, CliError> {
+            if prompt == "Move workspace to activity:" {
+                Ok(PickerOutcome::Selected("Work".to_owned()))
+            } else {
+                // Follow picker — confirm.
+                assert_eq!(prompt, "Follow?");
+                Ok(PickerOutcome::Selected(items[0].clone()))
+            }
+        };
+
+        run_picker(&mut client, pick, true, true).expect("delegation threads --overview");
         client.assert_consumed_in_order();
     }
 }

@@ -209,8 +209,18 @@ fn cmd_switch_previous() -> Result<()> {
 fn cmd_move_window(name: Option<String>, follow: bool, overview: bool) -> Result<()> {
     match name {
         Some(n) => {
+            // When `--follow` is set the named-arg form also spawns a
+            // fuzzel-backed follow picker after the move, so the
+            // picker-availability check must fire pre-IPC even on the
+            // non-interactive path. Skipping when `follow` is false
+            // preserves the "no fuzzel required for plain named-arg"
+            // ergonomic.
+            if follow {
+                picker::ensure_available()
+                    .context("verifying move-window follow picker availability")?;
+            }
             let mut client = ipc::make_client();
-            move_window::run(client.as_mut(), &n, follow, overview)
+            move_window::run(client.as_mut(), &n, picker::pick_one, follow, overview)
         }
         None => {
             // Verify `fuzzel` is on $PATH BEFORE any IPC round-trip so a
@@ -245,8 +255,17 @@ fn cmd_move_window_here(follow: bool, overview: bool) -> Result<()> {
 fn cmd_move_workspace(name: Option<String>, follow: bool, overview: bool) -> Result<()> {
     match name {
         Some(n) => {
+            // Same rationale as `cmd_move_window`'s named-arg branch:
+            // when `--follow` is set we will spawn a fuzzel-backed follow
+            // picker after the move, so the picker-availability check
+            // must fire pre-IPC. The plain named-arg form (no `--follow`)
+            // remains fuzzel-free.
+            if follow {
+                picker::ensure_available()
+                    .context("verifying move-workspace follow picker availability")?;
+            }
             let mut client = ipc::make_client();
-            move_workspace::run(client.as_mut(), &n, follow, overview)
+            move_workspace::run(client.as_mut(), &n, picker::pick_one, follow, overview)
         }
         None => {
             // Verify `fuzzel` is on $PATH BEFORE any IPC round-trip so a
@@ -269,8 +288,19 @@ fn cmd_assign_workspace(follow: bool, overview: bool) -> Result<()> {
     // would produce on a disconnected socket.
     picker::multi_select::ensure_available()
         .context("verifying assign-workspace picker availability")?;
+    // When `--follow` is set the post-save follow picker uses fuzzel
+    // (single-select); rofi handles the assignment picker but the
+    // follow stage is always single-select. Pre-verify so a missing
+    // fuzzel surfaces with the picker-naming stderr message rather
+    // than as a transport-layer failure after the save has already
+    // landed. Skipped when `follow` is false to preserve the
+    // "no fuzzel required" ergonomic for the plain assign path.
+    if follow {
+        picker::ensure_available()
+            .context("verifying assign-workspace follow picker availability")?;
+    }
     let mut client = ipc::make_client();
-    assign_workspace::run(client.as_mut(), follow, overview)
+    assign_workspace::run(client.as_mut(), picker::pick_one, follow, overview)
         .context("running assign-workspace picker")
 }
 

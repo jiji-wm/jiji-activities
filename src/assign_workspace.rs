@@ -11,6 +11,13 @@
 //! The chained-single leg (`« Only one… »` sentinel) adds a fourth
 //! step — the chained fuzzel picker — between (2) and (3).
 //!
+//! **`--follow` path.** When `follow: true`, after a successful dispatch
+//! the follow picker is spawned. On confirmation,
+//! [`dispatch_follow_activity_and_workspace`] issues up to three more IPC
+//! round-trips in strict order: `SwitchActivity`, `FocusWorkspace`, and
+//! optionally `OpenOverview` (when `overview: true`). See
+//! [`dispatch_follow_activity_and_workspace`] for the full contract.
+//!
 //! ## Why the workspace arg is `Id(ws.id)`, not `None`
 //!
 //! `Action::SetWorkspaceActivities { workspace: None, ... }` defaults
@@ -29,6 +36,7 @@ use niri_ipc::{
 };
 
 use crate::error::{CliError, MalformedResponseSource};
+use crate::follow::{self, dispatch_follow_activity_and_workspace};
 use crate::ipc::{IpcError, NiriClient};
 use crate::ipc_helpers::{send_expect_activities, send_expect_workspaces, variant_name};
 use crate::picker::PickerOutcome;
@@ -56,6 +64,14 @@ use crate::picker::multi_select::{self, MultiPickerOutcome};
 /// - Other IPC failures flow through the existing `IpcError → CliError`
 ///   mapping (`SocketUnavailable`, `MalformedResponse(Server)`, etc.).
 ///
+/// **`--follow`.** When `follow: true`, after a successful dispatch a
+/// follow picker is spawned over the saved activity names plus a `« Stay »`
+/// sentinel. On confirmation, [`dispatch_follow_activity_and_workspace`] is
+/// invoked. If the picker returns an unrecognised row →
+/// `MalformedResponse(Server("follow picker returned row not in items: …"))`
+/// (exit 65). `overview: true` causes an additional `OpenOverview` IPC call
+/// after `FocusWorkspace` on the follow path.
+///
 /// **Snapshot freshness.** The activities snapshot read here is
 /// point-in-time at picker open: a concurrent `niri-activities create`
 /// while the picker is open does not refresh the menu, and a stale
@@ -63,7 +79,15 @@ use crate::picker::multi_select::{self, MultiPickerOutcome};
 /// `IpcError → CliError` mapping (typically
 /// `MalformedResponse(Server)` when the chosen name no longer
 /// resolves). Reactive refresh is deferred to v2.
-pub(crate) fn run(client: &mut dyn NiriClient, _follow: bool, _overview: bool) -> Result<()> {
+pub(crate) fn run<F>(
+    client: &mut dyn NiriClient,
+    pick: F,
+    follow: bool,
+    overview: bool,
+) -> Result<()>
+where
+    F: FnOnce(&str, &[String]) -> Result<PickerOutcome, CliError>,
+{
     let activities = send_expect_activities(client).context("requesting activities")?;
     if activities.is_empty() {
         eprintln!("niri-activities: no activities configured; nothing to assign");
@@ -71,22 +95,92 @@ pub(crate) fn run(client: &mut dyn NiriClient, _follow: bool, _overview: bool) -
     }
     let workspaces = send_expect_workspaces(client).context("requesting workspaces")?;
     let ws = focused_workspace(&workspaces).context("locating focused workspace")?;
+    let ws_id = ws.id;
     let activity_names: Vec<String> = activities.iter().map(|a| a.name.clone()).collect();
     let current = workspace_activity_names(ws, &activities);
 
-    match multi_select::pick_many(&activity_names, &current)
+    let saved: Option<Vec<String>> = match multi_select::pick_many(&activity_names, &current)
         .context("running assign-workspace picker")?
     {
-        MultiPickerOutcome::Cancelled => Ok(()),
-        MultiPickerOutcome::Selected(names) => dispatch_set(client, ws.id, names),
+        MultiPickerOutcome::Cancelled => None,
+        MultiPickerOutcome::Selected(names) => {
+            dispatch_set(client, ws_id, names.clone())?;
+            Some(names)
+        }
         MultiPickerOutcome::ChainSingle => {
             match multi_select::pick_one_chained(&activity_names)
                 .context("running assign-workspace chained picker")?
             {
-                PickerOutcome::Cancelled => Ok(()),
-                PickerOutcome::Selected(name) => dispatch_set(client, ws.id, vec![name]),
+                PickerOutcome::Cancelled => None,
+                PickerOutcome::Selected(name) => {
+                    dispatch_set(client, ws_id, vec![name.clone()])?;
+                    Some(vec![name])
+                }
             }
         }
+    };
+
+    if follow
+        && let Some(saved_names) = saved
+        && !saved_names.is_empty()
+    {
+        run_assign_workspace_follow_picker(client, pick, &saved_names, ws_id, overview)?;
+    }
+    Ok(())
+}
+
+/// Spawns the follow picker after a successful `SetWorkspaceActivities`
+/// dispatch. Items: one row per saved activity name plus the
+/// `« Stay »` sentinel.
+///
+/// **Picker contract:**
+/// - `PickerOutcome::Cancelled` → `Ok(())` (silent exit 0).
+/// - `PickerOutcome::Selected(stay)` → `Ok(())` (silent exit 0). Stay is
+///   resolved via [`crate::follow::stay_sentinel`] against the saved
+///   activity-name row set, so an activity literally named `« Stay »`
+///   does not collide with the sentinel.
+/// - `PickerOutcome::Selected(name)` where `name` matches one of the
+///   saved activity names →
+///   `dispatch_follow_activity_and_workspace(client, &name, ws_id, overview)`.
+///   That helper prepends `SwitchActivity { Name(name) }` before the
+///   `FocusWorkspace`, scoping the focus to the user's chosen activity
+///   context when the workspace is a member of more than one activity.
+/// - `PickerOutcome::Selected(unknown)` →
+///   `CliError::MalformedResponse(Server("follow picker returned row not
+///   in items: ..."))` (exit 65). Contract-violation routing — NEVER
+///   folded into `Cancelled`, which would be a silent-failure anti-pattern.
+///
+/// **Synthetic-string discipline.** The
+/// `"follow picker returned row not in items: …"` literal is a
+/// CLI-internal value, not on the wire. Same discipline as
+/// [`focused_workspace`]'s `"no focused workspace"`.
+fn run_assign_workspace_follow_picker<F>(
+    client: &mut dyn NiriClient,
+    pick: F,
+    saved_names: &[String],
+    ws_id: u64,
+    overview: bool,
+) -> Result<()>
+where
+    F: FnOnce(&str, &[String]) -> Result<PickerOutcome, CliError>,
+{
+    let row_refs: Vec<&str> = saved_names.iter().map(String::as_str).collect();
+    let stay = follow::stay_sentinel(&row_refs);
+    let mut items: Vec<String> = saved_names.to_vec();
+    items.push(stay.to_owned());
+    let outcome = pick("Follow?", &items).context("running assign-workspace follow picker")?;
+    match outcome {
+        PickerOutcome::Cancelled => Ok(()),
+        PickerOutcome::Selected(row) if row == stay => Ok(()),
+        PickerOutcome::Selected(row) if saved_names.iter().any(|n| n == &row) => {
+            dispatch_follow_activity_and_workspace(client, &row, ws_id, overview)
+        }
+        PickerOutcome::Selected(row) => Err(CliError::MalformedResponse(
+            MalformedResponseSource::Server(format!(
+                "follow picker returned row not in items: {row:?}"
+            )),
+        )
+        .into()),
     }
 }
 
@@ -225,13 +319,22 @@ mod tests {
         client.assert_consumed_in_order();
     }
 
-    /// Wires the full happy-path flow through `run`, with a stub
-    /// multi-select picker returning a literal `Selected` outcome.
-    /// Verifies all three IPC calls fire in order.
-    fn run_with_pickers<MS, OS>(client: &mut dyn NiriClient, multi: MS, one: OS) -> Result<()>
+    /// Wires the full happy-path flow through `run`, with stub
+    /// multi-select / chained-single pickers. Mirrors the production
+    /// `run` shape including the post-save `--follow` picker so the
+    /// follow path is unit-testable without spawning fuzzel.
+    fn run_with_pickers<MS, OS, FP>(
+        client: &mut dyn NiriClient,
+        multi: MS,
+        one: OS,
+        follow_pick: FP,
+        follow: bool,
+        overview: bool,
+    ) -> Result<()>
     where
         MS: FnOnce(&[String], &HashSet<String>) -> Result<MultiPickerOutcome, CliError>,
         OS: FnOnce(&[String]) -> Result<PickerOutcome, CliError>,
+        FP: FnOnce(&str, &[String]) -> Result<PickerOutcome, CliError>,
     {
         let activities = send_expect_activities(client).context("requesting activities")?;
         if activities.is_empty() {
@@ -240,18 +343,39 @@ mod tests {
         }
         let workspaces = send_expect_workspaces(client).context("requesting workspaces")?;
         let ws = focused_workspace(&workspaces)?;
+        let ws_id = ws.id;
         let activity_names: Vec<String> = activities.iter().map(|a| a.name.clone()).collect();
         let current = workspace_activity_names(ws, &activities);
-        match multi(&activity_names, &current).context("running assign-workspace picker")? {
-            MultiPickerOutcome::Cancelled => Ok(()),
-            MultiPickerOutcome::Selected(names) => dispatch_set(client, ws.id, names),
-            MultiPickerOutcome::ChainSingle => {
-                match one(&activity_names).context("running assign-workspace chained picker")? {
-                    PickerOutcome::Cancelled => Ok(()),
-                    PickerOutcome::Selected(name) => dispatch_set(client, ws.id, vec![name]),
+        let saved: Option<Vec<String>> =
+            match multi(&activity_names, &current).context("running assign-workspace picker")? {
+                MultiPickerOutcome::Cancelled => None,
+                MultiPickerOutcome::Selected(names) => {
+                    dispatch_set(client, ws_id, names.clone())?;
+                    Some(names)
                 }
-            }
+                MultiPickerOutcome::ChainSingle => {
+                    match one(&activity_names).context("running assign-workspace chained picker")? {
+                        PickerOutcome::Cancelled => None,
+                        PickerOutcome::Selected(name) => {
+                            dispatch_set(client, ws_id, vec![name.clone()])?;
+                            Some(vec![name])
+                        }
+                    }
+                }
+            };
+        if follow
+            && let Some(saved_names) = saved
+            && !saved_names.is_empty()
+        {
+            run_assign_workspace_follow_picker(client, follow_pick, &saved_names, ws_id, overview)?;
         }
+        Ok(())
+    }
+
+    /// `follow_pick` stub that panics — for tests where `--follow` is
+    /// off, so the follow picker must NOT spawn.
+    fn no_follow_pick(_: &str, _: &[String]) -> Result<PickerOutcome, CliError> {
+        panic!("follow picker must NOT be invoked when --follow is off");
     }
 
     #[test]
@@ -298,7 +422,8 @@ mod tests {
         let one = |_: &[String]| -> Result<PickerOutcome, CliError> {
             panic!("chained picker must not be called for Selected outcome");
         };
-        run_with_pickers(&mut client, multi, one).expect("happy path succeeds");
+        run_with_pickers(&mut client, multi, one, no_follow_pick, false, false)
+            .expect("happy path succeeds");
         client.assert_consumed_in_order();
     }
 
@@ -332,7 +457,8 @@ mod tests {
             assert_eq!(names, &["Work", "Personal"]);
             Ok(PickerOutcome::Selected("Personal".into()))
         };
-        run_with_pickers(&mut client, multi, one).expect("chain path succeeds");
+        run_with_pickers(&mut client, multi, one, no_follow_pick, false, false)
+            .expect("chain path succeeds");
         client.assert_consumed_in_order();
     }
 
@@ -352,7 +478,8 @@ mod tests {
         );
         let multi = |_: &[String], _: &HashSet<String>| Ok(MultiPickerOutcome::ChainSingle);
         let one = |_: &[String]| Ok(PickerOutcome::Cancelled);
-        run_with_pickers(&mut client, multi, one).expect("cancellation is silent Ok");
+        run_with_pickers(&mut client, multi, one, no_follow_pick, false, false)
+            .expect("cancellation is silent Ok");
         client.assert_consumed_in_order();
     }
 
@@ -373,7 +500,8 @@ mod tests {
         let one = |_: &[String]| -> Result<PickerOutcome, CliError> {
             panic!("chained picker must not be called on Cancelled");
         };
-        run_with_pickers(&mut client, multi, one).expect("cancellation is silent Ok");
+        run_with_pickers(&mut client, multi, one, no_follow_pick, false, false)
+            .expect("cancellation is silent Ok");
         client.assert_consumed_in_order();
     }
 
@@ -398,7 +526,7 @@ mod tests {
         let one = |_: &[String]| -> Result<PickerOutcome, CliError> {
             panic!("chained picker must not be called when no workspace is focused");
         };
-        let err = run_with_pickers(&mut client, multi, one)
+        let err = run_with_pickers(&mut client, multi, one, no_follow_pick, false, false)
             .expect_err("no focused workspace must surface as error");
         let cli_err = err
             .chain()
@@ -426,7 +554,8 @@ mod tests {
         let one = |_: &[String]| -> Result<PickerOutcome, CliError> {
             panic!("chained picker must not be called when activity list is empty");
         };
-        run_with_pickers(&mut client, multi, one).expect("empty list exits Ok");
+        run_with_pickers(&mut client, multi, one, no_follow_pick, false, false)
+            .expect("empty list exits Ok");
         client.assert_consumed_in_order();
     }
 
@@ -441,8 +570,8 @@ mod tests {
             panic!("picker must not be called on malformed Activities response");
         };
         let one = |_: &[String]| -> Result<PickerOutcome, CliError> { unreachable!() };
-        let err =
-            run_with_pickers(&mut client, multi, one).expect_err("wrong variant must surface");
+        let err = run_with_pickers(&mut client, multi, one, no_follow_pick, false, false)
+            .expect_err("wrong variant must surface");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())
@@ -475,8 +604,8 @@ mod tests {
             panic!("picker must not be called on malformed Workspaces response");
         };
         let one = |_: &[String]| -> Result<PickerOutcome, CliError> { unreachable!() };
-        let err =
-            run_with_pickers(&mut client, multi, one).expect_err("wrong variant must surface");
+        let err = run_with_pickers(&mut client, multi, one, no_follow_pick, false, false)
+            .expect_err("wrong variant must surface");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())
@@ -520,8 +649,8 @@ mod tests {
             Ok(MultiPickerOutcome::Selected(vec!["Work".into()]))
         };
         let one = |_: &[String]| -> Result<PickerOutcome, CliError> { unreachable!() };
-        let err =
-            run_with_pickers(&mut client, multi, one).expect_err("server error must propagate");
+        let err = run_with_pickers(&mut client, multi, one, no_follow_pick, false, false)
+            .expect_err("server error must propagate");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())
@@ -529,6 +658,200 @@ mod tests {
         match cli_err {
             CliError::MalformedResponse(MalformedResponseSource::Server(msg)) => {
                 assert_eq!(msg, "workspace not found");
+            }
+            other => panic!("expected MalformedResponse(Server), got {other:?}"),
+        }
+        assert_eq!(cli_err.exit_code(), 65);
+        client.assert_consumed_in_order();
+    }
+
+    // ---- --follow ---------------------------------------------------------
+
+    fn switch_activity_req(name: &str) -> Request {
+        Request::Action(Action::SwitchActivity {
+            activity: ActivityReferenceArg::Name(name.to_owned()),
+        })
+    }
+
+    fn focus_workspace_req(ws_id: u64) -> Request {
+        Request::Action(Action::FocusWorkspace {
+            reference: WorkspaceReferenceArg::Id(ws_id),
+        })
+    }
+
+    fn three_ipc_follow_setup(client: &mut MockClient) {
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![
+                act(1, "Work"),
+                act(2, "Personal"),
+                act(3, "Gaming"),
+            ])),
+        );
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![ws(42, true, vec![1])])),
+        );
+        client.expect(
+            Request::Action(Action::SetWorkspaceActivities {
+                workspace: Some(WorkspaceReferenceArg::Id(42)),
+                activities: vec![
+                    ActivityReferenceArg::Name("Work".into()),
+                    ActivityReferenceArg::Name("Personal".into()),
+                ],
+            }),
+            Reply::Ok(Response::Handled),
+        );
+    }
+
+    fn multi_work_personal(
+        _: &[String],
+        _: &HashSet<String>,
+    ) -> Result<MultiPickerOutcome, CliError> {
+        Ok(MultiPickerOutcome::Selected(vec![
+            "Work".into(),
+            "Personal".into(),
+        ]))
+    }
+
+    /// Pins the item shape presented to the follow picker: one row per
+    /// saved activity name (in save order) plus `« Stay »` as the last row.
+    #[test]
+    fn assign_workspace_follow_picker_item_shape_matches_saved_plus_stay() {
+        let mut client = MockClient::new();
+        three_ipc_follow_setup(&mut client);
+        let one = |_: &[String]| -> Result<PickerOutcome, CliError> { unreachable!() };
+        let follow_pick = |prompt: &str, items: &[String]| -> Result<PickerOutcome, CliError> {
+            assert_eq!(prompt, "Follow?");
+            assert_eq!(items, &["Work", "Personal", "« Stay »"]);
+            Ok(PickerOutcome::Cancelled)
+        };
+        run_with_pickers(
+            &mut client,
+            multi_work_personal,
+            one,
+            follow_pick,
+            true,
+            false,
+        )
+        .expect("item-shape assertion exits Ok");
+        client.assert_consumed_in_order();
+    }
+
+    /// Pins the cancellation contract: when the follow picker returns
+    /// `Cancelled` (Escape), no follow IPC is dispatched — only the
+    /// three earlier calls are consumed.
+    #[test]
+    fn assign_workspace_follow_cancelled_dispatches_no_follow_ipc() {
+        let mut client = MockClient::new();
+        three_ipc_follow_setup(&mut client);
+        let one = |_: &[String]| -> Result<PickerOutcome, CliError> { unreachable!() };
+        // Return Cancelled — the IPC queue must be fully consumed with no
+        // additional requests beyond the three set up above.
+        let follow_pick = |_: &str, _: &[String]| -> Result<PickerOutcome, CliError> {
+            Ok(PickerOutcome::Cancelled)
+        };
+        run_with_pickers(
+            &mut client,
+            multi_work_personal,
+            one,
+            follow_pick,
+            true,
+            false,
+        )
+        .expect("cancelled follow picker exits Ok");
+        client.assert_consumed_in_order();
+    }
+
+    /// `Selected("Work")` in the follow picker dispatches
+    /// `SwitchActivity { Name("Work") }` then `FocusWorkspace { Id(42) }`.
+    /// Pins the strict IPC ordering across the full assign-workspace
+    /// --follow happy path.
+    #[test]
+    fn assign_workspace_follow_dispatches_switch_then_focus_against_picked_activity() {
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![
+                act(1, "Work"),
+                act(2, "Personal"),
+            ])),
+        );
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![ws(42, true, vec![1])])),
+        );
+        client.expect(
+            Request::Action(Action::SetWorkspaceActivities {
+                workspace: Some(WorkspaceReferenceArg::Id(42)),
+                activities: vec![
+                    ActivityReferenceArg::Name("Work".into()),
+                    ActivityReferenceArg::Name("Personal".into()),
+                ],
+            }),
+            Reply::Ok(Response::Handled),
+        );
+        client.expect(switch_activity_req("Work"), Reply::Ok(Response::Handled));
+        client.expect(focus_workspace_req(42), Reply::Ok(Response::Handled));
+
+        let multi = |_: &[String], _: &HashSet<String>| {
+            Ok(MultiPickerOutcome::Selected(vec![
+                "Work".into(),
+                "Personal".into(),
+            ]))
+        };
+        let one = |_: &[String]| -> Result<PickerOutcome, CliError> { unreachable!() };
+        let follow_pick = |_: &str, items: &[String]| -> Result<PickerOutcome, CliError> {
+            // Pick the first saved activity name.
+            assert_eq!(items[0], "Work");
+            Ok(PickerOutcome::Selected("Work".into()))
+        };
+        run_with_pickers(&mut client, multi, one, follow_pick, true, false)
+            .expect("follow happy-path succeeds");
+        client.assert_consumed_in_order();
+    }
+
+    /// `--follow` with picker returning an unknown row: routes to
+    /// `MalformedResponse(Server(_))` (exit 65), NOT folded into
+    /// `Cancelled`. Pins the resolver-enums silent-failure discipline.
+    #[test]
+    fn assign_workspace_follow_unknown_row_routes_to_malformed_server() {
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![act(1, "Work")])),
+        );
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![ws(42, true, vec![1])])),
+        );
+        client.expect(
+            Request::Action(Action::SetWorkspaceActivities {
+                workspace: Some(WorkspaceReferenceArg::Id(42)),
+                activities: vec![ActivityReferenceArg::Name("Work".into())],
+            }),
+            Reply::Ok(Response::Handled),
+        );
+
+        let multi = |_: &[String], _: &HashSet<String>| {
+            Ok(MultiPickerOutcome::Selected(vec!["Work".into()]))
+        };
+        let one = |_: &[String]| -> Result<PickerOutcome, CliError> { unreachable!() };
+        let follow_pick = |_: &str, _: &[String]| -> Result<PickerOutcome, CliError> {
+            Ok(PickerOutcome::Selected("not-an-item".into()))
+        };
+        let err = run_with_pickers(&mut client, multi, one, follow_pick, true, false)
+            .expect_err("unknown row must surface as error");
+        let cli_err = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<CliError>())
+            .expect("CliError must be in chain");
+        match cli_err {
+            CliError::MalformedResponse(MalformedResponseSource::Server(msg)) => {
+                assert!(
+                    msg.contains("follow picker returned row not in items"),
+                    "expected synthetic discipline message, got: {msg}",
+                );
             }
             other => panic!("expected MalformedResponse(Server), got {other:?}"),
         }

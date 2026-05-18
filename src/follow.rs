@@ -1,28 +1,30 @@
 //! Post-move focus helpers used by `--follow` flags on move verbs.
 //!
-//! Scaffolding for the `--follow` / `--overview` UX: after a successful
-//! move (window or workspace) the caller may want the compositor to focus
-//! the destination workspace, optionally the moved window within it, and
-//! optionally open the Overview so the user can see the landing tile in
-//! its scene context.
+//! After a successful move (window or workspace, or an assign-workspace
+//! save) the caller may want the compositor to focus the destination
+//! workspace, optionally the moved window within it, optionally switch
+//! into a destination activity, and optionally open the Overview so the
+//! user can see the landing tile in its scene context.
 //!
 //! These helpers are pure dispatch wrappers — no resolution logic, no
 //! snapshot reads, no picker contact. Callers feed in the already-resolved
-//! `workspace_id` (and `window_id` for the window-aware variant) and pick
-//! the `with_overview` flag based on the verb's flag surface.
+//! `workspace_id` (and `window_id` / `activity_name` for the richer
+//! variants) and pick the `with_overview` flag based on the verb's flag
+//! surface.
 //!
 //! ## IPC ordering (load-bearing)
 //!
-//! | Helper                                  | `with_overview: false`             | `with_overview: true`                              |
-//! | --------------------------------------- | ---------------------------------- | -------------------------------------------------- |
-//! | [`dispatch_follow_workspace`]           | `FocusWorkspace`                   | `FocusWorkspace` → `OpenOverview`                  |
-//! | [`dispatch_follow_workspace_and_window`]| `FocusWorkspace` → `FocusWindow`   | `FocusWorkspace` → `FocusWindow` → `OpenOverview`  |
+//! | Helper                                       | `with_overview: false`                              | `with_overview: true`                                                |
+//! | -------------------------------------------- | --------------------------------------------------- | -------------------------------------------------------------------- |
+//! | [`dispatch_follow_workspace`]                | `FocusWorkspace`                                    | `FocusWorkspace` → `OpenOverview`                                    |
+//! | [`dispatch_follow_workspace_and_window`]     | `FocusWorkspace` → `FocusWindow`                    | `FocusWorkspace` → `FocusWindow` → `OpenOverview`                    |
+//! | [`dispatch_follow_activity_and_workspace`]   | `SwitchActivity` → `FocusWorkspace`                 | `SwitchActivity` → `FocusWorkspace` → `OpenOverview`                 |
 //!
-//! `FocusWorkspace` always fires first — it switches the activity +
-//! workspace context the subsequent `FocusWindow` resolves against.
-//! `FocusWindow` must follow before `OpenOverview` so the user sees the
-//! destination tile highlighted under the Overview, not a transient
-//! mid-move state.
+//! `FocusWorkspace` always fires after the activity switch (when present)
+//! — it switches the workspace context the subsequent `FocusWindow`
+//! resolves against. `FocusWindow` must follow before `OpenOverview` so
+//! the user sees the destination tile highlighted under the Overview,
+//! not a transient mid-move state.
 //!
 //! ## Wire shape pins
 //!
@@ -33,6 +35,13 @@
 //!   ordering changed between the snapshot read and the compositor
 //!   processing the action.
 //! - `Action::FocusWindow { id: u64 }` — single-field action.
+//! - `Action::SwitchActivity { activity: ActivityReferenceArg::Name(_) }`
+//!   — the activity-name carrier is what the picker returned, so a
+//!   `Name(_)` reference is the only one we can construct here. The
+//!   compositor's `"activity not found"` wire-error for an unresolvable
+//!   reference is treated as a contract violation by this helper (the
+//!   user-supplied name just came back from the saved-set picker), see
+//!   below for the `None` activity-name routing.
 //! - `Action::OpenOverview {}` — unit-shape (no fields). Idempotent when
 //!   the Overview is already open. `Action::ToggleOverview` and
 //!   `Action::CloseOverview` are intentionally NOT used: toggling on an
@@ -42,13 +51,20 @@
 //! ## Reply handling
 //!
 //! Each action is routed through
-//! [`send_expect_handled`]`(client, req, None)`. The `None` reflects that
-//! these three actions don't take an activity-name argument, so any wire
-//! `"activity not found"` would be a compositor contract violation — the
-//! helper's `None` branch correctly routes it to
-//! `MalformedResponse(Server)` rather than fabricating an
-//! `ActivityNotFound` with an empty name. Each call attaches a
-//! `.context(...)` layer naming the step (`"focusing target workspace"`,
+//! [`send_expect_handled`]`(client, req, None)`. The `None` reflects two
+//! related facts:
+//! - `FocusWorkspace`, `FocusWindow`, and `OpenOverview` don't take an
+//!   activity-name argument, so any wire `"activity not found"` reply
+//!   would be a compositor contract violation.
+//! - `SwitchActivity` *does* take an activity-name argument, but the
+//!   name we pass came back from a picker that listed only activities
+//!   the workspace was just saved into — so `"activity not found"` here
+//!   is ALSO a contract violation, not a user-input miss. `None` routes
+//!   the error to `MalformedResponse(Server(_))` (exit 65) rather than
+//!   `ActivityNotFound` (exit 66).
+//!
+//! Each call attaches a `.context(...)` layer naming the step
+//! (`"switching to selected activity"`, `"focusing target workspace"`,
 //! `"focusing moved window"`, `"opening overview after follow"`) so a
 //! `{:#}`-printed `anyhow::Error` discloses which step failed.
 //!
@@ -58,12 +74,47 @@
 //! `MalformedResponse(Server(_))` strings — every server-error carrier
 //! that reaches stderr from this module comes from the compositor's own
 //! wire payload via [`send_expect_handled`].
+//!
+//! The `« Stay »` follow-picker sentinel is a separate concern handled
+//! by [`stay_sentinel`]: that helper picks between two CLI-internal
+//! literals based on a collision check against the picker's row set.
+//! The sentinel itself is never sent on the wire — it is only ever
+//! consumed by callers comparing against [`PickerOutcome::Selected`].
 
 use anyhow::{Context, Result};
-use niri_ipc::{Action, Request, WorkspaceReferenceArg};
+use niri_ipc::{Action, ActivityReferenceArg, Request, WorkspaceReferenceArg};
 
 use crate::ipc::NiriClient;
 use crate::ipc_helpers::send_expect_handled;
+
+/// Preferred unicode form of the follow-picker "do not follow" sentinel
+/// row. Used unless [`stay_sentinel`] detects a collision against the
+/// picker's row set.
+pub(crate) const STAY_UNICODE: &str = "« Stay »";
+
+/// Underscore-fallback form of the "do not follow" sentinel, substituted
+/// by [`stay_sentinel`] iff any picker row would otherwise collide with
+/// [`STAY_UNICODE`].
+pub(crate) const STAY_FALLBACK: &str = "__niri_activities_stay__";
+
+/// Picks the appropriate stay-sentinel literal for a given set of picker
+/// rows. Returns [`STAY_UNICODE`] unless one of the rows literally equals
+/// the unicode form, in which case [`STAY_FALLBACK`] is returned instead.
+///
+/// **Synthetic-string discipline.** Both [`STAY_UNICODE`] and
+/// [`STAY_FALLBACK`] are CLI-internal literals — neither is emitted on
+/// the wire by the niri compositor. The sentinel is resolved purely
+/// against the picker's stdout in the caller's `PickerOutcome::Selected`
+/// match arm; a future grep auditing compositor wire-string matches must
+/// skip both literals. Same pattern as the stage-1 / stage-2 sentinels in
+/// [`crate::move_window`].
+pub(crate) fn stay_sentinel(rows: &[&str]) -> &'static str {
+    if rows.contains(&STAY_UNICODE) {
+        STAY_FALLBACK
+    } else {
+        STAY_UNICODE
+    }
+}
 
 /// Focuses the destination workspace, and optionally opens the Overview.
 ///
@@ -83,12 +134,6 @@ use crate::ipc_helpers::send_expect_handled;
 /// [`WorkspaceReferenceArg::Id`]`(workspace_id)` — never `Index(_)` or
 /// `Name(_)`. Index/name resolution would re-introduce the snapshot-vs-
 /// dispatch race the rest of this module already takes pains to avoid.
-//
-// `dead_code` allow: scaffolding helper. Callers in move-workspace
-// `--follow` / assign-workspace `--follow` light it up in subsequent
-// tasks; landing the helper + its ordering tests in isolation pins the
-// IPC contract before any caller can drift it.
-#[allow(dead_code)]
 pub(crate) fn dispatch_follow_workspace(
     client: &mut dyn NiriClient,
     workspace_id: u64,
@@ -133,12 +178,6 @@ pub(crate) fn dispatch_follow_workspace(
 /// [`WorkspaceReferenceArg::Id`]`(workspace_id)` — never `Index(_)` or
 /// `Name(_)`. See [`dispatch_follow_workspace`] for the focus-drift
 /// rationale.
-//
-// `dead_code` allow: scaffolding helper. The move-window `--follow`
-// caller lights it up once window-id thread-through lands; landing the
-// helper + its ordering tests in isolation pins the IPC contract before
-// any caller can drift it.
-#[allow(dead_code)]
 pub(crate) fn dispatch_follow_workspace_and_window(
     client: &mut dyn NiriClient,
     workspace_id: u64,
@@ -161,11 +200,69 @@ pub(crate) fn dispatch_follow_workspace_and_window(
     Ok(())
 }
 
+/// Switches to the named activity, focuses the destination workspace,
+/// and optionally opens the Overview.
+///
+/// **Contract:**
+/// - `with_overview: false` → two IPC round-trips in strict order:
+///   `Action::SwitchActivity { activity: Name(activity_name) }` then
+///   `Action::FocusWorkspace { reference: Id(workspace_id) }`.
+/// - `with_overview: true` → three round-trips in strict order:
+///   `SwitchActivity` then `FocusWorkspace` then `OpenOverview {}`.
+/// - Ordering rationale: when a workspace belongs to multiple activities
+///   the compositor's deterministic disambiguation may not match the
+///   activity the user picked at the follow stage; switching activities
+///   first scopes the subsequent `FocusWorkspace` to the user's chosen
+///   activity context.
+/// - Every dispatched action expects `Response::Handled`; any other
+///   variant surfaces as `MalformedResponse(WrongVariant)` (exit 65)
+///   via [`send_expect_handled`].
+/// - The `SwitchActivity` step passes `None` for the helper's
+///   `activity_name` parameter so an `"activity not found"` wire reply
+///   routes to `MalformedResponse(Server)` (exit 65), NOT
+///   `ActivityNotFound` (exit 66). The user just saved the workspace
+///   into the activity set picked from; a "not found" reply here is a
+///   compositor contract violation, not a user-input miss. See module
+///   docs for the broader `None` routing rationale.
+/// - Errors are wrapped with per-step `.context(...)` layers
+///   (`"switching to selected activity"`, `"focusing target workspace"`,
+///   `"opening overview after follow"`) so the `{:#}`-formatted chain
+///   discloses which step failed.
+///
+/// **Synthetic-string discipline.** No CLI-internal `Server(_)` carrier
+/// is constructed here: every server-error string surfaced from this
+/// helper comes verbatim from the compositor wire payload via the `None`
+/// routing in [`send_expect_handled`].
+pub(crate) fn dispatch_follow_activity_and_workspace(
+    client: &mut dyn NiriClient,
+    activity_name: &str,
+    workspace_id: u64,
+    with_overview: bool,
+) -> Result<()> {
+    let switch_req = Request::Action(Action::SwitchActivity {
+        activity: ActivityReferenceArg::Name(activity_name.to_owned()),
+    });
+    send_expect_handled(client, switch_req, None).context("switching to selected activity")?;
+
+    let focus_ws_req = Request::Action(Action::FocusWorkspace {
+        reference: WorkspaceReferenceArg::Id(workspace_id),
+    });
+    send_expect_handled(client, focus_ws_req, None).context("focusing target workspace")?;
+
+    if with_overview {
+        let overview_req = Request::Action(Action::OpenOverview {});
+        send_expect_handled(client, overview_req, None).context("opening overview after follow")?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use niri_ipc::{Action, Reply, Request, Response, WorkspaceReferenceArg};
+    use niri_ipc::{Action, ActivityReferenceArg, Reply, Request, Response, WorkspaceReferenceArg};
 
     use super::*;
+    use crate::error::{CliError, MalformedResponseSource};
     use crate::ipc::MockClient;
 
     fn focus_workspace_req(ws_id: u64) -> Request {
@@ -180,6 +277,12 @@ mod tests {
 
     fn open_overview_req() -> Request {
         Request::Action(Action::OpenOverview {})
+    }
+
+    fn switch_activity_req(name: &str) -> Request {
+        Request::Action(Action::SwitchActivity {
+            activity: ActivityReferenceArg::Name(name.to_owned()),
+        })
     }
 
     /// `with_overview: false`: a single `Action::FocusWorkspace`
@@ -229,5 +332,82 @@ mod tests {
         client.expect(open_overview_req(), Reply::Ok(Response::Handled));
         dispatch_follow_workspace_and_window(&mut client, 7, 42, true).expect("happy path");
         client.assert_consumed_in_order();
+    }
+
+    /// `with_overview: false`: `SwitchActivity { Name(_) }` then
+    /// `FocusWorkspace { Id(_) }`, in that strict order. Pins the
+    /// activity-then-workspace ordering rationale for the multi-activity
+    /// workspace disambiguation contract.
+    #[test]
+    fn dispatch_follow_activity_and_workspace_no_overview_emits_switch_then_focus() {
+        let mut client = MockClient::new();
+        client.expect(switch_activity_req("Work"), Reply::Ok(Response::Handled));
+        client.expect(focus_workspace_req(7), Reply::Ok(Response::Handled));
+        dispatch_follow_activity_and_workspace(&mut client, "Work", 7, false).expect("happy path");
+        client.assert_consumed_in_order();
+    }
+
+    /// `with_overview: true`: all three actions in strict order —
+    /// `SwitchActivity` → `FocusWorkspace` → `OpenOverview`. Canonical
+    /// "switch + follow + overview" shape for assign-workspace --follow.
+    #[test]
+    fn dispatch_follow_activity_and_workspace_with_overview_emits_all_three_in_order() {
+        let mut client = MockClient::new();
+        client.expect(switch_activity_req("Work"), Reply::Ok(Response::Handled));
+        client.expect(focus_workspace_req(7), Reply::Ok(Response::Handled));
+        client.expect(open_overview_req(), Reply::Ok(Response::Handled));
+        dispatch_follow_activity_and_workspace(&mut client, "Work", 7, true).expect("happy path");
+        client.assert_consumed_in_order();
+    }
+
+    /// When `SwitchActivity` returns the wire error `"activity not found"`,
+    /// the helper must surface it as `MalformedResponse(Server(_))` (exit
+    /// 65), NOT as `CliError::ActivityNotFound` (exit 66). The user just
+    /// picked this activity from a list of activities the workspace was
+    /// saved into; an unresolvable reference here is a contract violation,
+    /// not user input. Pins the `None` activity-name argument discipline
+    /// at the `send_expect_handled` call site.
+    #[test]
+    fn dispatch_follow_activity_and_workspace_switch_activity_wire_error_routes_to_server() {
+        let mut client = MockClient::new();
+        client.expect(
+            switch_activity_req("Work"),
+            Err("activity not found".to_owned()),
+        );
+        let err = dispatch_follow_activity_and_workspace(&mut client, "Work", 7, false)
+            .expect_err("activity-not-found must surface as error");
+        let cli_err = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<CliError>())
+            .expect("CliError must be in chain");
+        match cli_err {
+            CliError::MalformedResponse(MalformedResponseSource::Server(msg)) => {
+                assert_eq!(msg, "activity not found");
+            }
+            other => {
+                panic!("expected MalformedResponse(Server), NOT ActivityNotFound; got {other:?}",)
+            }
+        }
+        assert_eq!(cli_err.exit_code(), 65);
+        client.assert_consumed_in_order();
+    }
+
+    /// `stay_sentinel` falls back to `STAY_FALLBACK` when one of the rows
+    /// literally equals the unicode form. Mirrors the `sentinel_names`
+    /// collision discipline in `src/move_window.rs`: the helper picks
+    /// between unicode and underscore-fallback purely against the live
+    /// row set, never against a static "what the user might have named
+    /// an activity" guess. Sub-cases pin both the colliding and
+    /// non-colliding branches.
+    #[test]
+    fn follow_picker_stay_sentinel_falls_back_when_activity_named_stay_exists() {
+        // Default happy path: no collision → unicode form.
+        assert_eq!(stay_sentinel(&["Work", "Personal"]), STAY_UNICODE);
+        // Collision against the unicode form → fallback.
+        assert_eq!(stay_sentinel(&["Work", STAY_UNICODE]), STAY_FALLBACK);
+        // Defensive: the underscore-fallback form's presence does NOT
+        // drive another collision substitution. Only the unicode form
+        // can flip the decision.
+        assert_eq!(stay_sentinel(&["Work", STAY_FALLBACK]), STAY_UNICODE);
     }
 }
