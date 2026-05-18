@@ -148,16 +148,34 @@ enum Stage2ResolutionWithNew<'a> {
     Unknown(String),
 }
 
-/// Post-picker resolution for stage 2 when the `« New workspace »`
-/// sentinel is structurally absent from the composed item list
-/// (non-active activity path).
+/// Post-picker resolution for stage 2 on the non-active activity path.
 ///
-/// The absence of a `NewWorkspace` variant here is load-bearing: the
-/// compositor's trailing-empty invariant only applies to the active
-/// activity, so on the non-active path the sentinel was never injected,
-/// and there is no `NewWorkspace` outcome to resolve.
+/// The `« New workspace »` sentinel is **not** injected into the
+/// composed item list on this path (the compositor's trailing-empty
+/// invariant only applies to the active activity), so a real picker
+/// invocation cannot resolve to [`Self::NewWorkspace`] — fuzzel will
+/// never return a row the caller didn't paste in. The variant exists
+/// as type-state scaffolding so the resolver's signature is symmetric
+/// with [`Stage2ResolutionWithNew`] and the dispatch arm is already
+/// wired should a literal-only "new workspace" affordance be added
+/// later. Lighting it up requires the compositor to expose an
+/// `Action::CreateWorkspace` (or equivalent) so the non-active activity
+/// path can mint a landing slot on demand; until that exists the
+/// composer deliberately omits the sentinel on this path.
+///
+/// **Reachability:** in current production code the `NewWorkspace`
+/// arm of [`dispatch_stage2_literal_only`] is statically unreachable.
+/// It routes to `MalformedResponse(Server(_))` rather than
+/// `unreachable!()` so a future regression — composer mistakenly
+/// appending the sentinel, fuzzel echoing a synthesised row — fails
+/// loudly with exit 65 and a diagnostic stderr line, not SIGABRT.
 #[derive(Debug)]
 enum Stage2ResolutionLiteralOnly<'a> {
+    /// Resolver detected the `« New workspace »` sentinel label.
+    /// Currently runtime-unreachable on this path (the composer does
+    /// not inject the sentinel); see the enum docs for why the variant
+    /// exists regardless.
+    NewWorkspace,
     Selected(&'a Workspace),
     Cancelled,
     /// The stage-2 picker returned a label that was not in the items we
@@ -422,9 +440,17 @@ where
     }
 
     let stage2_items = compose_stage2_items_literal_only(&filtered);
+    // Compute the sentinel against the live label set even though the
+    // literal-only composer does not inject it. This keeps the resolver
+    // call shape symmetric with `dispatch_stage2_with_new` and means
+    // the (statically unreachable) `NewWorkspace` arm below is the
+    // single place a regression — composer mistakenly appending the
+    // sentinel, fuzzel synthesising a row — would surface.
+    let labels: Vec<&str> = stage2_items.iter().map(String::as_str).collect();
+    let stage2_sentinel = workspace_sentinel_names(&labels);
 
     let stage2_picked = pick("Move window to workspace:", &stage2_items)?;
-    match resolve_stage2_literal_only(stage2_picked, &filtered) {
+    match resolve_stage2_literal_only(stage2_picked, stage2_sentinel, &filtered) {
         Stage2ResolutionLiteralOnly::Cancelled => Ok(()),
         Stage2ResolutionLiteralOnly::Selected(ws) => dispatch_move(client, ws.id),
         Stage2ResolutionLiteralOnly::Unknown(label) => Err(CliError::MalformedResponse(
@@ -433,6 +459,25 @@ where
             )),
         )
         .into()),
+        // Statically unreachable on the literal-only path: the composer
+        // never appends the sentinel. Routing through
+        // `MalformedResponse(Server)` rather than `unreachable!()` means
+        // a future regression (composer change, fuzzel synthesising a
+        // row, picker contract drift) surfaces as exit 65 with a
+        // diagnostic stderr line, not SIGABRT.
+        //
+        // **Synthetic-string discipline.** The literal
+        // `"stage-2 literal-only path produced new-workspace sentinel"`
+        // is a CLI-internal value — it is **not** emitted on the wire
+        // by the niri compositor. A future grep that audits compositor
+        // wire-string matches must skip this site. Same pattern as
+        // [`focused_workspace`]'s `"no focused workspace"`.
+        Stage2ResolutionLiteralOnly::NewWorkspace => {
+            Err(CliError::MalformedResponse(MalformedResponseSource::Server(
+                "stage-2 literal-only path produced new-workspace sentinel".to_owned(),
+            ))
+            .into())
+        }
     }
 }
 
@@ -686,25 +731,34 @@ fn resolve_stage2_with_new<'a>(
 }
 
 /// Resolves the stage-2 picker outcome on the literal-only path to one
-/// of three branches: cancellation, a literal workspace selection, or
-/// `Unknown` when the stage-2 picker returns a label not in the items we
-/// passed (a picker-side contract violation).
+/// of four branches: cancellation, the `« New workspace »` sentinel,
+/// a literal workspace selection, or `Unknown` when the stage-2 picker
+/// returns a label not in the items we passed (a picker-side contract
+/// violation).
 ///
-/// Takes no `sentinels` argument: on the literal-only path the
-/// `« New workspace »` sentinel is structurally absent from the composed
-/// item list, so no sentinel match needs to fire.
+/// **Signature symmetry.** Takes a `sentinel` argument so it is
+/// shape-compatible with [`resolve_stage2_with_new`]. On the literal-
+/// only path the dispatcher does **not** inject the sentinel into the
+/// item list, so a `Stage2ResolutionLiteralOnly::NewWorkspace` outcome
+/// is statically unreachable in production today — see the enum docs.
+/// The resolver still performs the equality check so a future
+/// regression that does inject the sentinel produces a typed
+/// resolution rather than misrouting to `Unknown`.
 ///
 /// `Unknown(label)` is returned rather than silently folding contract
 /// violations into `Cancelled` so callers can surface the anomaly as
 /// `MalformedResponse`.
 fn resolve_stage2_literal_only<'a>(
     picked: PickerOutcome,
+    sentinel: &str,
     candidates: &'a [&'a Workspace],
 ) -> Stage2ResolutionLiteralOnly<'a> {
     match picked {
         PickerOutcome::Cancelled => Stage2ResolutionLiteralOnly::Cancelled,
         PickerOutcome::Selected(label) => {
-            if let Some(ws) = candidates
+            if label == sentinel {
+                Stage2ResolutionLiteralOnly::NewWorkspace
+            } else if let Some(ws) = candidates
                 .iter()
                 .find(|w| workspace_label(w) == label)
                 .copied()
@@ -1126,10 +1180,13 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_stage2_literal_only_does_not_offer_new_workspace_sentinel_to_picker() {
+    fn dispatch_stage2_literal_only_still_does_not_offer_new_workspace_sentinel_to_picker() {
         // Structural pin: compose_stage2_items_literal_only's output
         // contains neither the unicode sentinel nor the underscore
-        // fallback, even when the workspace labels would collide.
+        // fallback, even when the workspace labels would collide. This
+        // remains true after Stage2ResolutionLiteralOnly grew the
+        // `NewWorkspace` type-state variant — the resolver enum's shape
+        // changed, the composer's contract did not.
         let a = ws(1, 0, false, Some("DP-1"), vec![1], None);
         let b = ws(2, 1, false, Some("DP-1"), vec![1], None);
         let filtered = vec![&a, &b];
@@ -1205,11 +1262,86 @@ mod tests {
         // contract violations to `Unknown(_)` rather than `Cancelled`.
         let a = ws(1, 0, false, Some("DP-1"), vec![1], None);
         let filtered = vec![&a];
+        let sentinel = workspace_sentinel_names(&["idx 0"]);
         let picked = PickerOutcome::Selected("not-a-workspace".into());
-        match resolve_stage2_literal_only(picked, &filtered) {
+        match resolve_stage2_literal_only(picked, sentinel, &filtered) {
             Stage2ResolutionLiteralOnly::Unknown(label) => assert_eq!(label, "not-a-workspace"),
             other => panic!("expected Unknown, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_stage2_literal_only_recognises_new_workspace_sentinel_when_threaded_through_resolver()
+     {
+        // Pins the type-state symmetry: although the literal-only
+        // composer does NOT inject the sentinel, the resolver still
+        // recognises it when handed one. This decouples "composer
+        // omits the sentinel" (current invariant) from "resolver
+        // detects the sentinel" (futureproofing).
+        let a = ws(1, 0, false, Some("DP-1"), vec![1], None);
+        let filtered = vec![&a];
+        let sentinel = workspace_sentinel_names(&["idx 0"]);
+        let picked = PickerOutcome::Selected(sentinel.to_owned());
+        match resolve_stage2_literal_only(picked, sentinel, &filtered) {
+            Stage2ResolutionLiteralOnly::NewWorkspace => {}
+            other => panic!("expected NewWorkspace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_stage2_literal_only_new_workspace_resolver_arm_routes_to_malformed_response_server()
+    {
+        // Pin the defensive guard on the statically-unreachable
+        // `NewWorkspace` arm of `dispatch_stage2_literal_only`. We
+        // drive the dispatcher with a fake picker that synthesises the
+        // sentinel string (simulating the composer-regression or
+        // fuzzel-contract-drift case). The arm must surface as
+        // MalformedResponse(Server(_)) → exit 65, not unreachable!().
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![
+                act(1, "Work", true),
+                act(2, "Personal", false),
+            ])),
+        );
+        client.expect(
+            Request::Workspaces,
+            // Non-active activity 'Personal' has a workspace on the
+            // focused output — drives the literal-only path.
+            Reply::Ok(Response::Workspaces(vec![
+                ws(10, 0, true, Some("DP-1"), vec![1], Some(99)),
+                ws(20, 0, false, Some("DP-1"), vec![2], None),
+            ])),
+        );
+        let pick = |prompt: &str, _items: &[String]| -> Result<PickerOutcome, CliError> {
+            if prompt == "Move window to activity:" {
+                Ok(PickerOutcome::Selected("Personal".into()))
+            } else {
+                // Synthesise the sentinel even though the composer did
+                // not offer it — simulates the regression we're guarding
+                // against.
+                Ok(PickerOutcome::Selected("« New workspace »".into()))
+            }
+        };
+        let err = run_picker(&mut client, pick).expect_err(
+            "synthetic sentinel on literal-only path must surface as MalformedResponse",
+        );
+        let cli_err = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<CliError>())
+            .expect("CliError must be in chain");
+        assert_eq!(cli_err.exit_code(), 65);
+        match cli_err {
+            CliError::MalformedResponse(MalformedResponseSource::Server(msg)) => {
+                assert_eq!(
+                    msg,
+                    "stage-2 literal-only path produced new-workspace sentinel",
+                );
+            }
+            other => panic!("expected MalformedResponse(Server), got {other:?}"),
+        }
+        client.assert_consumed_in_order();
     }
 
     // ---- run (named-arg) ---------------------------------------------------
