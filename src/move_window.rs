@@ -357,8 +357,9 @@ where
 {
     let workspaces = send_expect_workspaces(client).context("requesting workspaces")?;
     let focused_output = focused_output_name(&workspaces)?;
-    let filtered =
+    let mut filtered =
         workspaces_in_activity_on_focused_output(&workspaces, target_activity_id, focused_output);
+    sort_for_picker(&mut filtered);
 
     let workspace_labels: Vec<String> = filtered.iter().map(|w| workspace_label(w)).collect();
     let workspace_label_refs: Vec<&str> = workspace_labels.iter().map(String::as_str).collect();
@@ -409,8 +410,9 @@ where
 {
     let workspaces = send_expect_workspaces(client).context("requesting workspaces")?;
     let focused_output = focused_output_name(&workspaces)?;
-    let filtered =
+    let mut filtered =
         workspaces_in_activity_on_focused_output(&workspaces, target_activity_id, focused_output);
+    sort_for_picker(&mut filtered);
 
     if filtered.is_empty() {
         eprintln!(
@@ -507,7 +509,8 @@ fn current_activity_id(activities: &[Activity]) -> Result<u64, CliError> {
 
 /// Filters `workspaces` to those that belong to `activity_id` and live
 /// on `focused_output`. Compositor-supplied order is preserved (we walk
-/// the slice; no sort).
+/// the slice; no sort). Callers that want a deterministic picker order
+/// run [`sort_for_picker`] on the result before composing labels.
 fn workspaces_in_activity_on_focused_output<'a>(
     workspaces: &'a [Workspace],
     activity_id: u64,
@@ -519,6 +522,25 @@ fn workspaces_in_activity_on_focused_output<'a>(
             w.activities.contains(&activity_id) && w.output.as_deref() == Some(focused_output)
         })
         .collect()
+}
+
+/// Sorts a filtered workspace list into the deterministic order shown to
+/// the user by the stage-2 picker:
+///
+/// 1. Active-activity workspaces first (`is_in_active_activity == true`),
+///    then hidden-activity workspaces.
+/// 2. Within each bucket, ascending `idx` (active rows) / `id` (hidden
+///    rows), with `id` as the final tiebreaker so two hidden rows with
+///    the same nominal `idx` keep a stable order.
+///
+/// `(!is_in_active_activity, idx, id)` is the resulting comparator — the
+/// negated bool sorts `false` (active) before `true` (hidden). Compositor-
+/// supplied order is intentionally NOT preserved: the compositor's snapshot
+/// can interleave hidden and active workspaces in any order, which produces
+/// jumpy picker rows from the user's perspective. A stable, predictable
+/// order is the picker-UX contract.
+fn sort_for_picker(workspaces: &mut Vec<&Workspace>) {
+    workspaces.sort_by_key(|w| (!w.is_in_active_activity, w.idx, w.id));
 }
 
 /// Returns the trailing-empty workspace from `filtered`: the one with
@@ -897,6 +919,61 @@ mod tests {
         assert_eq!(
             filtered.iter().map(|w| w.id).collect::<Vec<_>>(),
             vec![10, 11, 12]
+        );
+    }
+
+    // ---- sort_for_picker ---------------------------------------------------
+
+    #[test]
+    fn sort_for_picker_orders_hidden_workspaces_by_id_ascending() {
+        // Three hidden-activity workspaces with idx 0 (compositor contract).
+        // The picker order must be stable and predictable: ascending by id,
+        // because idx is degenerate for hidden rows.
+        let a = ws_hidden(30, 0, Some("DP-1"), vec![2], None);
+        let b = ws_hidden(10, 0, Some("DP-1"), vec![2], None);
+        let c = ws_hidden(20, 0, Some("DP-1"), vec![2], None);
+        let mut filtered = vec![&a, &b, &c];
+        sort_for_picker(&mut filtered);
+        assert_eq!(
+            filtered.iter().map(|w| w.id).collect::<Vec<_>>(),
+            vec![10, 20, 30],
+        );
+    }
+
+    #[test]
+    fn sort_for_picker_orders_active_workspaces_by_idx_ascending() {
+        // Active-activity workspaces sort by idx, with id as the final
+        // tiebreaker. Compositor-supplied order is NOT preserved.
+        let mut a = ws(100, 2, false, Some("DP-1"), vec![1], None);
+        a.is_in_active_activity = true;
+        let mut b = ws(101, 0, false, Some("DP-1"), vec![1], None);
+        b.is_in_active_activity = true;
+        let mut c = ws(102, 1, false, Some("DP-1"), vec![1], None);
+        c.is_in_active_activity = true;
+        let mut filtered = vec![&a, &b, &c];
+        sort_for_picker(&mut filtered);
+        assert_eq!(
+            filtered.iter().map(|w| w.idx).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+        );
+    }
+
+    #[test]
+    fn sort_for_picker_active_workspaces_sort_before_hidden_workspaces() {
+        // Mixed fixture: one active-activity workspace with a high idx (99)
+        // and one hidden-activity workspace with a low id (0). Active must
+        // land first regardless of idx/id ordering — the bucket boundary is
+        // `!is_in_active_activity`, which sorts `false` (active) before
+        // `true` (hidden).
+        let mut active = ws(50, 99, false, Some("DP-1"), vec![1], None);
+        active.is_in_active_activity = true;
+        let hidden = ws_hidden(0, 0, Some("DP-1"), vec![2], None);
+        let mut filtered = vec![&hidden, &active];
+        sort_for_picker(&mut filtered);
+        assert_eq!(
+            filtered.iter().map(|w| w.id).collect::<Vec<_>>(),
+            vec![50, 0],
+            "active bucket must precede hidden bucket regardless of idx/id values",
         );
     }
 
