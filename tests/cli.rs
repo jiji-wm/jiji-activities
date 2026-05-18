@@ -542,6 +542,6 @@ fn move_window_named_prints_confirmation_to_stderr_on_success() {
         .env("NIRI_SOCKET", &sock)
         .assert()
         .success()
-        .stderr(contains("moved window"))
+        .stderr(contains("moved focused window"))
         .stderr(contains("'Personal'"));
 }

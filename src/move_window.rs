@@ -254,7 +254,6 @@ pub(crate) fn run(client: &mut dyn NiriClient, activity_name: &str) -> Result<()
     let activity_id = activity.id;
 
     let workspaces = send_expect_workspaces(client).context("requesting workspaces")?;
-    let focused_window = focused_window_id(&workspaces);
     let focused_output = focused_output_name(&workspaces)?;
     let filtered =
         workspaces_in_activity_on_focused_output(&workspaces, activity_id, focused_output);
@@ -273,9 +272,7 @@ pub(crate) fn run(client: &mut dyn NiriClient, activity_name: &str) -> Result<()
     };
     let ws_id = ws.id;
     dispatch_move(client, ws_id)?;
-    if let Some(wid) = focused_window {
-        print_move_confirmation(wid, ws_id, activity_name);
-    }
+    print_move_confirmation(ws_id, activity_name);
     Ok(())
 }
 
@@ -510,7 +507,6 @@ where
     F: FnOnce(&str, &[String]) -> Result<PickerOutcome, CliError>,
 {
     let workspaces = send_expect_workspaces(client).context("requesting workspaces")?;
-    let focused_window = focused_window_id(&workspaces);
     let focused_output = focused_output_name(&workspaces)?;
     let mut filtered =
         workspaces_in_activity_on_focused_output(&workspaces, target_activity_id, focused_output);
@@ -527,9 +523,7 @@ where
         Stage2ResolutionWithNew::Selected(ws) => {
             let ws_id = ws.id;
             dispatch_move(client, ws_id)?;
-            if let Some(wid) = focused_window {
-                print_move_confirmation(wid, ws_id, target_activity_name);
-            }
+            print_move_confirmation(ws_id, target_activity_name);
             Ok(())
         }
         Stage2ResolutionWithNew::Unknown(label) => Err(CliError::MalformedResponse(
@@ -547,9 +541,7 @@ where
             };
             let ws_id = ws.id;
             dispatch_move(client, ws_id)?;
-            if let Some(wid) = focused_window {
-                print_move_confirmation(wid, ws_id, target_activity_name);
-            }
+            print_move_confirmation(ws_id, target_activity_name);
             Ok(())
         }
     }
@@ -576,7 +568,6 @@ where
     F: FnOnce(&str, &[String]) -> Result<PickerOutcome, CliError>,
 {
     let workspaces = send_expect_workspaces(client).context("requesting workspaces")?;
-    let focused_window = focused_window_id(&workspaces);
     let focused_output = focused_output_name(&workspaces)?;
     let mut filtered =
         workspaces_in_activity_on_focused_output(&workspaces, target_activity_id, focused_output);
@@ -605,9 +596,7 @@ where
         Stage2ResolutionLiteralOnly::Selected(ws) => {
             let ws_id = ws.id;
             dispatch_move(client, ws_id)?;
-            if let Some(wid) = focused_window {
-                print_move_confirmation(wid, ws_id, target_activity_name);
-            }
+            print_move_confirmation(ws_id, target_activity_name);
             Ok(())
         }
         Stage2ResolutionLiteralOnly::Unknown(label) => Err(CliError::MalformedResponse(
@@ -657,27 +646,24 @@ fn dispatch_move(client: &mut dyn NiriClient, ws_id: u64) -> Result<()> {
 /// successful `MoveWindowToWorkspace` dispatch. Pure helper so the line
 /// shape is unit-testable.
 ///
-/// Includes the window id, workspace id, and activity name. Activity
-/// id is intentionally omitted — the name is the user-visible handle
-/// and stays stable across reconnects, where the id is internal.
-fn format_move_confirmation(window_id: u64, ws_id: u64, activity_name: &str) -> String {
+/// The window id is intentionally omitted: `dispatch_move` uses
+/// `window_id: None` (operates on the focused window), so there is a
+/// snapshot-vs-dispatch race between the `Workspaces` snapshot read and
+/// the compositor processing the action. The user knows visually which
+/// window moved; the workspace id and activity name are sufficient to
+/// confirm the destination.
+fn format_move_confirmation(ws_id: u64, activity_name: &str) -> String {
     format!(
-        "niri-activities: moved window {window_id} to workspace {ws_id} in activity '{activity_name}'"
+        "niri-activities: moved focused window to workspace {ws_id} in activity '{activity_name}'"
     )
 }
 
 /// Writes [`format_move_confirmation`]'s output to stderr.
 ///
-/// **Best-effort UX:** called only after `dispatch_move` succeeds, and
-/// only when the focused window id was known at dispatch time. If the
-/// focused workspace had no `active_window_id` (compositor invariant
-/// violation, or the focused workspace genuinely had no window — which
-/// would have failed dispatch anyway), the call site skips this print.
-fn print_move_confirmation(window_id: u64, ws_id: u64, activity_name: &str) {
-    eprintln!(
-        "{}",
-        format_move_confirmation(window_id, ws_id, activity_name)
-    );
+/// Called on every successful `dispatch_move`. Always prints; no
+/// None-skip path.
+fn print_move_confirmation(ws_id: u64, activity_name: &str) {
+    eprintln!("{}", format_move_confirmation(ws_id, activity_name));
 }
 
 // ---- Pure helpers ----------------------------------------------------------
@@ -713,22 +699,6 @@ fn focused_output_name(workspaces: &[Workspace]) -> Result<&str, CliError> {
             "focused workspace has no output".to_owned(),
         ))
     })
-}
-
-/// Returns the focused window's id (the `active_window_id` field of
-/// the focused workspace), or `None` if there is no focused workspace
-/// or it has no active window.
-///
-/// **Best-effort accessor** — the print of [`print_move_confirmation`]
-/// is a UX nicety after a successful dispatch, so an unknown window id
-/// at print time produces a silent skip rather than an error. Real
-/// invariant violations on the move path are surfaced by
-/// [`focused_workspace`] / [`focused_output_name`] before dispatch.
-fn focused_window_id(workspaces: &[Workspace]) -> Option<u64> {
-    workspaces
-        .iter()
-        .find(|w| w.is_focused)
-        .and_then(|w| w.active_window_id)
 }
 
 /// Returns a reference to the currently-active activity, or
@@ -1141,34 +1111,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn focused_window_id_returns_none_when_no_focused_workspace() {
-        // No workspace has is_focused=true → focused_window_id returns None
-        // (best-effort accessor, no error). This pins that the function does
-        // not panic on an empty or unfocused snapshot.
-        let workspaces = vec![
-            ws(1, 0, false, Some("DP-1"), vec![1], Some(42)),
-            ws(2, 1, false, Some("DP-1"), vec![1], Some(77)),
-        ];
-        assert_eq!(focused_window_id(&workspaces), None);
-    }
-
-    #[test]
-    fn focused_window_id_returns_none_when_focused_workspace_has_no_active_window() {
-        // Focused workspace exists but has no active_window_id → None.
-        let workspaces = vec![ws(1, 0, true, Some("DP-1"), vec![1], None)];
-        assert_eq!(focused_window_id(&workspaces), None);
-    }
-
-    #[test]
-    fn focused_window_id_returns_active_window_id_of_focused_workspace() {
-        let workspaces = vec![
-            ws(1, 0, false, Some("DP-1"), vec![1], Some(99)),
-            ws(2, 1, true, Some("DP-1"), vec![1], Some(42)),
-        ];
-        assert_eq!(focused_window_id(&workspaces), Some(42));
-    }
-
     // ---- current_activity --------------------------------------------------
 
     #[test]
@@ -1285,14 +1227,15 @@ mod tests {
     // ---- format_move_confirmation ------------------------------------------
 
     #[test]
-    fn format_move_confirmation_renders_window_workspace_activity() {
-        // Pins the exact stderr format. All three identifiers are
-        // present; the activity name is single-quoted so whitespace-
-        // bearing names stay legible.
-        let line = format_move_confirmation(42, 7, "Personal");
+    fn format_move_confirmation_renders_workspace_activity() {
+        // Pins the exact stderr format. The window id is intentionally
+        // absent (snapshot-vs-dispatch race; dispatch uses window_id: None).
+        // The activity name is single-quoted so whitespace-bearing names
+        // stay legible.
+        let line = format_move_confirmation(7, "Personal");
         assert_eq!(
             line,
-            "niri-activities: moved window 42 to workspace 7 in activity 'Personal'",
+            "niri-activities: moved focused window to workspace 7 in activity 'Personal'",
         );
     }
 
