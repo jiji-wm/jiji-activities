@@ -2459,6 +2459,186 @@ mod tests {
         client.assert_consumed_in_order();
     }
 
+    /// Pins: the AlreadyCurrent arm body itself does not invoke the follow
+    /// picker (eager short-circuit; no move is ever dispatched).
+    #[test]
+    fn dispatch_stage2_with_new_already_current_with_follow_does_not_spawn_follow_picker() {
+        // Mirrors dispatch_stage2_with_new_already_current_emits_breadcrumb_and_no_move
+        // with follow: true. The composite pick closure routes by prompt:
+        // Stage 1 → return Selected("Work"); Stage 2 → return the (current)
+        // row; Follow → panic (must never fire).
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![act(1, "Work", true)])),
+        );
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![
+                ws(10, 0, true, Some("DP-1"), vec![1], Some(99)),
+                ws(20, 1, false, Some("DP-1"), vec![1], None),
+            ])),
+        );
+        // No move_req expectation — the dispatcher must short-circuit on AlreadyCurrent.
+        let pick = |prompt: &str, items: &[String]| -> Result<PickerOutcome, CliError> {
+            if prompt == "Move window to activity:" {
+                Ok(PickerOutcome::Selected("Work".into()))
+            } else if prompt == "Move window to workspace:" {
+                let current_row = items
+                    .iter()
+                    .find(|s| s.contains("(current)"))
+                    .expect("(current) row must be present")
+                    .clone();
+                Ok(PickerOutcome::Selected(current_row))
+            } else {
+                panic!("follow picker must NOT spawn when move resolved to AlreadyCurrent");
+            }
+        };
+        run_picker(&mut client, pick, no_new_activity_prompt, true, false)
+            .expect("AlreadyCurrent must exit Ok");
+        client.assert_consumed_in_order();
+    }
+
+    /// Pins: the AlreadyCurrent arm body itself does not invoke the follow
+    /// picker on the literal-only (non-active activity) path (eager
+    /// short-circuit; no move is ever dispatched).
+    #[test]
+    fn dispatch_stage2_literal_only_already_current_with_follow_does_not_spawn_follow_picker() {
+        // Mirrors dispatch_stage2_literal_only_already_current_emits_breadcrumb_and_no_move
+        // with follow: true. The composite pick closure routes by prompt:
+        // Stage 1 → return Selected("Personal"); Stage 2 → return the
+        // (current) row; Follow → panic (must never fire).
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![
+                act(1, "Work", true),
+                act(2, "Personal", false),
+            ])),
+        );
+        let mut focused_ws = ws(10, 0, true, Some("DP-1"), vec![2], Some(99));
+        focused_ws.is_in_active_activity = false;
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![focused_ws])),
+        );
+        // No move_req expectation — the dispatcher must short-circuit on AlreadyCurrent.
+        let pick = |prompt: &str, items: &[String]| -> Result<PickerOutcome, CliError> {
+            if prompt == "Move window to activity:" {
+                Ok(PickerOutcome::Selected("Personal".into()))
+            } else if prompt == "Move window to workspace:" {
+                let current_row = items
+                    .iter()
+                    .find(|s| s.contains("(current)"))
+                    .expect("(current) row must be present")
+                    .clone();
+                Ok(PickerOutcome::Selected(current_row))
+            } else {
+                panic!("follow picker must NOT spawn when move resolved to AlreadyCurrent");
+            }
+        };
+        run_picker(&mut client, pick, no_new_activity_prompt, true, false)
+            .expect("AlreadyCurrent must exit Ok");
+        client.assert_consumed_in_order();
+    }
+
+    /// Pins: the Selected arm's `if follow && was_handled` gate short-circuits
+    /// when `handle_move_outcome` returns `Ok(false)` for `was_handled` on the
+    /// `with_new` path (wire `Response::NoOp(AlreadyOnTarget)`).
+    #[test]
+    fn dispatch_stage2_with_new_no_op_already_on_target_with_follow_does_not_spawn_follow_picker() {
+        // Mirrors dispatch_stage2_with_new_handles_response_no_op_already_on_target
+        // with follow: true. The move IS dispatched (non-(current) row
+        // selected) but the compositor replies NoOp, so was_handled = false
+        // and the follow picker must not fire.
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![act(1, "Work", true)])),
+        );
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![
+                ws(10, 0, true, Some("DP-1"), vec![1], Some(99)),
+                ws(20, 1, false, Some("DP-1"), vec![1], None),
+            ])),
+        );
+        // With follow: true the captured active_window_id (99) threads into
+        // the move request as window_id: Some(99).
+        client.expect(
+            move_req_with_window(20, 99),
+            Reply::Ok(Response::NoOp(NoOpReason::AlreadyOnTarget {
+                workspace_id: 20,
+            })),
+        );
+        // No FocusWorkspace/FocusWindow expectation — follow picker must not fire.
+        let pick = |prompt: &str, items: &[String]| -> Result<PickerOutcome, CliError> {
+            if prompt == "Move window to activity:" {
+                Ok(PickerOutcome::Selected("Work".into()))
+            } else if prompt == "Move window to workspace:" {
+                assert_eq!(items[0], "idx 0 (current)");
+                Ok(PickerOutcome::Selected(items[1].clone()))
+            } else {
+                panic!(
+                    "follow picker must NOT spawn when handle_move_outcome returns was_handled=false"
+                );
+            }
+        };
+        run_picker(&mut client, pick, no_new_activity_prompt, true, false)
+            .expect("NoOp reply must exit Ok");
+        client.assert_consumed_in_order();
+    }
+
+    /// Pins: the Selected arm's `if follow && was_handled` gate short-circuits
+    /// when `handle_move_outcome` returns `Ok(false)` for `was_handled` on the
+    /// literal-only path (wire `Response::NoOp(AlreadyOnTarget)`).
+    #[test]
+    fn dispatch_stage2_literal_only_no_op_already_on_target_with_follow_does_not_spawn_follow_picker()
+     {
+        // Mirrors dispatch_stage2_literal_only_handles_response_no_op_already_on_target
+        // with follow: true. The move IS dispatched but the compositor replies
+        // NoOp, so was_handled = false and the follow picker must not fire.
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![
+                act(1, "Work", true),
+                act(2, "Personal", false),
+            ])),
+        );
+        let mut focused_ws = ws(10, 0, true, Some("DP-1"), vec![2], Some(99));
+        focused_ws.is_in_active_activity = false;
+        let other_ws = ws_hidden(20, 1, Some("DP-1"), vec![2], None);
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![focused_ws, other_ws])),
+        );
+        // With follow: true the captured active_window_id (99) threads into
+        // the move request as window_id: Some(99).
+        client.expect(
+            move_req_with_window(20, 99),
+            Reply::Ok(Response::NoOp(NoOpReason::AlreadyOnTarget {
+                workspace_id: 20,
+            })),
+        );
+        // No FocusWorkspace/FocusWindow expectation — follow picker must not fire.
+        let pick = |prompt: &str, items: &[String]| -> Result<PickerOutcome, CliError> {
+            if prompt == "Move window to activity:" {
+                Ok(PickerOutcome::Selected("Personal".into()))
+            } else if prompt == "Move window to workspace:" {
+                assert_eq!(items[0], "id 10 (current)");
+                Ok(PickerOutcome::Selected(items[1].clone()))
+            } else {
+                panic!(
+                    "follow picker must NOT spawn when handle_move_outcome returns was_handled=false"
+                );
+            }
+        };
+        run_picker(&mut client, pick, no_new_activity_prompt, true, false)
+            .expect("NoOp reply must exit Ok");
+        client.assert_consumed_in_order();
+    }
+
     #[test]
     fn handle_move_outcome_no_op_payload_id_diverges_uses_payload_id_label() {
         // Regression pin for the payload_id != ws_id divergence case.
