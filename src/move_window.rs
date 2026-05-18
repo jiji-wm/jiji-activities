@@ -3546,4 +3546,134 @@ mod tests {
         run_here_picker(&mut client, pick, true, false).expect("--follow stage 2 succeeds");
         client.assert_consumed_in_order();
     }
+
+    #[test]
+    fn run_picker_with_follow_threads_window_id_through_literal_only_stage2() {
+        // Pin the `run_picker` → `Stage1Resolution::Selected { is_active:
+        // false }` → `dispatch_stage2_literal_only` path under `follow: true`.
+        // The user-facing entry-point arm (non-active activity literal-only
+        // dispatch) was previously exercised only with `follow: false`; a
+        // regression that drops the `follow` parameter on this branch would
+        // not surface without this test.
+        //
+        // Fixture: Work (active, id 1), Personal (non-active, id 2).
+        // Focused workspace id 10 in Work has active_window_id 99.
+        // Personal has one non-focused workspace (id 20) on DP-1 — the
+        // literal-only path is selected, and dispatch must carry
+        // `window_id: Some(99)`.
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![
+                act(1, "Work", true),
+                act(2, "Personal", false),
+            ])),
+        );
+        let mut personal_ws = ws(20, 0, false, Some("DP-1"), vec![2], None);
+        personal_ws.is_in_active_activity = false;
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![
+                ws(10, 0, true, Some("DP-1"), vec![1], Some(99)),
+                personal_ws,
+            ])),
+        );
+        client.expect(move_req_with_window(20, 99), Reply::Ok(Response::Handled));
+
+        let pick = |prompt: &str, items: &[String]| -> Result<PickerOutcome, CliError> {
+            if prompt == "Move window to activity:" {
+                Ok(PickerOutcome::Selected("Personal".into()))
+            } else {
+                // Stage 2, literal-only path: no « New workspace » sentinel.
+                // Pick the single Personal workspace (id 20, label "id 20").
+                assert!(
+                    items.iter().all(|s| s != "« New workspace »"),
+                    "literal-only path must not offer « New workspace »; items: {items:?}",
+                );
+                Ok(PickerOutcome::Selected(items[0].clone()))
+            }
+        };
+        run_picker(&mut client, pick, no_new_activity_prompt, true, false)
+            .expect("--follow literal-only stage 2 succeeds");
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn dispatch_stage2_with_new_new_workspace_arm_with_follow_threads_captured_window_id() {
+        // Pin the `dispatch_stage2_with_new::NewWorkspace` arm (line
+        // 736-737 in the original) under `--follow: true`. The user picks
+        // `« New workspace »`; the dispatched `MoveWindowToWorkspace` must
+        // carry `window_id: Some(99)` (the focused-window id captured from
+        // the snapshot). Drives via `run_here_picker` so the with-new path
+        // is guaranteed without constructing the full stage-1 picker chain.
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![act(1, "Work", true)])),
+        );
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![
+                // Focused workspace (id 10) with active window 99.
+                ws(10, 0, true, Some("DP-1"), vec![1], Some(99)),
+                // Trailing-empty workspace (id 20) — what « New workspace » resolves to.
+                ws(20, 1, false, Some("DP-1"), vec![1], None),
+            ])),
+        );
+        client.expect(move_req_with_window(20, 99), Reply::Ok(Response::Handled));
+
+        let pick = |_prompt: &str, _items: &[String]| -> Result<PickerOutcome, CliError> {
+            Ok(PickerOutcome::Selected("« New workspace »".into()))
+        };
+        run_here_picker(&mut client, pick, true, false)
+            .expect("--follow new-workspace arm succeeds");
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn run_with_follow_no_focused_workspace_exits_65_before_capture() {
+        // Ordering invariant: `focused_output_name?` fires before
+        // `decide_window_id_for_dispatch`, so a Workspaces snapshot with no
+        // focused workspace must surface as
+        // `MalformedResponse(Server("no focused workspace"))` exit 65
+        // regardless of whether `--follow` is set. The synthetic error must
+        // NOT be swallowed by the capture fallback path (which only fires
+        // when `focused_workspace` succeeds but the focused workspace has no
+        // active window).
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![
+                act(1, "Work", true),
+                act(2, "Personal", false),
+            ])),
+        );
+        // No focused workspace in the snapshot.
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![
+                ws(10, 0, false, Some("DP-1"), vec![1], Some(99)),
+                ws(20, 0, false, Some("DP-1"), vec![2], None),
+            ])),
+        );
+        let err = run(&mut client, "Personal", true, false)
+            .expect_err("no focused workspace must fail with exit 65");
+        let cli_err = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<CliError>())
+            .expect("CliError must be in chain");
+        assert_eq!(cli_err.exit_code(), 65);
+        match cli_err {
+            CliError::MalformedResponse(MalformedResponseSource::Server(msg)) => {
+                assert_eq!(
+                    msg.as_str(),
+                    "no focused workspace",
+                    "synthetic error string must be exact; got: {msg}",
+                );
+            }
+            other => panic!("expected MalformedResponse(Server), got {other:?}"),
+        }
+        // No MoveWindowToWorkspace must have been dispatched.
+        client.assert_consumed_in_order();
+    }
 }
