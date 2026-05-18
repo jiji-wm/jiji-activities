@@ -409,7 +409,8 @@ fn completions_fish_emits_clap_complete_base_and_dynamic_lines() {
     // Pins both halves of the fish completion output:
     //   1. clap_complete base (anchored by `complete -c niri-activities`)
     //   2. dynamic activity-name augmentation (anchored by the comment
-    //      header and the `__fish_seen_subcommand_from switch` line).
+    //      header, the `__niri_activities_no_positional_yet` helper
+    //      definition, and the position-aware condition for `switch`).
     // A regression in either half — clap_complete dropped, or the fish
     // branch in completions::run lost the augmentation — fails here.
     let assert = Command::cargo_bin(BIN)
@@ -423,12 +424,19 @@ fn completions_fish_emits_clap_complete_base_and_dynamic_lines() {
         "fish completion output missing clap_complete base:\n{out}",
     );
     assert!(
-        out.contains("# Dynamic activity-name completion."),
+        out.contains("# Dynamic activity-name completion"),
         "fish completion output missing dynamic-section header:\n{out}",
     );
     assert!(
-        out.contains("__fish_seen_subcommand_from switch\""),
-        "fish completion output missing dynamic line for `switch`:\n{out}",
+        out.contains("function __niri_activities_no_positional_yet"),
+        "fish completion output missing position-guard helper:\n{out}",
+    );
+    assert!(
+        out.contains(
+            "__fish_niri_activities_using_subcommand switch; \
+             and __niri_activities_no_positional_yet"
+        ),
+        "fish completion output missing position-aware condition for `switch`:\n{out}",
     );
     assert!(
         out.contains("(niri-activities list --format=name 2>/dev/null)"),
