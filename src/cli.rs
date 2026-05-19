@@ -26,7 +26,7 @@ use crate::switch_previous;
 /// directly; everything else routes through [`Cmd`] and `dispatch`.
 #[derive(Debug, Parser)]
 #[command(
-    name = "niri-activities",
+    name = "jiji-activities",
     version,
     about = "KDE-style Activities for the niri Wayland compositor."
 )]

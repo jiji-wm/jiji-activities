@@ -135,7 +135,7 @@ const UNICODE_CURRENT_ACTIVITY: &str = "« Current activity »";
 /// Stage-1 sentinel fallback used iff any activity name collides with
 /// the unicode form. Selected by [`sentinel_names`] per picker invocation
 /// against the live activity name set.
-const FALLBACK_CURRENT_ACTIVITY: &str = "__niri_activities_current_activity__";
+const FALLBACK_CURRENT_ACTIVITY: &str = "__jiji_activities_current_activity__";
 
 /// Stage-1 sentinel (preferred unicode form): the `« New activity »`
 /// row that prompts the user for a name, creates the activity over IPC,
@@ -144,7 +144,7 @@ const UNICODE_NEW_ACTIVITY: &str = "« New activity »";
 
 /// Stage-1 sentinel fallback used iff any activity name collides with
 /// the unicode form for the new-activity row. Selected by [`sentinel_names`].
-const FALLBACK_NEW_ACTIVITY: &str = "__niri_activities_new_activity__";
+const FALLBACK_NEW_ACTIVITY: &str = "__jiji_activities_new_activity__";
 
 /// Stage-2 sentinel (preferred unicode form): the `« New workspace »`
 /// row that resolves to the active activity's trailing-empty workspace.
@@ -153,7 +153,7 @@ const UNICODE_NEW_WORKSPACE: &str = "« New workspace »";
 /// Stage-2 sentinel fallback used iff any workspace label collides with
 /// the unicode form. Selected by [`workspace_sentinel_names`] per picker
 /// invocation against the live workspace label set.
-const FALLBACK_NEW_WORKSPACE: &str = "__niri_activities_new_workspace__";
+const FALLBACK_NEW_WORKSPACE: &str = "__jiji_activities_new_workspace__";
 
 /// Stage-1 sentinel pair produced by [`sentinel_names`] for a given
 /// activity-name slice. Both fields are CLI-internal `&'static str`s —
@@ -334,13 +334,13 @@ where
 
     if filtered.is_empty() {
         eprintln!(
-            "niri-activities: activity '{activity_name}' has no workspaces on the focused output; nothing to move window to"
+            "jiji-activities: activity '{activity_name}' has no workspaces on the focused output; nothing to move window to"
         );
         return Ok(());
     }
     let Some(ws) = trailing_empty_workspace(&filtered) else {
         eprintln!(
-            "niri-activities: activity '{activity_name}' has no empty workspaces on the focused output; create one or pick an existing workspace via `move-window` (no arg)"
+            "jiji-activities: activity '{activity_name}' has no empty workspaces on the focused output; create one or pick an existing workspace via `move-window` (no arg)"
         );
         return Ok(());
     };
@@ -414,7 +414,7 @@ fn handle_move_outcome(
         }) => {
             if payload_id != ws_id {
                 eprintln!(
-                    "niri-activities: warning: compositor reported AlreadyOnTarget for ws {payload_id} but we dispatched against ws {ws_id}"
+                    "jiji-activities: warning: compositor reported AlreadyOnTarget for ws {payload_id} but we dispatched against ws {ws_id}"
                 );
             }
             print_already_current_breadcrumb(payload_id, workspaces);
@@ -524,7 +524,7 @@ fn format_already_current_breadcrumb(ws_id: u64, workspaces: &[Workspace]) -> St
         .find(|w| w.id == ws_id)
         .map(workspace_label)
         .unwrap_or_else(|| format!("id {ws_id}"));
-    format!("niri-activities: focused window is already in workspace {label}; nothing to move")
+    format!("jiji-activities: focused window is already in workspace {label}; nothing to move")
 }
 
 /// Prints the breadcrumb returned by [`format_already_current_breadcrumb`].
@@ -588,7 +588,7 @@ where
 {
     let activities = send_expect_activities(client).context("requesting activities")?;
     if activities.is_empty() {
-        eprintln!("niri-activities: no activities configured; nothing to move window to");
+        eprintln!("jiji-activities: no activities configured; nothing to move window to");
         return Ok(());
     }
 
@@ -995,7 +995,7 @@ where
 
     if filtered.is_empty() {
         eprintln!(
-            "niri-activities: activity '{target_activity_name}' has no workspaces on the focused output; nothing to move window to"
+            "jiji-activities: activity '{target_activity_name}' has no workspaces on the focused output; nothing to move window to"
         );
         return Ok(());
     }
@@ -1163,7 +1163,7 @@ fn decide_window_id_for_dispatch(follow: bool, workspaces: &[Workspace]) -> Opti
     let captured = capture_focused_window_id(workspaces);
     if captured.is_none() {
         eprintln!(
-            "niri-activities: --follow set but no focused window to capture; \
+            "jiji-activities: --follow set but no focused window to capture; \
              dispatching move with compositor-resolved window (no window-id \
              refocus will fire after follow)"
         );
@@ -1191,7 +1191,7 @@ fn decide_window_id_for_dispatch(follow: bool, workspaces: &[Workspace]) -> Opti
 /// is rendered exactly once, by this helper.
 fn format_move_confirmation(ws_id: u64, activity_name: &str) -> String {
     format!(
-        "niri-activities: moved focused window to workspace {ws_id} in activity '{activity_name}'"
+        "jiji-activities: moved focused window to workspace {ws_id} in activity '{activity_name}'"
     )
 }
 
@@ -1956,7 +1956,7 @@ mod tests {
         let line = format_move_confirmation(7, "Personal");
         assert_eq!(
             line,
-            "niri-activities: moved focused window to workspace 7 in activity 'Personal'",
+            "jiji-activities: moved focused window to workspace 7 in activity 'Personal'",
         );
     }
 
@@ -2046,7 +2046,7 @@ mod tests {
         // still uses its unicode form.
         let names = vec!["Work", "« Current activity »"];
         let s = sentinel_names(&names);
-        assert_eq!(s.current, "__niri_activities_current_activity__");
+        assert_eq!(s.current, "__jiji_activities_current_activity__");
         assert_eq!(s.new_activity, "« New activity »");
     }
 
@@ -2058,7 +2058,7 @@ mod tests {
         let names = vec!["Work", "« New activity »"];
         let s = sentinel_names(&names);
         assert_eq!(s.current, "« Current activity »");
-        assert_eq!(s.new_activity, "__niri_activities_new_activity__");
+        assert_eq!(s.new_activity, "__jiji_activities_new_activity__");
     }
 
     #[test]
@@ -2072,7 +2072,7 @@ mod tests {
     fn workspace_sentinel_names_collision_with_new_workspace_uses_underscore_fallback() {
         let labels = vec!["ws-1", "« New workspace »"];
         let s = workspace_sentinel_names(&labels);
-        assert_eq!(s, "__niri_activities_new_workspace__");
+        assert_eq!(s, "__jiji_activities_new_workspace__");
     }
 
     // ---- compose_stage1_items / compose_stage2_items_{with_new,literal_only} -
@@ -2139,7 +2139,7 @@ mod tests {
         assert!(
             items
                 .iter()
-                .all(|s| s != "__niri_activities_new_workspace__")
+                .all(|s| s != "__jiji_activities_new_workspace__")
         );
         assert_eq!(items.len(), 1);
     }
@@ -2160,7 +2160,7 @@ mod tests {
         assert!(
             items
                 .iter()
-                .all(|s| s != "__niri_activities_new_workspace__")
+                .all(|s| s != "__jiji_activities_new_workspace__")
         );
     }
 
@@ -2852,8 +2852,8 @@ mod tests {
         // Force the underscore fallback for `current` by passing a
         // colliding name.
         let sentinels = sentinel_names(&["« Current activity »"]);
-        assert_eq!(sentinels.current, "__niri_activities_current_activity__");
-        let picked = PickerOutcome::Selected("__niri_activities_current_activity__".into());
+        assert_eq!(sentinels.current, "__jiji_activities_current_activity__");
+        let picked = PickerOutcome::Selected("__jiji_activities_current_activity__".into());
         match resolve_stage1(picked, &sentinels, &acts) {
             Stage1Resolution::CurrentActivity => {}
             other => panic!("expected CurrentActivity, got {other:?}"),
@@ -2878,8 +2878,8 @@ mod tests {
         let filtered = vec![&a];
         // Force the underscore fallback by passing a colliding label.
         let sentinel = workspace_sentinel_names(&["« New workspace »"]);
-        assert_eq!(sentinel, "__niri_activities_new_workspace__");
-        let picked = PickerOutcome::Selected("__niri_activities_new_workspace__".into());
+        assert_eq!(sentinel, "__jiji_activities_new_workspace__");
+        let picked = PickerOutcome::Selected("__jiji_activities_new_workspace__".into());
         match resolve_stage2_with_new(picked, sentinel, &filtered, None, 1, &HashMap::new()) {
             Stage2ResolutionWithNew::NewWorkspace => {}
             other => panic!("expected NewWorkspace, got {other:?}"),

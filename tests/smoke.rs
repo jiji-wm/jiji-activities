@@ -25,8 +25,8 @@
 //! **Stranded activity recovery.** If a test panics before its cleanup guard
 //! runs (or cleanup itself fails), runtime activities with the
 //! `__nact_smoke_` prefix remain in the compositor. Inspect via
-//! `niri-activities list | grep __nact_smoke` and remove manually with
-//! `niri-activities remove <name>`. They do not persist across a compositor
+//! `jiji-activities list | grep __nact_smoke` and remove manually with
+//! `jiji-activities remove <name>`. They do not persist across a compositor
 //! restart (runtime activities by construction).
 
 use std::process::Command as StdCommand;
@@ -35,7 +35,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use assert_cmd::Command;
 use serde_json::Value;
 
-const BIN: &str = "niri-activities";
+const BIN: &str = "jiji-activities";
 const SMOKE_PREFIX: &str = "__nact_smoke_";
 
 /// Returns `Some(socket)` if the live-niri precondition holds, `None`
@@ -116,7 +116,7 @@ fn niri_msg(socket: &str, args: &[&str]) -> Value {
     })
 }
 
-/// Build an `assert_cmd::Command` for the test-compiled `niri-activities`
+/// Build an `assert_cmd::Command` for the test-compiled `jiji-activities`
 /// binary with `$NIRI_SOCKET` pre-populated.
 ///
 /// `assert_cmd::Command` does not strip env by default, but inheriting
@@ -124,7 +124,7 @@ fn niri_msg(socket: &str, args: &[&str]) -> Value {
 /// the same compositor the test helper queries — even if future
 /// versions of `assert_cmd` change defaults.
 fn nact(socket: &str) -> Command {
-    let mut c = Command::cargo_bin(BIN).expect("locate niri-activities binary");
+    let mut c = Command::cargo_bin(BIN).expect("locate jiji-activities binary");
     c.env("NIRI_SOCKET", socket);
     c
 }
@@ -174,7 +174,7 @@ impl Drop for RuntimeActivityGuard {
             Ok(c) => c,
             Err(e) => {
                 eprintln!(
-                    "smoke cleanup: could not locate niri-activities binary for cleanup of `{}`: {e}",
+                    "smoke cleanup: could not locate jiji-activities binary for cleanup of `{}`: {e}",
                     self.name,
                 );
                 return;
@@ -203,7 +203,7 @@ fn smoke_list_succeeds() {
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf-8 stdout");
     assert!(
         !stdout.trim().is_empty(),
-        "`niri-activities list` stdout was empty; live compositor must have at least one activity",
+        "`jiji-activities list` stdout was empty; live compositor must have at least one activity",
     );
 }
 
@@ -373,7 +373,7 @@ fn smoke_switch_previous() {
     let output = nact(&socket)
         .arg("switch-previous")
         .output()
-        .expect("spawn niri-activities");
+        .expect("spawn jiji-activities");
 
     // Two valid outcomes:
     // 1. Exit 0 with an observable focus change (a previous activity existed).
@@ -402,10 +402,10 @@ fn smoke_switch_previous() {
         // session with no previous activity may surface as exit 0 (silent
         // no-op) or as a non-zero error depending on the compositor's pointer
         // state. Pin only that some non-zero exit produces a
-        // `niri-activities:`-prefixed stderr breadcrumb.
+        // `jiji-activities:`-prefixed stderr breadcrumb.
         assert!(
-            stderr.contains("niri-activities:"),
-            "switch-previous non-zero exit must produce a niri-activities stderr breadcrumb; got: {stderr:?}",
+            stderr.contains("jiji-activities:"),
+            "switch-previous non-zero exit must produce a jiji-activities stderr breadcrumb; got: {stderr:?}",
         );
     }
 }

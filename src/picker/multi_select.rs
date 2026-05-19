@@ -60,8 +60,8 @@ pub(crate) struct SentinelNames {
 impl SentinelNames {
     const UNICODE_SELECT_ALL: &'static str = "« Select all »";
     const UNICODE_ONLY_ONE: &'static str = "« Only one… »";
-    const FALLBACK_SELECT_ALL: &'static str = "__niri_activities_select_all__";
-    const FALLBACK_ONLY_ONE: &'static str = "__niri_activities_only_one__";
+    const FALLBACK_SELECT_ALL: &'static str = "__jiji_activities_select_all__";
+    const FALLBACK_ONLY_ONE: &'static str = "__jiji_activities_only_one__";
 }
 
 /// Outcome of a multi-select invocation, post-sentinel-resolution.
@@ -396,13 +396,13 @@ fn classify_output(
         (true, false) => resolve_outcome(&lines, activity_names, sentinels),
         (true, true) => {
             eprintln!(
-                "niri-activities: rofi exited 0 with empty stdout (treating as cancellation)"
+                "jiji-activities: rofi exited 0 with empty stdout (treating as cancellation)"
             );
             MultiPickerOutcome::Cancelled
         }
         (false, false) => {
             eprintln!(
-                "niri-activities: rofi exited non-zero with stdout {:?} (treating as cancellation)",
+                "jiji-activities: rofi exited non-zero with stdout {:?} (treating as cancellation)",
                 text.as_ref()
             );
             MultiPickerOutcome::Cancelled
@@ -453,8 +453,8 @@ mod tests {
         // together — mixing forms would split-brain the parser.
         let names = names_for(&["Work", "« Select all »", "Gaming"]);
         let sentinels = sentinel_names(&names);
-        assert_eq!(sentinels.select_all, "__niri_activities_select_all__");
-        assert_eq!(sentinels.only_one, "__niri_activities_only_one__");
+        assert_eq!(sentinels.select_all, "__jiji_activities_select_all__");
+        assert_eq!(sentinels.only_one, "__jiji_activities_only_one__");
     }
 
     // ---- build_input_payload --------------------------------------------
@@ -557,7 +557,7 @@ mod tests {
             static COUNTER: AtomicU64 = AtomicU64::new(0);
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "niri-activities-rofi-{}-{}-{}",
+                "jiji-activities-rofi-{}-{}-{}",
                 std::process::id(),
                 n,
                 tag,
@@ -594,7 +594,7 @@ mod tests {
     fn ensure_rofi_available_not_found_synthesises_canonical_message() {
         let _lock = PATH_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let empty_dir = std::env::temp_dir().join(format!(
-            "niri-activities-rofi-ea-empty-{}",
+            "jiji-activities-rofi-ea-empty-{}",
             std::process::id(),
         ));
         std::fs::create_dir_all(&empty_dir).expect("create empty dir");

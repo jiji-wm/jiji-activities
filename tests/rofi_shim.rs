@@ -26,7 +26,7 @@ use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::{self, contains};
 
-const BIN: &str = "niri-activities";
+const BIN: &str = "jiji-activities";
 
 /// Per-test unique tempdir under `/tmp`. PID + counter keeps concurrent
 /// `cargo test` jobs disjoint. Mirror of `ShimDir` in
@@ -41,7 +41,7 @@ impl RofiShimDir {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "niri-activities-rofi-shim-{}-{}-{}",
+            "jiji-activities-rofi-shim-{}-{}-{}",
             std::process::id(),
             n,
             tag,
@@ -90,7 +90,7 @@ fn spawn_one_shot_assign_listener(tag: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "niri-activities-rofi-shim-sock-{}-{}-{}.sock",
+        "jiji-activities-rofi-shim-sock-{}-{}-{}.sock",
         std::process::id(),
         n,
         tag,
@@ -145,7 +145,7 @@ fn spawn_one_shot_assign_listener_capturing(tag: &str) -> (PathBuf, Arc<Mutex<Ve
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "niri-activities-rofi-shim-cap-{}-{}-{}.sock",
+        "jiji-activities-rofi-shim-cap-{}-{}-{}.sock",
         std::process::id(),
         n,
         tag,

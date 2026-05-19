@@ -73,7 +73,7 @@ use crate::picker::multi_select::{self, MultiPickerOutcome};
 /// after `FocusWorkspace` on the follow path.
 ///
 /// **Snapshot freshness.** The activities snapshot read here is
-/// point-in-time at picker open: a concurrent `niri-activities create`
+/// point-in-time at picker open: a concurrent `jiji-activities create`
 /// while the picker is open does not refresh the menu, and a stale
 /// snapshot at save surfaces the compositor's wire error through the
 /// `IpcError → CliError` mapping (typically
@@ -90,7 +90,7 @@ where
 {
     let activities = send_expect_activities(client).context("requesting activities")?;
     if activities.is_empty() {
-        eprintln!("niri-activities: no activities configured; nothing to assign");
+        eprintln!("jiji-activities: no activities configured; nothing to assign");
         return Ok(());
     }
     let workspaces = send_expect_workspaces(client).context("requesting workspaces")?;
@@ -338,7 +338,7 @@ mod tests {
     {
         let activities = send_expect_activities(client).context("requesting activities")?;
         if activities.is_empty() {
-            eprintln!("niri-activities: no activities configured; nothing to assign");
+            eprintln!("jiji-activities: no activities configured; nothing to assign");
             return Ok(());
         }
         let workspaces = send_expect_workspaces(client).context("requesting workspaces")?;

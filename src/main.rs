@@ -1,4 +1,4 @@
-//! `niri-activities` — KDE-style Activities CLI for the niri compositor.
+//! `jiji-activities` — KDE-style Activities CLI for the niri compositor.
 //!
 //! `main` is intentionally thin: parse the CLI, dispatch, then map any
 //! error back to a sysexits-style exit code. All real work lives in
@@ -46,7 +46,7 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             // `OutputPipeClosed` means the stdout consumer closed its read
-            // end (e.g. `niri-activities list | head -1`). This is not an
+            // end (e.g. `jiji-activities list | head -1`). This is not an
             // error — suppress the message and exit 0, matching standard
             // Unix tool behaviour.
             //
@@ -60,7 +60,7 @@ fn main() -> ExitCode {
             }
             // `{:#}` walks the full anyhow chain so context layers
             // added via `.context(...)` survive to stderr.
-            eprintln!("niri-activities: {err:#}");
+            eprintln!("jiji-activities: {err:#}");
             ExitCode::from(u8::try_from(error::map_exit(&err)).unwrap_or(1))
         }
     }

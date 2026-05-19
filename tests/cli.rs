@@ -13,7 +13,7 @@ use std::thread;
 use assert_cmd::Command;
 use predicates::str::contains;
 
-const BIN: &str = "niri-activities";
+const BIN: &str = "jiji-activities";
 
 /// Multi-reply Unix-socket listener that accepts one connection per reply
 /// and sends a fixed reply to each, in order.  `SocketClient` opens a new
@@ -24,7 +24,7 @@ fn spawn_scripted_listener(tag: &str, replies: Vec<&'static str>) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let sock_path = std::env::temp_dir().join(format!(
-        "niri-activities-cli-test-scripted-{}-{}-{}.sock",
+        "jiji-activities-cli-test-scripted-{}-{}-{}.sock",
         std::process::id(),
         n,
         tag,
@@ -64,7 +64,7 @@ fn spawn_one_shot_handled_listener(tag: &str, capture_path: PathBuf) -> PathBuf 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let sock_path = std::env::temp_dir().join(format!(
-        "niri-activities-cli-test-{}-{}-{}.sock",
+        "jiji-activities-cli-test-{}-{}-{}.sock",
         std::process::id(),
         n,
         tag,
@@ -378,7 +378,7 @@ fn save_no_socket_exits_69() {
         // the fs-write succeeded but the reload IPC failed — including
         // the Transport (dead-socket) path, which is the primary documented
         // failure mode.
-        .stderr(contains("niri-activities: note: activity was written to"))
+        .stderr(contains("jiji-activities: note: activity was written to"))
         .stderr(contains("load-config-file"));
     // The fs-edit phase must have completed: the new activity is on
     // disk even though the reload failed.
@@ -419,7 +419,7 @@ fn toggle_alias_routes_to_switch_activity_previous() {
     // would still exit 69 on a dead socket, making exit-code tests
     // unable to detect it. This test inspects the actual request JSON.
     let capture = std::env::temp_dir().join(format!(
-        "niri-activities-cli-toggle-req-{}.json",
+        "jiji-activities-cli-toggle-req-{}.json",
         std::process::id(),
     ));
     let sock = spawn_one_shot_handled_listener("toggle-shape", capture.clone());
@@ -448,9 +448,9 @@ fn toggle_alias_routes_to_switch_activity_previous() {
 #[test]
 fn completions_fish_emits_clap_complete_base_and_dynamic_lines() {
     // Pins both halves of the fish completion output:
-    //   1. clap_complete base (anchored by `complete -c niri-activities`)
+    //   1. clap_complete base (anchored by `complete -c jiji-activities`)
     //   2. dynamic activity-name augmentation (anchored by the comment
-    //      header, the `__niri_activities_no_positional_yet` helper
+    //      header, the `__jiji_activities_no_positional_yet` helper
     //      definition, and the position-aware condition for `switch`).
     // A regression in either half — clap_complete dropped, or the fish
     // branch in completions::run lost the augmentation — fails here.
@@ -461,7 +461,7 @@ fn completions_fish_emits_clap_complete_base_and_dynamic_lines() {
         .success();
     let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     assert!(
-        out.contains("complete -c niri-activities"),
+        out.contains("complete -c jiji-activities"),
         "fish completion output missing clap_complete base:\n{out}",
     );
     assert!(
@@ -469,18 +469,18 @@ fn completions_fish_emits_clap_complete_base_and_dynamic_lines() {
         "fish completion output missing dynamic-section header:\n{out}",
     );
     assert!(
-        out.contains("function __niri_activities_no_positional_yet"),
+        out.contains("function __jiji_activities_no_positional_yet"),
         "fish completion output missing position-guard helper:\n{out}",
     );
     assert!(
         out.contains(
-            "__fish_niri_activities_using_subcommand switch; \
-             and __niri_activities_no_positional_yet"
+            "__fish_jiji_activities_using_subcommand switch; \
+             and __jiji_activities_no_positional_yet"
         ),
         "fish completion output missing position-aware condition for `switch`:\n{out}",
     );
     assert!(
-        out.contains("(niri-activities list --format=name 2>/dev/null)"),
+        out.contains("(jiji-activities list --format=name 2>/dev/null)"),
         "fish completion output missing live-candidate source:\n{out}",
     );
 }

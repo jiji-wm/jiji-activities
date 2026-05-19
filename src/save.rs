@@ -74,7 +74,7 @@ use crate::error::{CliError, MalformedResponseSource};
 use crate::ipc::{IpcError, NiriClient};
 
 const NIRI_CONFIG_ENV: &str = "NIRI_CONFIG";
-const TMP_SUFFIX: &str = ".niri-activities.tmp";
+const TMP_SUFFIX: &str = ".jiji-activities.tmp";
 
 /// Outcome of [`append_activity_if_absent`].
 ///
@@ -192,7 +192,7 @@ pub(crate) fn append_activity_if_absent(
                 // rather than silently missing a Unicode duplicate.
                 if !name.is_ascii() || !s.is_ascii() {
                     eprintln!(
-                        "niri-activities: note: activity name contains non-ASCII characters; \
+                        "jiji-activities: note: activity name contains non-ASCII characters; \
                          collision detection is ASCII-only"
                     );
                 }
@@ -293,7 +293,7 @@ pub(crate) fn run(
         match append_activity_if_absent(&existing, name)? {
             AppendOutcome::AlreadyDeclared => {
                 eprintln!(
-                    "niri-activities: activity \"{name}\" is already declared in config; nothing to write"
+                    "jiji-activities: activity \"{name}\" is already declared in config; nothing to write"
                 );
                 Ok(None)
             }
@@ -357,7 +357,7 @@ fn atomic_write(path: &Path, content: &str) -> std::result::Result<(), CliError>
             && cleanup_err.kind() != io::ErrorKind::NotFound
         {
             eprintln!(
-                "niri-activities: warning: could not remove tmp file {}: {cleanup_err}",
+                "jiji-activities: warning: could not remove tmp file {}: {cleanup_err}",
                 tmp.display(),
             );
         }
@@ -428,7 +428,7 @@ fn dispatch_reload(client: &mut dyn NiriClient, written_path: &Path) -> Result<(
 /// [`dispatch_reload`] so no failure mode silently drops the breadcrumb.
 fn emit_written_breadcrumb(written_path: &Path) {
     eprintln!(
-        "niri-activities: note: activity was written to {}; \
+        "jiji-activities: note: activity was written to {}; \
          run `niri msg action load-config-file` to reload manually",
         written_path.display()
     );

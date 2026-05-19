@@ -7,7 +7,7 @@
 //! 1. Create a per-test tempdir.
 //! 2. Write a `bash` script named `fuzzel` inside it that does whatever
 //!    behaviour the test wants (cancel, select, etc.).
-//! 3. Spawn `niri-activities` with `$PATH` set to *only* that tempdir
+//! 3. Spawn `jiji-activities` with `$PATH` set to *only* that tempdir
 //!    (via `env_clear` + explicit `env("PATH", ...)`) so the shim is the
 //!    only `fuzzel` the binary can resolve.
 //! 4. For tests that need the IPC `Request::Activities` round-trip to
@@ -32,7 +32,7 @@ use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 
-const BIN: &str = "niri-activities";
+const BIN: &str = "jiji-activities";
 
 /// Per-test unique tempdir under `/tmp`. PID + counter keeps concurrent
 /// `cargo test` jobs disjoint. Avoids pulling in `tempfile` as a
@@ -46,7 +46,7 @@ impl ShimDir {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "niri-activities-shim-{}-{}-{}",
+            "jiji-activities-shim-{}-{}-{}",
             std::process::id(),
             n,
             tag,
@@ -99,7 +99,7 @@ fn spawn_one_shot_activities_listener(tag: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "niri-activities-shim-sock-{}-{}-{}.sock",
+        "jiji-activities-shim-sock-{}-{}-{}.sock",
         std::process::id(),
         n,
         tag,
@@ -305,7 +305,7 @@ fn run_picker_empty_activities_warns_and_exits_zero() {
     // later exits non-zero with empty stdout (which classify_output would
     // fold into Cancelled, masking the bug).
     shim.install_fuzzel(
-        ": > \"$SHIM_INVOKED\"\nprintf 'niri-activities BUG: picker spawned for empty list\\n' >&2\nexit 99\n",
+        ": > \"$SHIM_INVOKED\"\nprintf 'jiji-activities BUG: picker spawned for empty list\\n' >&2\nexit 99\n",
     );
     let sock = spawn_one_shot_activities_listener_empty("empty-activities");
 
@@ -430,7 +430,7 @@ fn spawn_two_shot_listener_for_move_window(
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "niri-activities-shim-sock-mw-{}-{}-{}.sock",
+        "jiji-activities-shim-sock-mw-{}-{}-{}.sock",
         std::process::id(),
         n,
         tag,
@@ -638,7 +638,7 @@ fn move_window_named_arg_skips_picker() {
     let shim = ShimDir::new("mw-named");
     let sentinel = shim.as_path().join("shim-invoked.sentinel");
     shim.install_fuzzel(
-        ": > \"$SHIM_INVOKED\"\nprintf 'niri-activities BUG: picker spawned for named arg\\n' >&2\nexit 99\n",
+        ": > \"$SHIM_INVOKED\"\nprintf 'jiji-activities BUG: picker spawned for named arg\\n' >&2\nexit 99\n",
     );
     let sock = spawn_two_shot_listener_for_move_window(
         "mw-named",
@@ -784,7 +784,7 @@ fn spawn_one_shot_activities_listener_empty(tag: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "niri-activities-shim-sock-empty-{}-{}-{}.sock",
+        "jiji-activities-shim-sock-empty-{}-{}-{}.sock",
         std::process::id(),
         n,
         tag,

@@ -1,13 +1,15 @@
-# niri-activities
+# jiji-activities
 
-A user-facing CLI for KDE-style **Activities** on the [niri](https://github.com/niri-wm/niri) Wayland compositor.
+A user-facing CLI for KDE-style **Activities** on the **jiji** Wayland compositor — a hard-fork of [niri](https://github.com/niri-wm/niri) that adds the activities feature. See [`~/projects/desktop/de/jiji/docs/jiji-fork.md`](../../jiji/docs/jiji-fork.md) for the fork strategy.
+
+> **Rename note (2026-05-19).** This crate was renamed from `niri-activities` to `jiji-activities` as part of the hard-fork branding. The compositor binary it talks to is still called `niri` on disk (its source-level rename to `jiji` is a follow-up sub-phase); the IPC crate is still called `niri-ipc`. So this CLI talks to `$NIRI_SOCKET` and depends on `niri-ipc` for now; both will rename in the compositor source-rename sub-phase.
 
 ## Status
 
 **v0.1.0 tagged (`cb8b573`).** Implementation complete except for the
 `move-window` subcommand, which is blocked on an IPC variant that has not yet
-been implemented in the niri fork this CLI links against. Every other
-subcommand is wired and covered by tests.
+been implemented in the jiji compositor (the variant is on the roadmap but
+unimplemented). Every other subcommand is wired and covered by tests.
 
 ## Concept
 
@@ -37,8 +39,8 @@ If either binary is missing from `$PATH`, the CLI exits with code 69 and a
 precise stderr message naming the absent binary, e.g.:
 
 ```text
-niri-activities: picker unavailable: fuzzel: not on $PATH (required for single-select picker)
-niri-activities: picker unavailable: rofi: not on $PATH (required for multi-select picker)
+jiji-activities: picker unavailable: fuzzel: not on $PATH (required for single-select picker)
+jiji-activities: picker unavailable: rofi: not on $PATH (required for multi-select picker)
 ```
 
 The diagnostic names the *binary*, not "a picker," so the fix is always
@@ -47,24 +49,26 @@ unambiguous.
 ## Install
 
 This release builds from source only. The `niri-ipc` dependency is a local
-`path = ` reference into a checkout of the `gajdusek/niri` fork (which carries
-the activities-related IPC variants that have not yet landed upstream).
-Concretely, the path is `../../niri/niri/gajdusek/niri-ipc` relative to this
+`path = ` reference into a checkout of the jiji compositor (which carries
+the activities-related IPC variants that don't exist upstream).
+Concretely, the path is `../../jiji/jiji/niri-ipc` relative to this
 repo; the workspace layout that produces that path is documented in the parent
-niri workspace's `CLAUDE.md`.
+jiji workspace's `CLAUDE.md`.
 
 ```sh
-# From a niri workspace with the gajdusek fork checked out alongside this repo.
+# From a jiji workspace with the jiji compositor checked out alongside this repo.
 cargo build --release
 cargo install --path . --locked
 ```
 
-`cargo install niri-activities` (with no `--path` or `--git`) does **not** work
+`cargo install jiji-activities` (with no `--path` or `--git`) does **not** work
 in this release: the crate is `publish = false` and depends on an unpublished
-fork of `niri-ipc`. Once the fork's activities branch is pushed to a stable
-GitHub branch, `Cargo.toml` will switch to a pinned `niri-ipc = { git = "...",
-rev = "..." }` line and `cargo install --git` will become the supported install
-path. This is a known v0.1.0 limitation, not a permanent shape.
+`niri-ipc`. Once Phase D lands `gajdusek/jiji` on GitHub with the
+`feature/activities` branch pushed, `Cargo.toml` will switch to a pinned
+`niri-ipc = { git = "...", rev = "..." }` line (the crate is still called
+`niri-ipc` until the compositor source-rename sub-phase renames it to
+`jiji-ipc`) and `cargo install --git` will become the supported install path.
+This is a known v0.1.0 limitation, not a permanent shape.
 
 ## Usage
 
@@ -76,9 +80,9 @@ no-op and exits 0.
 ### `list` — enumerate activities
 
 ```sh
-niri-activities list                          # plain, focus-marked
-niri-activities list --json                   # versioned JSON envelope
-niri-activities list --format name,kind,focused
+jiji-activities list                          # plain, focus-marked
+jiji-activities list --json                   # versioned JSON envelope
+jiji-activities list --format name,kind,focused
 ```
 
 `--json` and `--format` are mutually exclusive (clap-enforced). The plain
@@ -126,8 +130,8 @@ Gaming,runtime,false
 ### `switch` — focus an activity
 
 ```sh
-niri-activities switch Work    # by name
-niri-activities switch         # picker (fuzzel)
+jiji-activities switch Work    # by name
+jiji-activities switch         # picker (fuzzel)
 ```
 
 Switching to the already-active activity is a silent no-op (no output, exit 0).
@@ -137,8 +141,8 @@ exits 0.
 ### `switch-previous` (alias `toggle`) — flip to the previous activity
 
 ```sh
-niri-activities switch-previous
-niri-activities toggle          # alias
+jiji-activities switch-previous
+jiji-activities toggle          # alias
 ```
 
 Switches to the activity that was active before the current one. With no
@@ -148,8 +152,8 @@ verbatim.
 ### `move-workspace` — relocate the focused workspace
 
 ```sh
-niri-activities move-workspace Personal   # by name
-niri-activities move-workspace            # picker (fuzzel)
+jiji-activities move-workspace Personal   # by name
+jiji-activities move-workspace            # picker (fuzzel)
 ```
 
 Removes the focused workspace from every activity it currently belongs to and
@@ -159,7 +163,7 @@ IPC mutation.
 ### `assign-workspace` — multi-select activity membership
 
 ```sh
-niri-activities assign-workspace
+jiji-activities assign-workspace
 ```
 
 Opens a rofi multi-select picker showing every activity, plus two sentinel rows
@@ -178,7 +182,7 @@ exits 0 without any IPC mutation.
 ### `create` — declare a runtime activity
 
 ```sh
-niri-activities create scratch
+jiji-activities create scratch
 ```
 
 Creates a new runtime activity. Runtime activities are not persisted across a
@@ -188,7 +192,7 @@ Name collisions with existing activities (config-declared or runtime) exit 73.
 ### `remove` — delete a runtime activity
 
 ```sh
-niri-activities remove scratch
+jiji-activities remove scratch
 ```
 
 Removes a runtime activity. The compositor **refuses to remove
@@ -200,7 +204,7 @@ a config-declared activity surfaces the compositor's refusal verbatim and exits
 ### `save` — persist a runtime activity to `niri.conf`
 
 ```sh
-niri-activities save scratch
+jiji-activities save scratch
 ```
 
 Appends an `activity "scratch"` node to your niri config file (`$NIRI_CONFIG`
@@ -223,7 +227,7 @@ config sync.
 ### `move-window` — not yet implemented
 
 ```sh
-niri-activities move-window <name>   # exits 70 with NotImplemented
+jiji-activities move-window <name>   # exits 70 with NotImplemented
 ```
 
 Currently returns `subcommand not yet implemented: move-window` (exit 70). The
@@ -250,9 +254,9 @@ act.
 |   70 | Subcommand not yet implemented (currently: `move-window`).                                                                                                      |
 |   73 | `create`/`save` compositor refusal (stderr `"cannot create activity:"`) OR config-file edit failed (stderr `"config edit failed:"`).                            |
 
-Stderr always names the failure mode with a stable prefix (`niri-activities:
-picker unavailable: ...`, `niri-activities: niri socket unavailable: ...`,
-`niri-activities: config edit failed: ...`, etc.) so consumers can pattern-match
+Stderr always names the failure mode with a stable prefix (`jiji-activities:
+picker unavailable: ...`, `jiji-activities: niri socket unavailable: ...`,
+`jiji-activities: config edit failed: ...`, etc.) so consumers can pattern-match
 the surface without parsing the trailing detail.
 
 ## Manual smoke test
@@ -290,8 +294,8 @@ fails (compositor unreachable, etc.), stranded activities remain in the
 session. Recover with:
 
 ```sh
-niri-activities list | grep __nact_smoke
-niri-activities remove <stranded-name>
+jiji-activities list | grep __nact_smoke
+jiji-activities remove <stranded-name>
 ```
 
 Runtime activities do not persist across a compositor restart, so a

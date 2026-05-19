@@ -198,7 +198,7 @@ where
 /// **Contract:**
 /// - Issues `Request::Activities` first.
 /// - If the activity list is empty, writes a single-line diagnostic to
-///   stderr (`niri-activities: no activities configured; nothing to
+///   stderr (`jiji-activities: no activities configured; nothing to
 ///   move workspace to`) and returns `Ok(())` — exit 0. The picker is
 ///   never spawned because an empty menu is worse UX than a no-op.
 /// - Otherwise reorders names with
@@ -226,7 +226,7 @@ where
 {
     let activities = send_expect_activities(client).context("requesting activities")?;
     if activities.is_empty() {
-        eprintln!("niri-activities: no activities configured; nothing to move workspace to");
+        eprintln!("jiji-activities: no activities configured; nothing to move workspace to");
         return Ok(());
     }
     let names = names_focused_first(&activities);

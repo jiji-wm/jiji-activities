@@ -59,7 +59,7 @@ pub(crate) fn run(client: &mut dyn NiriClient, name: &str) -> Result<()> {
 /// **Contract:**
 /// - Issues `Request::Activities` first.
 /// - If the activity list is empty, writes a single-line diagnostic to
-///   stderr (`niri-activities: no activities configured; nothing to
+///   stderr (`jiji-activities: no activities configured; nothing to
 ///   switch to`) and returns `Ok(())` — exit 0. The picker is never
 ///   spawned because an empty menu is worse UX than a no-op; the
 ///   stderr line tells the user *why* nothing happened.
@@ -81,7 +81,7 @@ where
         // Nothing to pick. Skip the picker spawn — an empty `fuzzel`
         // menu is worse UX than a no-op — and tell the user why nothing
         // happened so the silence is diagnosable.
-        eprintln!("niri-activities: no activities configured; nothing to switch to");
+        eprintln!("jiji-activities: no activities configured; nothing to switch to");
         return Ok(());
     }
     let names = names_focused_first(&activities);

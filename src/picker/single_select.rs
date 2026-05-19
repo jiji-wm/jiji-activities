@@ -301,7 +301,7 @@ fn classify_output(success: bool, stdout: &[u8]) -> PickerOutcome {
             // in normal usage; log to stderr so future fuzzel changes that
             // trigger this path are diagnosable rather than silently eaten.
             eprintln!(
-                "niri-activities: fuzzel exited 0 with empty stdout (treating as cancellation)"
+                "jiji-activities: fuzzel exited 0 with empty stdout (treating as cancellation)"
             );
             PickerOutcome::Cancelled
         }
@@ -310,7 +310,7 @@ fn classify_output(success: bool, stdout: &[u8]) -> PickerOutcome {
             // fuzzel builds emit a final-frame line before non-zero exit on
             // Escape; treat as cancellation but log so the case is visible.
             eprintln!(
-                "niri-activities: fuzzel exited non-zero with stdout {:?} (treating as cancellation)",
+                "jiji-activities: fuzzel exited non-zero with stdout {:?} (treating as cancellation)",
                 first
             );
             PickerOutcome::Cancelled
@@ -588,7 +588,7 @@ mod tests {
             static COUNTER: AtomicU64 = AtomicU64::new(0);
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "niri-activities-picker-{}-{}-{}",
+                "jiji-activities-picker-{}-{}-{}",
                 std::process::id(),
                 n,
                 tag,
@@ -690,7 +690,7 @@ mod tests {
         // A path that is guaranteed not to exist must return Ok(false), not
         // an error — NotFound is a normal outcome of a $PATH walk.
         let missing = std::env::temp_dir().join(format!(
-            "niri-activities-nonexistent-{}-{}",
+            "jiji-activities-nonexistent-{}-{}",
             std::process::id(),
             "isexec-missing",
         ));
@@ -707,7 +707,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         // A regular file with no execute bits must return Ok(false).
         let path = std::env::temp_dir().join(format!(
-            "niri-activities-noexec-{}-{}",
+            "jiji-activities-noexec-{}-{}",
             std::process::id(),
             "isexec-noexec",
         ));
@@ -729,7 +729,7 @@ mod tests {
         let _lock = PATH_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         // Use a tempdir that has no fuzzel binary so which_in_path returns NotFound.
         let empty_dir = std::env::temp_dir().join(format!(
-            "niri-activities-ea-empty-{}-{}",
+            "jiji-activities-ea-empty-{}-{}",
             std::process::id(),
             "ensure-notfound",
         ));
@@ -837,7 +837,7 @@ mod tests {
         // Create a good dir containing a unique executable so we can tell
         // if which_in_path accidentally walks past the bad dir.
         let good_dir = std::env::temp_dir().join(format!(
-            "niri-activities-sc-good-{}-{}",
+            "jiji-activities-sc-good-{}-{}",
             std::process::id(),
             "short-circuit-good",
         ));

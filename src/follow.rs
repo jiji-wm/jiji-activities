@@ -95,7 +95,7 @@ pub(crate) const STAY_UNICODE: &str = "« Stay »";
 /// Underscore-fallback form of the "do not follow" sentinel, substituted
 /// by [`stay_sentinel`] iff any picker row would otherwise collide with
 /// [`STAY_UNICODE`].
-pub(crate) const STAY_FALLBACK: &str = "__niri_activities_stay__";
+pub(crate) const STAY_FALLBACK: &str = "__jiji_activities_stay__";
 
 /// Picks the appropriate stay-sentinel literal for a given set of picker
 /// rows. Returns [`STAY_UNICODE`] unless one of the rows literally equals

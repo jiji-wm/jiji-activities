@@ -1,31 +1,33 @@
 [package]
-name = "niri-activities"
+name = "jiji-activities"
 version = "0.1.0"
-description = "KDE-style Activities for the niri wayland compositor (CLI)"
+description = "KDE-style Activities for the jiji wayland compositor (CLI) — hard-fork of niri"
 authors = ["Petr Gajdůšek"]
 license = "GPL-3.0-or-later"
 edition = "2024"
 publish = false
 
 [[bin]]
-name = "niri-activities"
+name = "jiji-activities"
 path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4.6"
-# Aligned with niri's own resolution (`niri/gajdusek/Cargo.toml`).
+# Aligned with the jiji compositor's own resolution (`jiji/Cargo.toml`).
 directories = "6"
-# `v1` feature pins the KDL v1 spec — niri's `knuffel` 3.2.0 parses KDL v1;
-# the default kdl-rs v6 dialect (KDL v2) would mismatch existing configs.
+# `v1` feature pins the KDL v1 spec — the jiji compositor's `knuffel` 3.2.0
+# parses KDL v1; the default kdl-rs v6 dialect (KDL v2) would mismatch
+# existing configs.
 kdl = { version = "6", features = ["v1"] }
-# Local path to the gajdusek niri fork's `feature/activities` branch.
-# Tracked rev (informational): 54aee6582cbfc11b4e69fa8a602cf2653e29df4a
-# Once the branch is pushed to GitHub, switch to:
-#   niri-ipc = { git = "https://github.com/gajdusek/niri", rev = "<sha>" }
+# Local path to the jiji compositor's `niri-ipc` crate (will rename to
+# `jiji-ipc` in the compositor source-rename sub-phase). Tracked rev
+# (informational): 54aee6582cbfc11b4e69fa8a602cf2653e29df4a
+# Once the branch is pushed to GitHub (Phase D — gajdusek/jiji), switch to:
+#   niri-ipc = { git = "https://github.com/gajdusek/jiji", rev = "<sha>" }
 # Pin the rev rather than the branch so IPC bumps are deliberate.
-niri-ipc = { path = "../../niri/niri/gajdusek/niri-ipc" }
+niri-ipc = { path = "../../jiji/jiji/niri-ipc" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

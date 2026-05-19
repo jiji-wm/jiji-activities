@@ -1,12 +1,12 @@
 # CLAUDE.md
 
-Operational guidance for Claude Code (claude.ai/code) when working in the niri-activities CLI repo.
+Operational guidance for Claude Code (claude.ai/code) when working in the jiji-activities CLI repo.
 
 ## What this is
 
-`niri-activities` is the user-facing CLI for KDE-style activities on the niri Wayland compositor. It is the Phase 3 deliverable of the activities workstream — the design lives in `docs/design.md` and is jointly owned with the compositor-side DD at `~/projects/desktop/de/niri/docs/activities/design.md`.
+`jiji-activities` is the user-facing CLI for KDE-style activities on the **jiji** Wayland compositor (hard-fork of niri; was `niri-activities` before the 2026-05-19 rename). It is the Phase 3 deliverable of the activities workstream — the design lives in `docs/design.md` and is jointly owned with the compositor-side DD at `~/projects/desktop/de/jiji/docs/activities/design.md`.
 
-The crate is a thin Rust binary (anyhow + clap-derive + niri-ipc) that wraps the fork's `Action::*Activity*` IPC variants. Pickers (fuzzel single-select, rofi multi-select) are external runtime deps.
+The crate is a thin Rust binary (anyhow + clap-derive + `niri-ipc`) that wraps the jiji compositor's `Action::*Activity*` IPC variants. The `niri-ipc` crate name will rename to `jiji-ipc` in the compositor source-rename sub-phase. Pickers (fuzzel single-select, rofi multi-select) are external runtime deps.
 
 ## Build & test
 
@@ -21,7 +21,7 @@ Smoke tests against a live compositor are gated behind `#[ignore]`; run with `ca
 
 ## Live install
 
-The user's installed binary lives at `~/.cargo/bin/niri-activities`. After any feature change touching the CLI surface:
+The user's installed binary lives at `~/.cargo/bin/jiji-activities`. After any feature change touching the CLI surface:
 
 ```sh
 cargo install --path . --offline
@@ -53,16 +53,16 @@ After any sync, run:
 ```sh
 cargo test --all
 cargo install --path . --offline   # so the user's binary emits the new output
-niri-activities completions fish > ~/.config/fish/completions/niri-activities.fish
+jiji-activities completions fish > ~/.config/fish/completions/jiji-activities.fish
 ```
 
 Or bump `# hash:` in the chezmoi script and `chezmoi apply` to do the last two steps as one.
 
-**Position-aware conditions discipline.** Single-arg verbs combine `__fish_niri_activities_using_subcommand <verb>` (clap_complete's helper, subcommand-context-aware) with the `__niri_activities_no_positional_yet` helper emitted by this module. Variadic verbs use only the using-subcommand check. **Never reach for `__fish_seen_subcommand_from <verb>` in dynamic conditions** — it fires anywhere `<verb>` has appeared in the command line, including after the user has already supplied a positional name. That bug landed at `28658d8` and was fixed at `d16a08d` after the user reported it; the rule exists so a future verb does not retrace the same mistake.
+**Position-aware conditions discipline.** Single-arg verbs combine `__fish_jiji_activities_using_subcommand <verb>` (clap_complete's helper, subcommand-context-aware) with the `__jiji_activities_no_positional_yet` helper emitted by this module. Variadic verbs use only the using-subcommand check. **Never reach for `__fish_seen_subcommand_from <verb>` in dynamic conditions** — it fires anywhere `<verb>` has appeared in the command line, including after the user has already supplied a positional name. That bug landed at `28658d8` and was fixed at `d16a08d` after the user reported it; the rule exists so a future verb does not retrace the same mistake.
 
 ## Active design doc
 
-`docs/design.md` is the implementer-grade DD owning Phase 3 of the activities workstream. The most-recent sub-phase outcomes are recorded as `**Reviewed:**` annotations under each Phase header; Phase 3.9 (shell completions) closed at `d16a08d` / `6d0c6a9`. The workspace `CLAUDE.md` at `~/projects/desktop/de/niri/CLAUDE.md` tracks which sub-phase is active across sessions.
+`docs/design.md` is the implementer-grade DD owning Phase 3 of the activities workstream. The most-recent sub-phase outcomes are recorded as `**Reviewed:**` annotations under each Phase header; Phase 3.9 (shell completions) closed at `d16a08d` / `6d0c6a9`. The workspace `CLAUDE.md` at `~/projects/desktop/de/jiji/CLAUDE.md` tracks which sub-phase is active across sessions.
 
 ## Git
 
@@ -73,4 +73,4 @@ Or bump `# hash:` in the chezmoi script and `chezmoi apply` to do the last two s
 
 ## Loop integration
 
-The niri-activities loop lives in `~/projects/desktop/de/niri/.claude/` (the niri workspace) — agents `cli-architect` / `cli-implementer` / `cli-fixer` / `cli-scribe`, slash commands `/cli:land-subphase` / `/cli:next-subphase` / `/cli:implement` / `/cli:apply-review` / `/cli:scribe-review`. Direct-implementation work (no loop) is fine for small scopes; the loop is for sub-phases that warrant the full architect → implementer → review → fixer → scribe round-trip.
+The jiji-activities loop lives in `~/projects/desktop/de/jiji/.claude/` (the niri workspace) — agents `cli-architect` / `cli-implementer` / `cli-fixer` / `cli-scribe`, slash commands `/cli:land-subphase` / `/cli:next-subphase` / `/cli:implement` / `/cli:apply-review` / `/cli:scribe-review`. Direct-implementation work (no loop) is fine for small scopes; the loop is for sub-phases that warrant the full architect → implementer → review → fixer → scribe round-trip.
