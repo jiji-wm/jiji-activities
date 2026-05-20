@@ -306,6 +306,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "jiji-activities"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "clap",
+ "clap_complete",
+ "directories",
+ "kdl 6.5.0",
+ "niri-ipc",
+ "predicates",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "kdl"
 version = "4.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -405,23 +422,6 @@ name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
-
-[[package]]
-name = "niri-activities"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "assert_cmd",
- "clap",
- "clap_complete",
- "directories",
- "kdl 6.5.0",
- "niri-ipc",
- "predicates",
- "serde",
- "serde_json",
- "tempfile",
-]
 
 [[package]]
 name = "niri-ipc"
