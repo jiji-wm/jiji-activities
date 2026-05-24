@@ -21,13 +21,13 @@ directories = "6"
 # parses KDL v1; the default kdl-rs v6 dialect (KDL v2) would mismatch
 # existing configs.
 kdl = { version = "6", features = ["v1"] }
-# Local path to the jiji compositor's `niri-ipc` crate (will rename to
-# `jiji-ipc` in the compositor source-rename sub-phase). Tracked rev
-# (informational): 54aee6582cbfc11b4e69fa8a602cf2653e29df4a
-# Once the branch is pushed to GitHub (Phase D — gajdusek/jiji), switch to:
-#   niri-ipc = { git = "https://github.com/gajdusek/jiji", rev = "<sha>" }
+# Local path to the jiji compositor's IPC crate. The compositor source rename
+# has landed: the crate is now `jiji-ipc`, so we bridge via `package` to keep
+# the `niri_ipc` source identifier until the in-repo rename to `jiji_ipc`.
+# Once the branch is pushed to GitHub (gajdusek/jiji), switch to:
+#   niri-ipc = { package = "jiji-ipc", git = "https://github.com/gajdusek/jiji", rev = "<sha>" }
 # Pin the rev rather than the branch so IPC bumps are deliberate.
-niri-ipc = { path = "../../jiji/jiji/niri-ipc" }
+niri-ipc = { package = "jiji-ipc", path = "../../jiji/jiji/jiji-ipc" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
