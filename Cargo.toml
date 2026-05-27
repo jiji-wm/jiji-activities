@@ -27,7 +27,7 @@ kdl = { version = "6", features = ["v1"] }
 # Once the branch is pushed to GitHub (gajdusek/jiji), switch to:
 #   niri-ipc = { package = "jiji-ipc", git = "https://github.com/gajdusek/jiji", rev = "<sha>" }
 # Pin the rev rather than the branch so IPC bumps are deliberate.
-niri-ipc = { package = "jiji-ipc", path = "../../jiji/jiji/jiji-ipc" }
+niri-ipc = { package = "jiji-ipc", path = "../jiji/jiji-ipc" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
