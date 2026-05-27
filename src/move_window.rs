@@ -107,6 +107,7 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use niri_ipc::{Action, Activity, NoOpReason, Request, Response, Workspace, WorkspaceReferenceArg};
 
+use crate::cli::FollowMode;
 use crate::error::{CliError, MalformedResponseSource};
 use crate::follow::{self, dispatch_follow_workspace, dispatch_follow_workspace_and_window};
 use crate::ipc::{IpcError, NiriClient};
@@ -266,20 +267,6 @@ enum Stage2ResolutionLiteralOnly<'a> {
     Unknown(String),
 }
 
-// ---- Internal options bundle -----------------------------------------------
-
-/// Bundles the three flags that travel together from the public entry points
-/// down through the private stage-2 dispatch helpers. Grouping them reduces
-/// the argument count of [`dispatch_stage2_with_new`] and
-/// [`dispatch_stage2_literal_only`] below the `clippy::too_many_arguments`
-/// threshold and keeps future per-verb extension localized.
-#[derive(Clone, Copy)]
-struct Stage2Opts {
-    follow: bool,
-    overview: bool,
-    window: Option<u64>,
-}
-
 // ---- Public entry points ---------------------------------------------------
 
 /// Moves the focused window into the trailing-empty workspace of the
@@ -313,34 +300,34 @@ struct Stage2Opts {
 ///   [`send_expect_handled_or_no_op`].
 ///
 /// **`window`.** When `Some(id)`, the `MoveWindowToWorkspace` request carries
-/// `window_id: Some(id)` regardless of `follow` or snapshot state — the
+/// `window_id: Some(id)` regardless of `follow_mode` or snapshot state — the
 /// explicit id takes precedence via [`decide_window_id_for_dispatch`].
 /// Validation of the id is delegated to the compositor: an unknown id returns
 /// `MalformedResponse(Server)` (exit 65), unlike `assign-workspace` which
 /// validates the workspace id client-side. When `None`, the compositor
 /// resolves the window from whatever has focus at dispatch time.
 ///
-/// **`follow`.** When `true`, the focused-window id is captured from the
-/// in-scope `Workspaces` snapshot and threaded into the dispatch — see
-/// [`decide_window_id_for_dispatch`]. The default (`false`) preserves the
-/// pre-`--follow` wire shape (`window_id: None`). After a successful
-/// state-changing dispatch (i.e. NOT a `NoOp(AlreadyOnTarget)`), a
-/// follow picker is spawned that lets the user opt into focusing the
-/// destination workspace. If the follow picker returns a row that is
-/// neither the confirm row nor the stay sentinel →
+/// **`follow_mode`.** When `follow_mode.should_follow()` holds, the
+/// focused-window id is captured from the in-scope `Workspaces` snapshot and
+/// threaded into the dispatch — see [`decide_window_id_for_dispatch`]. The
+/// default (`FollowMode::None`) preserves the pre-`--follow` wire shape
+/// (`window_id: None`). After a successful state-changing dispatch (i.e. NOT a
+/// `NoOp(AlreadyOnTarget)`), a follow picker is spawned that lets the user opt
+/// into focusing the destination workspace. If the follow picker returns a row
+/// that is neither the confirm row nor the stay sentinel →
 /// `MalformedResponse(Server("follow picker returned row not in items: …"))`
 /// (exit 65).
 ///
 /// The `pick` parameter is a closure so unit tests can inject a stub
 /// without spawning `fuzzel`; production wiring passes
 /// [`crate::picker::pick_one`]. Invoked at most once, only when
-/// `follow: true` AND the move landed `HandledOutcome::Handled`.
+/// `follow_mode.should_follow()` returns `true` AND the move landed
+/// `HandledOutcome::Handled`.
 pub(crate) fn run<F>(
     client: &mut dyn NiriClient,
     activity_name: &str,
     pick: F,
-    follow: bool,
-    overview: bool,
+    follow_mode: FollowMode,
     window: Option<u64>,
 ) -> Result<()>
 where
@@ -371,14 +358,15 @@ where
         return Ok(());
     };
     let ws_id = ws.id;
-    let window_id_for_dispatch = decide_window_id_for_dispatch(window, follow, &workspaces);
+    let window_id_for_dispatch =
+        decide_window_id_for_dispatch(window, follow_mode.should_follow(), &workspaces);
     let was_handled = handle_move_outcome(
         dispatch_move(client, ws_id, window_id_for_dispatch)?,
         ws_id,
         activity_name,
         &workspaces,
     )?;
-    if follow && was_handled {
+    if follow_mode.should_follow() && was_handled {
         let label = workspace_label_for_follow_picker(ws_id, &workspaces);
         run_move_window_follow_picker(
             client,
@@ -387,7 +375,7 @@ where
             activity_name,
             ws_id,
             window_id_for_dispatch,
-            overview,
+            follow_mode.with_overview(),
         )?;
     }
     Ok(())
@@ -593,29 +581,30 @@ fn print_already_current_breadcrumb(ws_id: u64, workspaces: &[Workspace]) {
 ///
 /// The `pick` parameter is a closure (not `FnOnce`) because it is
 /// called up to three times — once per stage and once more for the
-/// post-move follow picker when `follow: true`. The `prompt_name_fn`
+/// post-move follow picker when `follow_mode.should_follow()` holds. The `prompt_name_fn`
 /// parameter fires at most once, only when the user picks the
 /// `« New activity »` sentinel. Production wiring passes
 /// [`crate::picker::pick_one`] and [`crate::picker::prompt_name`]
 /// respectively.
 ///
 /// **`window`.** When `Some(id)`, the `MoveWindowToWorkspace` request carries
-/// `window_id: Some(id)` regardless of `follow` or snapshot state — the
-/// explicit id takes precedence and is threaded through `Stage2Opts` into
+/// `window_id: Some(id)` regardless of `follow_mode` or snapshot state — the
+/// explicit id takes precedence and is forwarded into
 /// [`decide_window_id_for_dispatch`]. Validation is delegated to the
 /// compositor (unknown id → `MalformedResponse(Server)`, exit 65). When
 /// `None`, the compositor resolves the window from focus at dispatch time.
 ///
-/// **`follow`.** When `true`, the focused-window id is captured from the
-/// in-scope `Workspaces` snapshot (fetched in stage 2) and threaded into
+/// **`follow_mode`.** When [`FollowMode::Follow`] or
+/// [`FollowMode::FollowAndOverview`], the focused-window id is captured from
+/// the in-scope `Workspaces` snapshot (fetched in stage 2) and threaded into
 /// the dispatch — see [`decide_window_id_for_dispatch`]. The default
-/// (`false`) preserves the pre-`--follow` wire shape (`window_id: None`).
+/// ([`FollowMode::None`]) preserves the pre-`--follow` wire shape
+/// (`window_id: None`).
 pub(crate) fn run_picker<F, P>(
     client: &mut dyn NiriClient,
     pick: F,
     prompt_name_fn: P,
-    follow: bool,
-    overview: bool,
+    follow_mode: FollowMode,
     window: Option<u64>,
 ) -> Result<()>
 where
@@ -647,11 +636,8 @@ where
                 &name,
                 &activity_names,
                 &pick,
-                Stage2Opts {
-                    follow,
-                    overview,
-                    window,
-                },
+                follow_mode,
+                window,
             )
         }
         // Active activity → with-new path (compositor trailing-empty
@@ -666,11 +652,8 @@ where
                 &name,
                 &activity_names,
                 &pick,
-                Stage2Opts {
-                    follow,
-                    overview,
-                    window,
-                },
+                follow_mode,
+                window,
             )
         }
         Stage1Resolution::Selected(activity) => {
@@ -681,11 +664,8 @@ where
                 &name,
                 &activity_names,
                 &pick,
-                Stage2Opts {
-                    follow,
-                    overview,
-                    window,
-                },
+                follow_mode,
+                window,
             )
         }
         Stage1Resolution::NewActivity => {
@@ -727,11 +707,8 @@ where
                     &new_name,
                     &activity_names_after,
                     &pick,
-                    Stage2Opts {
-                        follow,
-                        overview,
-                        window,
-                    },
+                    follow_mode,
+                    window,
                 )
                 .context("dispatching stage 2 against newly-created activity")
             } else {
@@ -741,11 +718,8 @@ where
                     &new_name,
                     &activity_names_after,
                     &pick,
-                    Stage2Opts {
-                        follow,
-                        overview,
-                        window,
-                    },
+                    follow_mode,
+                    window,
                 )
                 .context("dispatching stage 2 against newly-created activity")
             }
@@ -822,21 +796,21 @@ fn create_activity_via_ipc(client: &mut dyn NiriClient, name: &str) -> Result<()
 /// - Reply / variant handling matches [`send_expect_handled_or_no_op`].
 ///
 /// **`window`.** When `Some(id)`, the `MoveWindowToWorkspace` request carries
-/// `window_id: Some(id)` regardless of `follow` or snapshot state — the
-/// explicit id takes precedence and is threaded through `Stage2Opts` into
+/// `window_id: Some(id)` regardless of `follow_mode` or snapshot state — the
+/// explicit id takes precedence and is forwarded into
 /// [`decide_window_id_for_dispatch`]. Validation is delegated to the
 /// compositor (unknown id → `MalformedResponse(Server)`, exit 65). When
 /// `None`, the compositor resolves the window from focus at dispatch time.
 ///
-/// **`follow`.** When `true`, the focused-window id is captured from the
-/// in-scope `Workspaces` snapshot and threaded into the dispatch — see
-/// [`decide_window_id_for_dispatch`]. The default (`false`) preserves the
-/// pre-`--follow` wire shape (`window_id: None`).
+/// **`follow_mode`.** When [`FollowMode::Follow`] or
+/// [`FollowMode::FollowAndOverview`], the focused-window id is captured from
+/// the in-scope `Workspaces` snapshot and threaded into the dispatch — see
+/// [`decide_window_id_for_dispatch`]. The default ([`FollowMode::None`])
+/// preserves the pre-`--follow` wire shape (`window_id: None`).
 pub(crate) fn run_here_picker<F>(
     client: &mut dyn NiriClient,
     pick: F,
-    follow: bool,
-    overview: bool,
+    follow_mode: FollowMode,
     window: Option<u64>,
 ) -> Result<()>
 where
@@ -854,11 +828,8 @@ where
         &activity_name,
         &activity_names,
         &pick,
-        Stage2Opts {
-            follow,
-            overview,
-            window,
-        },
+        follow_mode,
+        window,
     )
 }
 
@@ -891,26 +862,22 @@ where
 ///
 /// The `pick` parameter accepts an `Fn` because the function may invoke
 /// it twice — once for stage 2, and a second time for the post-move
-/// follow picker when `follow: true`. The single shared closure is what
-/// production passes in (`picker::pick_one` is a function pointer that
-/// implements `Fn`), and the test suite injects multi-prompt stubs that
-/// dispatch on the prompt string.
+/// follow picker when `follow_mode.should_follow()` holds. The single shared
+/// closure is what production passes in (`picker::pick_one` is a function
+/// pointer that implements `Fn`), and the test suite injects multi-prompt
+/// stubs that dispatch on the prompt string.
 fn dispatch_stage2_with_new<F>(
     client: &mut dyn NiriClient,
     target_activity_id: u64,
     target_activity_name: &str,
     activity_names: &HashMap<u64, String>,
     pick: F,
-    opts: Stage2Opts,
+    follow_mode: FollowMode,
+    window: Option<u64>,
 ) -> Result<()>
 where
     F: Fn(&str, &[String]) -> Result<PickerOutcome, CliError>,
 {
-    let Stage2Opts {
-        follow,
-        overview,
-        window,
-    } = opts;
     debug_assert!(
         activity_names.contains_key(&target_activity_id),
         "target activity id not in name map — caller construction drift",
@@ -949,11 +916,12 @@ where
         Stage2ResolutionWithNew::Cancelled => Ok(()),
         Stage2ResolutionWithNew::Selected(ws) => {
             let ws_id = ws.id;
-            let window_id_for_dispatch = decide_window_id_for_dispatch(window, follow, &workspaces);
+            let window_id_for_dispatch =
+                decide_window_id_for_dispatch(window, follow_mode.should_follow(), &workspaces);
             let outcome = dispatch_move(client, ws_id, window_id_for_dispatch)?;
             let was_handled =
                 handle_move_outcome(outcome, ws_id, target_activity_name, &workspaces)?;
-            if follow && was_handled {
+            if follow_mode.should_follow() && was_handled {
                 let label = workspace_label_for_follow_picker(ws_id, &workspaces);
                 run_move_window_follow_picker(
                     client,
@@ -962,7 +930,7 @@ where
                     target_activity_name,
                     ws_id,
                     window_id_for_dispatch,
-                    overview,
+                    follow_mode.with_overview(),
                 )?;
             }
             Ok(())
@@ -994,11 +962,12 @@ where
                 .into());
             };
             let ws_id = ws.id;
-            let window_id_for_dispatch = decide_window_id_for_dispatch(window, follow, &workspaces);
+            let window_id_for_dispatch =
+                decide_window_id_for_dispatch(window, follow_mode.should_follow(), &workspaces);
             let outcome = dispatch_move(client, ws_id, window_id_for_dispatch)?;
             let was_handled =
                 handle_move_outcome(outcome, ws_id, target_activity_name, &workspaces)?;
-            if follow && was_handled {
+            if follow_mode.should_follow() && was_handled {
                 let label = workspace_label_for_follow_picker(ws_id, &workspaces);
                 run_move_window_follow_picker(
                     client,
@@ -1007,7 +976,7 @@ where
                     target_activity_name,
                     ws_id,
                     window_id_for_dispatch,
-                    overview,
+                    follow_mode.with_overview(),
                 )?;
             }
             Ok(())
@@ -1029,26 +998,22 @@ where
 ///
 /// The `pick` parameter accepts an `Fn` because the function may invoke
 /// it twice — once for stage 2, and a second time for the post-move
-/// follow picker when `follow: true`. The single shared closure is what
-/// production passes in (`picker::pick_one` is a function pointer that
-/// implements `Fn`), and the test suite injects multi-prompt stubs that
-/// dispatch on the prompt string.
+/// follow picker when `follow_mode.should_follow()` holds. The single shared
+/// closure is what production passes in (`picker::pick_one` is a function
+/// pointer that implements `Fn`), and the test suite injects multi-prompt
+/// stubs that dispatch on the prompt string.
 fn dispatch_stage2_literal_only<F>(
     client: &mut dyn NiriClient,
     target_activity_id: u64,
     target_activity_name: &str,
     activity_names: &HashMap<u64, String>,
     pick: F,
-    opts: Stage2Opts,
+    follow_mode: FollowMode,
+    window: Option<u64>,
 ) -> Result<()>
 where
     F: Fn(&str, &[String]) -> Result<PickerOutcome, CliError>,
 {
-    let Stage2Opts {
-        follow,
-        overview,
-        window,
-    } = opts;
     debug_assert!(
         activity_names.contains_key(&target_activity_id),
         "target activity id not in name map — caller construction drift",
@@ -1097,11 +1062,12 @@ where
         Stage2ResolutionLiteralOnly::Cancelled => Ok(()),
         Stage2ResolutionLiteralOnly::Selected(ws) => {
             let ws_id = ws.id;
-            let window_id_for_dispatch = decide_window_id_for_dispatch(window, follow, &workspaces);
+            let window_id_for_dispatch =
+                decide_window_id_for_dispatch(window, follow_mode.should_follow(), &workspaces);
             let outcome = dispatch_move(client, ws_id, window_id_for_dispatch)?;
             let was_handled =
                 handle_move_outcome(outcome, ws_id, target_activity_name, &workspaces)?;
-            if follow && was_handled {
+            if follow_mode.should_follow() && was_handled {
                 let label = workspace_label_for_follow_picker(ws_id, &workspaces);
                 run_move_window_follow_picker(
                     client,
@@ -1110,7 +1076,7 @@ where
                     target_activity_name,
                     ws_id,
                     window_id_for_dispatch,
-                    overview,
+                    follow_mode.with_overview(),
                 )?;
             }
             Ok(())
@@ -2378,8 +2344,7 @@ mod tests {
             &mut client,
             pick,
             no_new_activity_prompt,
-            false,
-            false,
+            FollowMode::None,
             None,
         )
         .expect("AlreadyCurrent must exit Ok");
@@ -2427,8 +2392,7 @@ mod tests {
             &mut client,
             pick,
             no_new_activity_prompt,
-            false,
-            false,
+            FollowMode::None,
             None,
         )
         .expect("AlreadyCurrent must exit Ok");
@@ -2480,8 +2444,7 @@ mod tests {
             &mut client,
             pick,
             no_new_activity_prompt,
-            false,
-            false,
+            FollowMode::None,
             None,
         )
         .expect("NoOp reply must exit Ok");
@@ -2533,8 +2496,7 @@ mod tests {
             &mut client,
             pick,
             no_new_activity_prompt,
-            false,
-            false,
+            FollowMode::None,
             None,
         )
         .expect("NoOp reply must exit Ok");
@@ -2576,8 +2538,14 @@ mod tests {
                 panic!("follow picker must NOT spawn when move resolved to AlreadyCurrent");
             }
         };
-        run_picker(&mut client, pick, no_new_activity_prompt, true, false, None)
-            .expect("AlreadyCurrent must exit Ok");
+        run_picker(
+            &mut client,
+            pick,
+            no_new_activity_prompt,
+            FollowMode::Follow,
+            None,
+        )
+        .expect("AlreadyCurrent must exit Ok");
         client.assert_consumed_in_order();
     }
 
@@ -2619,14 +2587,20 @@ mod tests {
                 panic!("follow picker must NOT spawn when move resolved to AlreadyCurrent");
             }
         };
-        run_picker(&mut client, pick, no_new_activity_prompt, true, false, None)
-            .expect("AlreadyCurrent must exit Ok");
+        run_picker(
+            &mut client,
+            pick,
+            no_new_activity_prompt,
+            FollowMode::Follow,
+            None,
+        )
+        .expect("AlreadyCurrent must exit Ok");
         client.assert_consumed_in_order();
     }
 
-    /// Pins: the Selected arm's `if follow && was_handled` gate short-circuits
-    /// when `handle_move_outcome` returns `Ok(false)` for `was_handled` on the
-    /// `with_new` path (wire `Response::NoOp(AlreadyOnTarget)`).
+    /// Pins: the Selected arm's `if follow_mode.should_follow() && was_handled`
+    /// gate short-circuits when `handle_move_outcome` returns `Ok(false)` for
+    /// `was_handled` on the `with_new` path (wire `Response::NoOp(AlreadyOnTarget)`).
     #[test]
     fn dispatch_stage2_with_new_no_op_already_on_target_with_follow_does_not_spawn_follow_picker() {
         // Mirrors dispatch_stage2_with_new_handles_response_no_op_already_on_target
@@ -2666,14 +2640,20 @@ mod tests {
                 );
             }
         };
-        run_picker(&mut client, pick, no_new_activity_prompt, true, false, None)
-            .expect("NoOp reply must exit Ok");
+        run_picker(
+            &mut client,
+            pick,
+            no_new_activity_prompt,
+            FollowMode::Follow,
+            None,
+        )
+        .expect("NoOp reply must exit Ok");
         client.assert_consumed_in_order();
     }
 
-    /// Pins: the Selected arm's `if follow && was_handled` gate short-circuits
-    /// when `handle_move_outcome` returns `Ok(false)` for `was_handled` on the
-    /// literal-only path (wire `Response::NoOp(AlreadyOnTarget)`).
+    /// Pins: the Selected arm's `if follow_mode.should_follow() && was_handled`
+    /// gate short-circuits when `handle_move_outcome` returns `Ok(false)` for
+    /// `was_handled` on the literal-only path (wire `Response::NoOp(AlreadyOnTarget)`).
     #[test]
     fn dispatch_stage2_literal_only_no_op_already_on_target_with_follow_does_not_spawn_follow_picker()
      {
@@ -2716,8 +2696,14 @@ mod tests {
                 );
             }
         };
-        run_picker(&mut client, pick, no_new_activity_prompt, true, false, None)
-            .expect("NoOp reply must exit Ok");
+        run_picker(
+            &mut client,
+            pick,
+            no_new_activity_prompt,
+            FollowMode::Follow,
+            None,
+        )
+        .expect("NoOp reply must exit Ok");
         client.assert_consumed_in_order();
     }
 
@@ -3068,8 +3054,7 @@ mod tests {
             &mut client,
             pick,
             no_new_activity_prompt,
-            false,
-            false,
+            FollowMode::None,
             None,
         )
         .expect_err("synthetic sentinel on literal-only path must surface as MalformedResponse");
@@ -3118,8 +3103,14 @@ mod tests {
         );
         client.expect(move_req(20), Reply::Ok(Response::Handled));
 
-        run(&mut client, "Personal", no_follow_pick, false, false, None)
-            .expect("named-arg succeeds");
+        run(
+            &mut client,
+            "Personal",
+            no_follow_pick,
+            FollowMode::None,
+            None,
+        )
+        .expect("named-arg succeeds");
         client.assert_consumed_in_order();
     }
 
@@ -3130,7 +3121,7 @@ mod tests {
             Request::Activities,
             Reply::Ok(Response::Activities(vec![act(1, "Work", true)])),
         );
-        let err = run(&mut client, "Nope", no_follow_pick, false, false, None)
+        let err = run(&mut client, "Nope", no_follow_pick, FollowMode::None, None)
             .expect_err("unknown name must fail");
         let cli_err = err
             .chain()
@@ -3164,8 +3155,14 @@ mod tests {
                 ws(20, 0, false, Some("DP-1"), vec![2], Some(77)),
             ])),
         );
-        run(&mut client, "Personal", no_follow_pick, false, false, None)
-            .expect("zero-case must exit Ok");
+        run(
+            &mut client,
+            "Personal",
+            no_follow_pick,
+            FollowMode::None,
+            None,
+        )
+        .expect("zero-case must exit Ok");
         // No third IPC call queued — dispatch was skipped.
         client.assert_consumed_in_order();
     }
@@ -3191,8 +3188,14 @@ mod tests {
                 ws(20, 0, false, Some("DP-2"), vec![2], None),
             ])),
         );
-        run(&mut client, "Personal", no_follow_pick, false, false, None)
-            .expect("zero-case must exit Ok");
+        run(
+            &mut client,
+            "Personal",
+            no_follow_pick,
+            FollowMode::None,
+            None,
+        )
+        .expect("zero-case must exit Ok");
         client.assert_consumed_in_order();
     }
 
@@ -3212,8 +3215,7 @@ mod tests {
             &mut client,
             pick,
             no_new_activity_prompt,
-            false,
-            false,
+            FollowMode::None,
             None,
         )
         .expect("empty activities must exit Ok");
@@ -3234,8 +3236,7 @@ mod tests {
             &mut client,
             pick,
             no_new_activity_prompt,
-            false,
-            false,
+            FollowMode::None,
             None,
         )
         .expect("stage1 cancel is silent Ok");
@@ -3287,8 +3288,7 @@ mod tests {
             &mut client,
             pick,
             no_new_activity_prompt,
-            false,
-            false,
+            FollowMode::None,
             None,
         )
         .expect("happy path succeeds");
@@ -3324,8 +3324,7 @@ mod tests {
             &mut client,
             pick,
             no_new_activity_prompt,
-            false,
-            false,
+            FollowMode::None,
             None,
         )
         .expect("stage2 cancel is silent Ok");
@@ -3362,8 +3361,7 @@ mod tests {
             &mut client,
             pick,
             no_new_activity_prompt,
-            false,
-            false,
+            FollowMode::None,
             None,
         )
         .expect("new-workspace sentinel succeeds");
@@ -3401,8 +3399,7 @@ mod tests {
             &mut client,
             pick,
             no_new_activity_prompt,
-            false,
-            false,
+            FollowMode::None,
             None,
         )
         .expect("zero-case must exit Ok");
@@ -3461,7 +3458,7 @@ mod tests {
         let prompt = |_prompt: &str| -> Result<NameOutcome, CliError> {
             Ok(NameOutcome::Typed("Personal".to_owned()))
         };
-        run_picker(&mut client, pick, prompt, false, false, None)
+        run_picker(&mut client, pick, prompt, FollowMode::None, None)
             .expect("new-activity happy path must succeed");
         client.assert_consumed_in_order();
     }
@@ -3516,7 +3513,7 @@ mod tests {
         let prompt_fn = |_prompt: &str| -> Result<NameOutcome, CliError> {
             Ok(NameOutcome::Typed("Personal".to_owned()))
         };
-        run_picker(&mut client, pick, prompt_fn, false, false, None)
+        run_picker(&mut client, pick, prompt_fn, FollowMode::None, None)
             .expect("new-activity active path must succeed");
         client.assert_consumed_in_order();
     }
@@ -3537,8 +3534,7 @@ mod tests {
             &mut client,
             pick,
             no_new_activity_prompt,
-            false,
-            false,
+            FollowMode::None,
             None,
         )
         .expect_err("wrong variant must fail");
@@ -3578,8 +3574,7 @@ mod tests {
             &mut client,
             pick,
             no_new_activity_prompt,
-            false,
-            false,
+            FollowMode::None,
             None,
         )
         .expect_err("wrong variant must fail");
@@ -3635,7 +3630,7 @@ mod tests {
             assert_eq!(items[0], "idx 0 (current)");
             Ok(PickerOutcome::Selected(items[1].clone()))
         };
-        run_here_picker(&mut client, pick, false, false, None).expect("happy path");
+        run_here_picker(&mut client, pick, FollowMode::None, None).expect("happy path");
         client.assert_consumed_in_order();
     }
 
@@ -3660,7 +3655,8 @@ mod tests {
         let pick = |_prompt: &str, _items: &[String]| -> Result<PickerOutcome, CliError> {
             Ok(PickerOutcome::Cancelled)
         };
-        run_here_picker(&mut client, pick, false, false, None).expect("cancellation is silent Ok");
+        run_here_picker(&mut client, pick, FollowMode::None, None)
+            .expect("cancellation is silent Ok");
         client.assert_consumed_in_order();
     }
 
@@ -3683,7 +3679,7 @@ mod tests {
         let pick = |_prompt: &str, _items: &[String]| -> Result<PickerOutcome, CliError> {
             Ok(PickerOutcome::Selected("« New workspace »".into()))
         };
-        run_here_picker(&mut client, pick, false, false, None)
+        run_here_picker(&mut client, pick, FollowMode::None, None)
             .expect("new-workspace sentinel succeeds");
         client.assert_consumed_in_order();
     }
@@ -3704,7 +3700,7 @@ mod tests {
         let pick = |_prompt: &str, _items: &[String]| -> Result<PickerOutcome, CliError> {
             panic!("picker must NOT be spawned when no active activity");
         };
-        let err = run_here_picker(&mut client, pick, false, false, None)
+        let err = run_here_picker(&mut client, pick, FollowMode::None, None)
             .expect_err("no active activity must fail");
         let cli_err = err
             .chain()
@@ -3738,7 +3734,7 @@ mod tests {
             Ok(PickerOutcome::Selected("« New activity »".into()))
         };
         let prompt = |_prompt: &str| -> Result<NameOutcome, CliError> { Ok(NameOutcome::Unnamed) };
-        let err = run_picker(&mut client, pick, prompt, false, false, None)
+        let err = run_picker(&mut client, pick, prompt, FollowMode::None, None)
             .expect_err("empty-Enter must surface as Usage");
         let cli_err = err
             .chain()
@@ -3928,8 +3924,7 @@ mod tests {
             &mut client,
             pick,
             no_new_activity_prompt,
-            false,
-            false,
+            FollowMode::None,
             None,
         )
         .expect("zero-case must exit Ok");
@@ -3960,7 +3955,7 @@ mod tests {
         let pick = |_prompt: &str, _items: &[String]| -> Result<PickerOutcome, CliError> {
             Ok(PickerOutcome::Selected("« New workspace »".into()))
         };
-        let err = run_here_picker(&mut client, pick, false, false, None)
+        let err = run_here_picker(&mut client, pick, FollowMode::None, None)
             .expect_err("trailing-empty breach must surface as MalformedResponse");
         let cli_err = err
             .chain()
@@ -4046,8 +4041,7 @@ mod tests {
             &mut client,
             "Personal",
             confirm_follow_pick,
-            true,
-            false,
+            FollowMode::Follow,
             None,
         )
         .expect("--follow named-arg succeeds");
@@ -4092,8 +4086,7 @@ mod tests {
             &mut client,
             "Personal",
             confirm_follow_pick,
-            true,
-            false,
+            FollowMode::Follow,
             None,
         )
         .expect("--follow fallback succeeds");
@@ -4125,8 +4118,14 @@ mod tests {
         // window_id: None, not Some(99) — `--follow` is off.
         client.expect(move_req(20), Reply::Ok(Response::Handled));
 
-        run(&mut client, "Personal", no_follow_pick, false, false, None)
-            .expect("no-follow named-arg succeeds");
+        run(
+            &mut client,
+            "Personal",
+            no_follow_pick,
+            FollowMode::None,
+            None,
+        )
+        .expect("no-follow named-arg succeeds");
         client.assert_consumed_in_order();
     }
 
@@ -4171,7 +4170,8 @@ mod tests {
                 Ok(PickerOutcome::Selected(items[1].clone()))
             }
         };
-        run_here_picker(&mut client, pick, true, false, None).expect("--follow stage 2 succeeds");
+        run_here_picker(&mut client, pick, FollowMode::Follow, None)
+            .expect("--follow stage 2 succeeds");
         client.assert_consumed_in_order();
     }
 
@@ -4233,8 +4233,14 @@ mod tests {
                 Ok(PickerOutcome::Selected(items[0].clone()))
             }
         };
-        run_picker(&mut client, pick, no_new_activity_prompt, true, false, None)
-            .expect("--follow literal-only stage 2 succeeds");
+        run_picker(
+            &mut client,
+            pick,
+            no_new_activity_prompt,
+            FollowMode::Follow,
+            None,
+        )
+        .expect("--follow literal-only stage 2 succeeds");
         client.assert_consumed_in_order();
     }
 
@@ -4279,7 +4285,7 @@ mod tests {
                 Ok(PickerOutcome::Selected("« New workspace »".into()))
             }
         };
-        run_here_picker(&mut client, pick, true, false, None)
+        run_here_picker(&mut client, pick, FollowMode::Follow, None)
             .expect("--follow new-workspace arm succeeds");
         client.assert_consumed_in_order();
     }
@@ -4310,8 +4316,14 @@ mod tests {
                 ws(20, 0, false, Some("DP-1"), vec![2], None),
             ])),
         );
-        let err = run(&mut client, "Personal", no_follow_pick, true, false, None)
-            .expect_err("no focused workspace must fail with exit 65");
+        let err = run(
+            &mut client,
+            "Personal",
+            no_follow_pick,
+            FollowMode::Follow,
+            None,
+        )
+        .expect_err("no focused workspace must fail with exit 65");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())
@@ -4407,8 +4419,7 @@ mod tests {
             &mut client,
             "Personal",
             no_follow_pick,
-            false,
-            false,
+            FollowMode::None,
             Some(99),
         )
         .expect("explicit --window succeeds");
@@ -4446,19 +4457,19 @@ mod tests {
             let sentinel = items.last().expect("sentinel is last");
             Ok(PickerOutcome::Selected(sentinel.clone()))
         };
-        run_here_picker(&mut client, pick, false, false, Some(7))
+        run_here_picker(&mut client, pick, FollowMode::None, Some(7))
             .expect("explicit --window threads through run_here_picker");
         client.assert_consumed_in_order();
     }
 
     /// `--window 55` passed to `run_picker` (interactive two-stage form):
-    /// the `Stage2Opts.window` must propagate through stage-2 dispatch so
+    /// the `window` param must propagate through stage-2 dispatch so
     /// `MoveWindowToWorkspace` carries `window_id: Some(55)`.
     ///
-    /// Regression guard for the `run_picker` → `Stage2Opts { window }` →
-    /// `dispatch_stage2_with_new` propagation path, which is independent from
-    /// `run` (named-arg) and `run_here_picker` (both already pinned by their
-    /// own tests). Exercises the `Stage1Resolution::CurrentActivity` arm so the
+    /// Regression guard for the `run_picker` → `dispatch_stage2_with_new`
+    /// propagation path, which is independent from `run` (named-arg) and
+    /// `run_here_picker` (both already pinned by their own tests). Exercises
+    /// the `Stage1Resolution::CurrentActivity` arm so the
     /// `dispatch_stage2_with_new` code path fires.
     #[test]
     fn run_picker_explicit_window_threads_through_stage2_dispatch() {
@@ -4505,8 +4516,7 @@ mod tests {
             &mut client,
             pick,
             no_new_activity_prompt,
-            false,
-            false,
+            FollowMode::None,
             Some(55),
         )
         .expect("explicit --window propagates through run_picker stage-2 dispatch");
@@ -4539,7 +4549,7 @@ mod tests {
         let pick = |_prompt: &str, _items: &[String]| -> Result<PickerOutcome, CliError> {
             Ok(PickerOutcome::Selected("definitely-not-an-item".into()))
         };
-        let err = run(&mut client, "Personal", pick, true, false, None)
+        let err = run(&mut client, "Personal", pick, FollowMode::Follow, None)
             .expect_err("unknown row must route to MalformedResponse");
         let cli_err = err
             .chain()

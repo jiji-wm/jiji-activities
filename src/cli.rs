@@ -146,15 +146,65 @@ pub(crate) enum Cmd {
     },
 }
 
+/// Encodes the mutually-dependent `--follow` / `--overview` flag pair as
+/// a three-state enum, making the `overview ⟹ follow` invariant
+/// unrepresentable rather than enforced by convention.
+///
+/// Canonically produced by [`resolve_follow_overview`] — the primary site
+/// where the raw `bool, bool` pair from clap collapses into this type.
+/// Tests may construct variants directly for ergonomic stub injection.
+/// Threaded through the four mutating verbs (`move-window`,
+/// `move-window-here`, `move-workspace`, `assign-workspace`) down to their
+/// `run*` entry points. Does **not** enter `src/follow.rs`; the
+/// `dispatch_follow_*` leaves keep their `overview: bool` param and are fed
+/// by [`FollowMode::with_overview`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FollowMode {
+    /// Neither `--follow` nor `--overview` was supplied. No follow picker
+    /// is spawned; window/workspace id capture is skipped.
+    None,
+    /// `--follow` was supplied (without `--overview`). A follow picker is
+    /// spawned after a successful move; no overview is opened.
+    Follow,
+    /// `--follow --overview` (or `--overview` alone, which implies
+    /// `--follow`). A follow picker is spawned and the compositor's
+    /// Overview is revealed on confirmation.
+    FollowAndOverview,
+}
+
+impl FollowMode {
+    /// Returns `true` when a follow picker should be spawned after the
+    /// move — i.e. for [`Self::Follow`] and [`Self::FollowAndOverview`].
+    #[inline]
+    pub(crate) fn should_follow(self) -> bool {
+        matches!(self, FollowMode::Follow | FollowMode::FollowAndOverview)
+    }
+
+    /// Returns `true` when the Overview should be revealed after the follow
+    /// confirmation — i.e. for [`Self::FollowAndOverview`] **only**.
+    #[inline]
+    pub(crate) fn with_overview(self) -> bool {
+        matches!(self, FollowMode::FollowAndOverview)
+    }
+}
+
 /// Resolve the `--overview` → `--follow` implication.
 ///
 /// `--overview` alone is shorthand for `--follow --overview`; this
-/// helper folds that single resolution rule. Lives at module scope so
-/// it is reachable from `src/cli.rs::tests` without spinning up clap or
-/// IPC, and is invoked from each `Cmd::Move*` / `Cmd::AssignWorkspace`
-/// dispatch arm to keep the rule canonical across verbs.
-fn resolve_follow_overview(follow: bool, overview: bool) -> (bool, bool) {
-    (follow || overview, overview)
+/// helper folds that single resolution rule into a [`FollowMode`] value,
+/// making the invariant unrepresentable rather than convention-enforced.
+/// Lives at module scope so it is reachable from `src/cli.rs::tests`
+/// without spinning up clap or IPC, and is invoked from each
+/// `Cmd::Move*` / `Cmd::AssignWorkspace` dispatch arm to keep the rule
+/// canonical across verbs.
+fn resolve_follow_overview(follow: bool, overview: bool) -> FollowMode {
+    if overview {
+        FollowMode::FollowAndOverview
+    } else if follow {
+        FollowMode::Follow
+    } else {
+        FollowMode::None
+    }
 }
 
 /// Routes the parsed [`Cli`] to the appropriate stub.
@@ -172,16 +222,16 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             overview,
             window,
         } => {
-            let (follow, overview) = resolve_follow_overview(follow, overview);
-            cmd_move_window(name, follow, overview, window)
+            let follow_mode = resolve_follow_overview(follow, overview);
+            cmd_move_window(name, follow_mode, window)
         }
         Cmd::MoveWindowHere {
             follow,
             overview,
             window,
         } => {
-            let (follow, overview) = resolve_follow_overview(follow, overview);
-            cmd_move_window_here(follow, overview, window)
+            let follow_mode = resolve_follow_overview(follow, overview);
+            cmd_move_window_here(follow_mode, window)
         }
         Cmd::MoveWorkspace {
             name,
@@ -189,16 +239,16 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             overview,
             workspace,
         } => {
-            let (follow, overview) = resolve_follow_overview(follow, overview);
-            cmd_move_workspace(name, follow, overview, workspace)
+            let follow_mode = resolve_follow_overview(follow, overview);
+            cmd_move_workspace(name, follow_mode, workspace)
         }
         Cmd::AssignWorkspace {
             follow,
             overview,
             workspace,
         } => {
-            let (follow, overview) = resolve_follow_overview(follow, overview);
-            cmd_assign_workspace(follow, overview, workspace)
+            let follow_mode = resolve_follow_overview(follow, overview);
+            cmd_assign_workspace(follow_mode, workspace)
         }
         Cmd::Create { name } => cmd_create(name),
         Cmd::Remove { name } => cmd_remove(name),
@@ -241,8 +291,7 @@ fn cmd_switch_previous() -> Result<()> {
 
 fn cmd_move_window(
     name: Option<String>,
-    follow: bool,
-    overview: bool,
+    follow_mode: FollowMode,
     window: Option<u64>,
 ) -> Result<()> {
     match name {
@@ -250,22 +299,15 @@ fn cmd_move_window(
             // When `--follow` is set the named-arg form also spawns a
             // fuzzel-backed follow picker after the move, so the
             // picker-availability check must fire pre-IPC even on the
-            // non-interactive path. Skipping when `follow` is false
+            // non-interactive path. Skipping when follow is None
             // preserves the "no fuzzel required for plain named-arg"
             // ergonomic.
-            if follow {
+            if follow_mode.should_follow() {
                 picker::ensure_available()
                     .context("verifying move-window follow picker availability")?;
             }
             let mut client = ipc::make_client();
-            move_window::run(
-                client.as_mut(),
-                &n,
-                picker::pick_one,
-                follow,
-                overview,
-                window,
-            )
+            move_window::run(client.as_mut(), &n, picker::pick_one, follow_mode, window)
         }
         None => {
             // Verify `fuzzel` is on $PATH BEFORE any IPC round-trip so a
@@ -279,8 +321,7 @@ fn cmd_move_window(
                 client.as_mut(),
                 picker::pick_one,
                 picker::prompt_name,
-                follow,
-                overview,
+                follow_mode,
                 window,
             )
             .context("running move-window picker")
@@ -288,20 +329,19 @@ fn cmd_move_window(
     }
 }
 
-fn cmd_move_window_here(follow: bool, overview: bool, window: Option<u64>) -> Result<()> {
+fn cmd_move_window_here(follow_mode: FollowMode, window: Option<u64>) -> Result<()> {
     // Verify `fuzzel` is on $PATH BEFORE any IPC round-trip — same
     // rationale as cmd_move_window's no-arg branch. `move-window-here`
     // has no named-arg form; it is always picker-driven.
     picker::ensure_available().context("verifying move-window-here picker availability")?;
     let mut client = ipc::make_client();
-    move_window::run_here_picker(client.as_mut(), picker::pick_one, follow, overview, window)
+    move_window::run_here_picker(client.as_mut(), picker::pick_one, follow_mode, window)
         .context("running move-window-here picker")
 }
 
 fn cmd_move_workspace(
     name: Option<String>,
-    follow: bool,
-    overview: bool,
+    follow_mode: FollowMode,
     workspace: Option<u64>,
 ) -> Result<()> {
     match name {
@@ -311,7 +351,7 @@ fn cmd_move_workspace(
             // picker after the move, so the picker-availability check
             // must fire pre-IPC. The plain named-arg form (no `--follow`)
             // remains fuzzel-free.
-            if follow {
+            if follow_mode.should_follow() {
                 picker::ensure_available()
                     .context("verifying move-workspace follow picker availability")?;
             }
@@ -320,8 +360,7 @@ fn cmd_move_workspace(
                 client.as_mut(),
                 &n,
                 picker::pick_one,
-                follow,
-                overview,
+                follow_mode,
                 workspace,
             )
         }
@@ -333,19 +372,13 @@ fn cmd_move_workspace(
             // produce on a disconnected socket.
             picker::ensure_available().context("verifying move-workspace picker availability")?;
             let mut client = ipc::make_client();
-            move_workspace::run_picker(
-                client.as_mut(),
-                picker::pick_one,
-                follow,
-                overview,
-                workspace,
-            )
-            .context("running move-workspace picker")
+            move_workspace::run_picker(client.as_mut(), picker::pick_one, follow_mode, workspace)
+                .context("running move-workspace picker")
         }
     }
 }
 
-fn cmd_assign_workspace(follow: bool, overview: bool, workspace: Option<u64>) -> Result<()> {
+fn cmd_assign_workspace(follow_mode: FollowMode, workspace: Option<u64>) -> Result<()> {
     // Verify `rofi` is on $PATH BEFORE any IPC round-trip so a
     // missing-dep failure surfaces with a rofi-naming stderr message
     // rather than the generic "niri socket unavailable" the IPC layer
@@ -357,21 +390,15 @@ fn cmd_assign_workspace(follow: bool, overview: bool, workspace: Option<u64>) ->
     // follow stage is always single-select. Pre-verify so a missing
     // fuzzel surfaces with the picker-naming stderr message rather
     // than as a transport-layer failure after the save has already
-    // landed. Skipped when `follow` is false to preserve the
+    // landed. Skipped when follow is None to preserve the
     // "no fuzzel required" ergonomic for the plain assign path.
-    if follow {
+    if follow_mode.should_follow() {
         picker::ensure_available()
             .context("verifying assign-workspace follow picker availability")?;
     }
     let mut client = ipc::make_client();
-    assign_workspace::run(
-        client.as_mut(),
-        picker::pick_one,
-        follow,
-        overview,
-        workspace,
-    )
-    .context("running assign-workspace picker")
+    assign_workspace::run(client.as_mut(), picker::pick_one, follow_mode, workspace)
+        .context("running assign-workspace picker")
 }
 
 fn cmd_create(name: String) -> Result<()> {
@@ -419,13 +446,35 @@ mod tests {
     /// rather than spinning up clap or a `MockClient`.
     #[test]
     fn dispatch_overview_implies_follow() {
-        // `--overview` alone is shorthand for `--follow --overview`.
-        assert_eq!(resolve_follow_overview(false, true), (true, true));
-        // `--follow` alone leaves `overview` false.
-        assert_eq!(resolve_follow_overview(true, false), (true, false));
-        // Both flags off → both stay off (the default no-op path).
-        assert_eq!(resolve_follow_overview(false, false), (false, false));
-        // Explicit `--follow --overview` is the canonical form, idempotent.
-        assert_eq!(resolve_follow_overview(true, true), (true, true));
+        // `--overview` alone collapses to FollowAndOverview (implies --follow).
+        assert_eq!(
+            resolve_follow_overview(false, true),
+            FollowMode::FollowAndOverview
+        );
+        // `--follow` alone → Follow (no overview).
+        assert_eq!(resolve_follow_overview(true, false), FollowMode::Follow);
+        // Both flags off → None (the default no-op path).
+        assert_eq!(resolve_follow_overview(false, false), FollowMode::None);
+        // Explicit `--follow --overview` → FollowAndOverview, idempotent.
+        assert_eq!(
+            resolve_follow_overview(true, true),
+            FollowMode::FollowAndOverview
+        );
+    }
+
+    /// Accessor correctness: pins all five (variant × accessor) cells so
+    /// a future inversion of `should_follow` / `with_overview` is caught
+    /// immediately rather than silently misrouting follow pickers.
+    #[test]
+    fn follow_mode_accessors_are_correct() {
+        // None: neither follow nor overview.
+        assert!(!FollowMode::None.should_follow());
+        assert!(!FollowMode::None.with_overview());
+        // Follow: follow yes, overview no.
+        assert!(FollowMode::Follow.should_follow());
+        assert!(!FollowMode::Follow.with_overview());
+        // FollowAndOverview: both true.
+        assert!(FollowMode::FollowAndOverview.should_follow());
+        assert!(FollowMode::FollowAndOverview.with_overview());
     }
 }

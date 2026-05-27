@@ -11,11 +11,12 @@
 //! The chained-single leg (`« Only one… »` sentinel) adds a fourth
 //! step — the chained fuzzel picker — between (2) and (3).
 //!
-//! **`--follow` path.** When `follow: true`, after a successful dispatch
-//! the follow picker is spawned. On confirmation,
+//! **`--follow` path.** When `follow_mode.should_follow()` holds, after a
+//! successful dispatch the follow picker is spawned. On confirmation,
 //! [`dispatch_follow_activity_and_workspace`] issues up to three more IPC
 //! round-trips in strict order: `SwitchActivity`, `FocusWorkspace`, and
-//! optionally `OpenOverview` (when `overview: true`). See
+//! optionally `OpenOverview` (when `follow_mode.with_overview()` holds;
+//! i.e. `FollowMode::FollowAndOverview`). See
 //! [`dispatch_follow_activity_and_workspace`] for the full contract.
 //!
 //! ## Why the workspace arg is `Id(ws.id)`, not `None`
@@ -35,6 +36,7 @@ use niri_ipc::{
     Action, Activity, ActivityReferenceArg, Request, Response, Workspace, WorkspaceReferenceArg,
 };
 
+use crate::cli::FollowMode;
 use crate::error::{CliError, MalformedResponseSource};
 use crate::follow::{self, dispatch_follow_activity_and_workspace};
 use crate::ipc::{IpcError, NiriClient};
@@ -78,17 +80,19 @@ use crate::picker::multi_select::{self, MultiPickerOutcome};
 /// - Other IPC failures flow through the existing `IpcError → CliError`
 ///   mapping (`SocketUnavailable`, `MalformedResponse(Server)`, etc.).
 ///
-/// **`--follow`.** When `follow: true`, after a successful dispatch a
-/// follow picker is spawned over the saved activity names plus a `« Stay »`
-/// sentinel. On confirmation, [`dispatch_follow_activity_and_workspace`] is
-/// invoked against the **assignment target** workspace id (the explicit id
-/// when `--workspace` is supplied, or the focused workspace id otherwise).
-/// When `--workspace <id>` and `--follow` are combined, the follow
-/// `FocusWorkspace` targets the explicit workspace, not the focused one.
-/// If the picker returns an unrecognised row →
+/// **`--follow`.** When `follow_mode.should_follow()` holds, after a
+/// successful dispatch a follow picker is spawned over the saved activity
+/// names plus a `« Stay »` sentinel. On confirmation,
+/// [`dispatch_follow_activity_and_workspace`] is invoked against the
+/// **assignment target** workspace id (the explicit id when `--workspace` is
+/// supplied, or the focused workspace id otherwise). When `--workspace <id>`
+/// and `--follow` are combined, the follow `FocusWorkspace` targets the
+/// explicit workspace, not the focused one. If the picker returns an
+/// unrecognised row →
 /// `MalformedResponse(Server("follow picker returned row not in items: …"))`
-/// (exit 65). `overview: true` causes an additional `OpenOverview` IPC call
-/// after `FocusWorkspace` on the follow path.
+/// (exit 65). `follow_mode.with_overview()` (i.e. `FollowMode::FollowAndOverview`)
+/// causes an additional `OpenOverview` IPC call after `FocusWorkspace` on the
+/// follow path.
 ///
 /// **Snapshot freshness.** The activities snapshot read here is
 /// point-in-time at picker open: a concurrent `jiji-activities create`
@@ -100,8 +104,7 @@ use crate::picker::multi_select::{self, MultiPickerOutcome};
 pub(crate) fn run<F>(
     client: &mut dyn NiriClient,
     pick: F,
-    follow: bool,
-    overview: bool,
+    follow_mode: FollowMode,
     workspace: Option<u64>,
 ) -> Result<()>
 where
@@ -156,11 +159,17 @@ where
         }
     };
 
-    if follow
+    if follow_mode.should_follow()
         && let Some(saved_names) = saved
         && !saved_names.is_empty()
     {
-        run_assign_workspace_follow_picker(client, pick, &saved_names, ws_id, overview)?;
+        run_assign_workspace_follow_picker(
+            client,
+            pick,
+            &saved_names,
+            ws_id,
+            follow_mode.with_overview(),
+        )?;
     }
     Ok(())
 }
@@ -343,8 +352,7 @@ mod tests {
         multi: MS,
         one: OS,
         follow_pick: FP,
-        follow: bool,
-        overview: bool,
+        follow_mode: FollowMode,
         workspace: Option<u64>,
     ) -> Result<()>
     where
@@ -390,11 +398,17 @@ mod tests {
                     }
                 }
             };
-        if follow
+        if follow_mode.should_follow()
             && let Some(saved_names) = saved
             && !saved_names.is_empty()
         {
-            run_assign_workspace_follow_picker(client, follow_pick, &saved_names, ws_id, overview)?;
+            run_assign_workspace_follow_picker(
+                client,
+                follow_pick,
+                &saved_names,
+                ws_id,
+                follow_mode.with_overview(),
+            )?;
         }
         Ok(())
     }
@@ -449,8 +463,15 @@ mod tests {
         let one = |_: &[String]| -> Result<PickerOutcome, CliError> {
             panic!("chained picker must not be called for Selected outcome");
         };
-        run_with_pickers(&mut client, multi, one, no_follow_pick, false, false, None)
-            .expect("happy path succeeds");
+        run_with_pickers(
+            &mut client,
+            multi,
+            one,
+            no_follow_pick,
+            FollowMode::None,
+            None,
+        )
+        .expect("happy path succeeds");
         client.assert_consumed_in_order();
     }
 
@@ -484,8 +505,15 @@ mod tests {
             assert_eq!(names, &["Work", "Personal"]);
             Ok(PickerOutcome::Selected("Personal".into()))
         };
-        run_with_pickers(&mut client, multi, one, no_follow_pick, false, false, None)
-            .expect("chain path succeeds");
+        run_with_pickers(
+            &mut client,
+            multi,
+            one,
+            no_follow_pick,
+            FollowMode::None,
+            None,
+        )
+        .expect("chain path succeeds");
         client.assert_consumed_in_order();
     }
 
@@ -505,8 +533,15 @@ mod tests {
         );
         let multi = |_: &[String], _: &HashSet<String>| Ok(MultiPickerOutcome::ChainSingle);
         let one = |_: &[String]| Ok(PickerOutcome::Cancelled);
-        run_with_pickers(&mut client, multi, one, no_follow_pick, false, false, None)
-            .expect("cancellation is silent Ok");
+        run_with_pickers(
+            &mut client,
+            multi,
+            one,
+            no_follow_pick,
+            FollowMode::None,
+            None,
+        )
+        .expect("cancellation is silent Ok");
         client.assert_consumed_in_order();
     }
 
@@ -527,8 +562,15 @@ mod tests {
         let one = |_: &[String]| -> Result<PickerOutcome, CliError> {
             panic!("chained picker must not be called on Cancelled");
         };
-        run_with_pickers(&mut client, multi, one, no_follow_pick, false, false, None)
-            .expect("cancellation is silent Ok");
+        run_with_pickers(
+            &mut client,
+            multi,
+            one,
+            no_follow_pick,
+            FollowMode::None,
+            None,
+        )
+        .expect("cancellation is silent Ok");
         client.assert_consumed_in_order();
     }
 
@@ -553,8 +595,15 @@ mod tests {
         let one = |_: &[String]| -> Result<PickerOutcome, CliError> {
             panic!("chained picker must not be called when no workspace is focused");
         };
-        let err = run_with_pickers(&mut client, multi, one, no_follow_pick, false, false, None)
-            .expect_err("no focused workspace must surface as error");
+        let err = run_with_pickers(
+            &mut client,
+            multi,
+            one,
+            no_follow_pick,
+            FollowMode::None,
+            None,
+        )
+        .expect_err("no focused workspace must surface as error");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())
@@ -581,8 +630,15 @@ mod tests {
         let one = |_: &[String]| -> Result<PickerOutcome, CliError> {
             panic!("chained picker must not be called when activity list is empty");
         };
-        run_with_pickers(&mut client, multi, one, no_follow_pick, false, false, None)
-            .expect("empty list exits Ok");
+        run_with_pickers(
+            &mut client,
+            multi,
+            one,
+            no_follow_pick,
+            FollowMode::None,
+            None,
+        )
+        .expect("empty list exits Ok");
         client.assert_consumed_in_order();
     }
 
@@ -597,8 +653,15 @@ mod tests {
             panic!("picker must not be called on malformed Activities response");
         };
         let one = |_: &[String]| -> Result<PickerOutcome, CliError> { unreachable!() };
-        let err = run_with_pickers(&mut client, multi, one, no_follow_pick, false, false, None)
-            .expect_err("wrong variant must surface");
+        let err = run_with_pickers(
+            &mut client,
+            multi,
+            one,
+            no_follow_pick,
+            FollowMode::None,
+            None,
+        )
+        .expect_err("wrong variant must surface");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())
@@ -631,8 +694,15 @@ mod tests {
             panic!("picker must not be called on malformed Workspaces response");
         };
         let one = |_: &[String]| -> Result<PickerOutcome, CliError> { unreachable!() };
-        let err = run_with_pickers(&mut client, multi, one, no_follow_pick, false, false, None)
-            .expect_err("wrong variant must surface");
+        let err = run_with_pickers(
+            &mut client,
+            multi,
+            one,
+            no_follow_pick,
+            FollowMode::None,
+            None,
+        )
+        .expect_err("wrong variant must surface");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())
@@ -676,8 +746,15 @@ mod tests {
             Ok(MultiPickerOutcome::Selected(vec!["Work".into()]))
         };
         let one = |_: &[String]| -> Result<PickerOutcome, CliError> { unreachable!() };
-        let err = run_with_pickers(&mut client, multi, one, no_follow_pick, false, false, None)
-            .expect_err("server error must propagate");
+        let err = run_with_pickers(
+            &mut client,
+            multi,
+            one,
+            no_follow_pick,
+            FollowMode::None,
+            None,
+        )
+        .expect_err("server error must propagate");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())
@@ -758,8 +835,7 @@ mod tests {
             multi_work_personal,
             one,
             follow_pick,
-            true,
-            false,
+            FollowMode::Follow,
             None,
         )
         .expect("item-shape assertion exits Ok");
@@ -784,8 +860,7 @@ mod tests {
             multi_work_personal,
             one,
             follow_pick,
-            true,
-            false,
+            FollowMode::Follow,
             None,
         )
         .expect("cancelled follow picker exits Ok");
@@ -835,8 +910,15 @@ mod tests {
             assert_eq!(items[0], "Work");
             Ok(PickerOutcome::Selected("Work".into()))
         };
-        run_with_pickers(&mut client, multi, one, follow_pick, true, false, None)
-            .expect("follow happy-path succeeds");
+        run_with_pickers(
+            &mut client,
+            multi,
+            one,
+            follow_pick,
+            FollowMode::Follow,
+            None,
+        )
+        .expect("follow happy-path succeeds");
         client.assert_consumed_in_order();
     }
 
@@ -869,8 +951,15 @@ mod tests {
         let follow_pick = |_: &str, _: &[String]| -> Result<PickerOutcome, CliError> {
             Ok(PickerOutcome::Selected("not-an-item".into()))
         };
-        let err = run_with_pickers(&mut client, multi, one, follow_pick, true, false, None)
-            .expect_err("unknown row must surface as error");
+        let err = run_with_pickers(
+            &mut client,
+            multi,
+            one,
+            follow_pick,
+            FollowMode::Follow,
+            None,
+        )
+        .expect_err("unknown row must surface as error");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())
@@ -946,8 +1035,7 @@ mod tests {
             multi,
             one,
             no_follow_pick,
-            false,
-            false,
+            FollowMode::None,
             Some(99),
         )
         .expect("explicit-workspace happy path succeeds");
@@ -980,8 +1068,7 @@ mod tests {
             multi,
             one,
             no_follow_pick,
-            false,
-            false,
+            FollowMode::None,
             Some(42),
         )
         .expect_err("missing explicit workspace id must surface as error");
@@ -1057,8 +1144,15 @@ mod tests {
             // Pick "Personal" to trigger the follow path.
             Ok(PickerOutcome::Selected(items[0].clone()))
         };
-        run_with_pickers(&mut client, multi, one, follow_pick, true, false, Some(99))
-            .expect("explicit workspace + follow targets the explicit workspace");
+        run_with_pickers(
+            &mut client,
+            multi,
+            one,
+            follow_pick,
+            FollowMode::Follow,
+            Some(99),
+        )
+        .expect("explicit workspace + follow targets the explicit workspace");
         client.assert_consumed_in_order();
     }
 
@@ -1105,8 +1199,15 @@ mod tests {
             Ok(MultiPickerOutcome::Selected(vec!["Work".into()]))
         };
         let one = |_: &[String]| -> Result<PickerOutcome, CliError> { unreachable!() };
-        run_with_pickers(&mut client, multi, one, no_follow_pick, false, false, None)
-            .expect("unset workspace uses focused path");
+        run_with_pickers(
+            &mut client,
+            multi,
+            one,
+            no_follow_pick,
+            FollowMode::None,
+            None,
+        )
+        .expect("unset workspace uses focused path");
         client.assert_consumed_in_order();
     }
 }
