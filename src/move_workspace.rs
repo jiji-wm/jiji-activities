@@ -2,16 +2,19 @@
 //! activity.
 //!
 //! Dispatches
-//! `Action::MoveWorkspaceToActivity { workspace: None, activity: Name(name), focus: false }`
+//! `Action::MoveWorkspaceToActivity { workspace, activity: Name(name), focus: false }`
 //! over IPC and expects `Response::Handled`.
 //!
-//! ## Why `workspace: None` and `focus: false`
+//! ## Why `workspace` and `focus: false`
 //!
-//! - **`workspace: None`** — defaults to the focused workspace. The
-//!   user invoked `move-workspace` without naming a workspace; the
-//!   only sensible referent is whatever has focus right now. There is
-//!   intentionally no flag to pick a specific workspace from the CLI
-//!   in v1.
+//! - **`workspace`** — defaults to `None` (the focused workspace). The
+//!   `--workspace <id>` flag overrides this with an explicit workspace id,
+//!   which the caller (a launcher) may have captured before a picker stole
+//!   focus. When the flag is absent the compositor resolves the workspace
+//!   from whatever has focus at dispatch time. Validation of an explicit id is
+//!   delegated to the compositor (unknown id → `MalformedResponse(Server)`,
+//!   exit 65) — unlike `assign-workspace`, which validates the workspace id
+//!   client-side against the fetched snapshot.
 //! - **`focus: false`** — the verb is "move the workspace to
 //!   activity"; focusing the destination activity is a separate user
 //!   gesture (and a separate subcommand: `switch <name>`). The two
@@ -26,18 +29,25 @@
 //!   `CliError::ActivityNotFound(name)` (exit 66) — the user-supplied
 //!   name is in scope here, so the typed carrier names it.
 //! - `Reply::Err("workspace not found")` →
-//!   `CliError::MalformedResponse(Server(_))` (exit 65). Normally
-//!   `workspace: None` defaults to the focused workspace, so this
-//!   string is unexpected — if it surfaces, the right diagnostic is
-//!   "compositor wire contract violated", not "no such input."
-//!   (Edge case: no-monitor sessions have no focused workspace and
-//!   may legitimately emit this.)
-//! - `Reply::Err("workspace not in active activity")` falls through
-//!   to `MalformedResponse(Server)`. The `workspace: None` payload
-//!   usually resolves to the focused workspace in the active activity,
-//!   but focus can change between the user invoking the command and
-//!   the compositor processing it, so this arm is reachable in
-//!   practice. Mapping it uniformly keeps the failure diagnosable.
+//!   `CliError::MalformedResponse(Server(_))` (exit 65).
+//!   - Default path (`workspace: None`): the compositor resolves the focused
+//!     workspace; this string is unexpected and signals a wire-contract
+//!     violation. (Edge case: no-monitor sessions have no focused workspace
+//!     and may legitimately emit this.)
+//!   - Explicit path (`--workspace <id>`): the supplied id was not found by
+//!     the compositor. This is a normal user-error outcome (stale or
+//!     non-existent id). Both paths map to `MalformedResponse(Server)` — the
+//!     typed `CliError::ActivityNotFound` carrier is for activity-name
+//!     mismatches only, not workspace-id mismatches.
+//! - `Reply::Err("workspace not in active activity")` falls through to
+//!   `MalformedResponse(Server)`.
+//!   - Default path (`workspace: None`): the focused workspace is expected to
+//!     be in the active activity, but focus can drift between invocation and
+//!     dispatch, so this is a reachable timing race.
+//!   - Explicit path (`--workspace <id>`): the supplied id names a real
+//!     workspace that is not in the target activity — a normal user-error
+//!     outcome (id from the wrong activity). Both paths map to
+//!     `MalformedResponse(Server)` and keep the failure diagnosable.
 //! - Other `Reply::Err(msg)` →
 //!   `CliError::MalformedResponse(Server(msg))`.
 //! - Transport / decode errors flow through `IpcError → CliError`
@@ -63,15 +73,17 @@ use crate::picker::PickerOutcome;
 /// no focus-follow) and expects `Response::Handled`. See module docs for
 /// the full error matrix.
 ///
-/// **`--follow` path.** When `follow: true`, an extra `Request::Workspaces`
-/// fires BEFORE the move so the focused workspace's id is captured (the
-/// move reassigns activity membership; the workspace id is invariant per
-/// the compositor's workspace-as-atom contract). After a successful
-/// dispatch, a single-select picker is spawned with two rows: a
+/// **`--follow` path.** When `follow: true` and no explicit `workspace` id is
+/// supplied, an extra `Request::Workspaces` fires BEFORE the move so the
+/// focused workspace's id is captured (the move reassigns activity membership;
+/// the workspace id is invariant per the compositor's workspace-as-atom
+/// contract). When `workspace` is `Some(id)`, the snapshot round-trip is
+/// skipped — the explicit id is used directly as the follow target. After a
+/// successful dispatch, a single-select picker is spawned with two rows: a
 /// follow-confirmation row and a [`STAY_UNICODE`][stay] sentinel. On
-/// confirmation [`dispatch_follow_workspace`] is invoked against the
-/// captured id. Cancellation (Escape) and the stay-sentinel are both
-/// silent exit-0 outcomes.
+/// confirmation [`dispatch_follow_workspace`] is invoked against the captured
+/// id. Cancellation (Escape) and the stay-sentinel are both silent exit-0
+/// outcomes.
 ///
 /// **Snapshot-vs-dispatch race.** The captured id is the "workspace I was
 /// moving" at snapshot time, not at dispatch time. If focus drifts
@@ -93,25 +105,34 @@ pub(crate) fn run<F>(
     pick: F,
     follow: bool,
     overview: bool,
+    workspace: Option<u64>,
 ) -> Result<()>
 where
     F: FnOnce(&str, &[String]) -> Result<PickerOutcome, CliError>,
 {
-    // Capture the focused workspace id BEFORE the move dispatches, so a
-    // subsequent FocusWorkspace can target the moved workspace by id (id
-    // is invariant across MoveWorkspaceToActivity per the workspace-as-
-    // atom contract). The capture is gated on `follow` so the default
-    // path retains the pre-`--follow` single-IPC shape.
+    // Determine the follow target workspace id. When an explicit workspace
+    // id is supplied, use it directly as the follow target (no snapshot
+    // round-trip needed — the id is already known). When no explicit id
+    // is given, capture the focused workspace id BEFORE the move dispatches
+    // so a subsequent FocusWorkspace can target the moved workspace by id
+    // (id is invariant across MoveWorkspaceToActivity per the workspace-
+    // as-atom contract). When `follow` is false, no follow target is needed
+    // regardless.
     let focused_id = if follow {
-        let workspaces =
-            send_expect_workspaces(client).context("requesting workspaces for --follow capture")?;
-        Some(focused_workspace_id(&workspaces)?)
+        if let Some(explicit_id) = workspace {
+            // Explicit workspace id: skip the snapshot round-trip.
+            Some(explicit_id)
+        } else {
+            let workspaces = send_expect_workspaces(client)
+                .context("requesting workspaces for --follow capture")?;
+            Some(focused_workspace_id(&workspaces)?)
+        }
     } else {
         None
     };
 
     let req = Request::Action(Action::MoveWorkspaceToActivity {
-        workspace: None,
+        workspace: workspace.map(niri_ipc::WorkspaceReferenceArg::Id),
         activity: ActivityReferenceArg::Name(name.to_owned()),
         focus: false,
     });
@@ -220,6 +241,7 @@ pub(crate) fn run_picker<F>(
     pick: F,
     follow: bool,
     overview: bool,
+    workspace: Option<u64>,
 ) -> Result<()>
 where
     F: Fn(&str, &[String]) -> Result<PickerOutcome, CliError>,
@@ -233,15 +255,15 @@ where
     match pick("Move workspace to activity:", &names)? {
         PickerOutcome::Cancelled => Ok(()),
         PickerOutcome::Selected(name) => {
-            // Thread `follow` / `overview` through to `run` so the
-            // post-move follow picker fires for the picker entry path
-            // too. The `pick` closure is invoked twice from this
+            // Thread `follow` / `overview` / `workspace` through to `run`
+            // so the post-move follow picker fires for the picker entry
+            // path too. The `pick` closure is invoked twice from this
             // function: once above for stage 1, then once inside `run`
             // via `&pick` (the post-move follow picker). Hence the
             // `Fn` bound on the outer signature — `FnOnce` would
             // consume `pick` at the stage-1 call site and leave
             // nothing to borrow for the inner `run` call.
-            run(client, &name, &pick, follow, overview)
+            run(client, &name, &pick, follow, overview, workspace)
         }
     }
 }
@@ -297,7 +319,7 @@ mod tests {
         // that flipped focus or pinned a workspace id would fail here.
         let mut client = MockClient::new();
         client.expect(move_req("Work"), Reply::Ok(Response::Handled));
-        run(&mut client, "Work", no_follow_pick, false, false)
+        run(&mut client, "Work", no_follow_pick, false, false, None)
             .expect("move-workspace succeeds on Handled");
         client.assert_consumed_in_order();
     }
@@ -306,7 +328,7 @@ mod tests {
     fn move_workspace_unknown_name_maps_to_activity_not_found() {
         let mut client = MockClient::new();
         client.expect(move_req("Work"), Err("activity not found".to_owned()));
-        let err = run(&mut client, "Work", no_follow_pick, false, false)
+        let err = run(&mut client, "Work", no_follow_pick, false, false, None)
             .expect_err("unknown activity must fail");
         let cli_err = err
             .chain()
@@ -329,7 +351,8 @@ mod tests {
         // workspace-miss wire string would be misleading.
         let mut client = MockClient::new();
         client.expect(move_req("Work"), Err("workspace not found".to_owned()));
-        let err = run(&mut client, "Work", no_follow_pick, false, false).expect_err("must fail");
+        let err =
+            run(&mut client, "Work", no_follow_pick, false, false, None).expect_err("must fail");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())
@@ -356,7 +379,8 @@ mod tests {
             move_req("Work"),
             Err("workspace not in active activity".to_owned()),
         );
-        let err = run(&mut client, "Work", no_follow_pick, false, false).expect_err("must fail");
+        let err =
+            run(&mut client, "Work", no_follow_pick, false, false, None).expect_err("must fail");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())
@@ -375,7 +399,7 @@ mod tests {
     fn move_workspace_wrong_response_variant_is_malformed() {
         let mut client = MockClient::new();
         client.expect(move_req("Work"), Reply::Ok(Response::Version("v".into())));
-        let err = run(&mut client, "Work", no_follow_pick, false, false)
+        let err = run(&mut client, "Work", no_follow_pick, false, false, None)
             .expect_err("wrong variant must fail");
         let cli_err = err
             .chain()
@@ -402,7 +426,7 @@ mod tests {
             move_req("Work"),
             Err("activity switch blocked: gesture".to_owned()),
         );
-        let err = run(&mut client, "Work", no_follow_pick, false, false)
+        let err = run(&mut client, "Work", no_follow_pick, false, false, None)
             .expect_err("server error must surface");
         let cli_err = err
             .chain()
@@ -422,7 +446,8 @@ mod tests {
     fn move_workspace_preserves_context_in_error_chain() {
         let mut client = MockClient::new();
         client.expect(move_req("Work"), Err("activity not found".to_owned()));
-        let err = run(&mut client, "Work", no_follow_pick, false, false).expect_err("must fail");
+        let err =
+            run(&mut client, "Work", no_follow_pick, false, false, None).expect_err("must fail");
         let formatted = format!("{err:#}");
         assert!(
             formatted.contains("moving workspace to activity"),
@@ -471,7 +496,7 @@ mod tests {
             Ok(PickerOutcome::Selected("Personal".to_owned()))
         };
 
-        run_picker(&mut client, pick, false, false).expect("happy path succeeds");
+        run_picker(&mut client, pick, false, false, None).expect("happy path succeeds");
         client.assert_consumed_in_order();
     }
 
@@ -484,7 +509,7 @@ mod tests {
             panic!("pick must not be called when activity list is empty");
         };
 
-        run_picker(&mut client, pick, false, false).expect("empty list exits Ok");
+        run_picker(&mut client, pick, false, false, None).expect("empty list exits Ok");
         client.assert_consumed_in_order();
     }
 
@@ -503,7 +528,7 @@ mod tests {
             Ok(PickerOutcome::Cancelled)
         };
 
-        run_picker(&mut client, pick, false, false).expect("cancellation is silent Ok");
+        run_picker(&mut client, pick, false, false, None).expect("cancellation is silent Ok");
         client.assert_consumed_in_order();
     }
 
@@ -522,7 +547,8 @@ mod tests {
             panic!("pick must not be called on a malformed Activities response");
         };
 
-        let err = run_picker(&mut client, pick, false, false).expect_err("wrong variant must fail");
+        let err =
+            run_picker(&mut client, pick, false, false, None).expect_err("wrong variant must fail");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())
@@ -573,7 +599,7 @@ mod tests {
             Ok(PickerOutcome::Selected(items[0].clone()))
         };
 
-        run(&mut client, "Personal", pick, true, false).expect("--follow succeeds");
+        run(&mut client, "Personal", pick, true, false, None).expect("--follow succeeds");
         client.assert_consumed_in_order();
     }
 
@@ -594,7 +620,7 @@ mod tests {
         let pick = |_: &str, _: &[String]| -> Result<PickerOutcome, CliError> {
             Ok(PickerOutcome::Selected("definitely-not-an-item".to_owned()))
         };
-        let err = run(&mut client, "Personal", pick, true, false)
+        let err = run(&mut client, "Personal", pick, true, false, None)
             .expect_err("unknown row must route to MalformedResponse");
         let cli_err = err
             .chain()
@@ -623,7 +649,7 @@ mod tests {
             Request::Workspaces,
             Reply::Ok(Response::Workspaces(vec![ws(42, false, vec![1])])),
         );
-        let err = run(&mut client, "Personal", no_follow_pick, true, false)
+        let err = run(&mut client, "Personal", no_follow_pick, true, false, None)
             .expect_err("no focused workspace must fail with exit 65 before move");
         let cli_err = err
             .chain()
@@ -667,7 +693,7 @@ mod tests {
             }
         };
 
-        run_picker(&mut client, pick, true, false).expect("delegation threads --follow");
+        run_picker(&mut client, pick, true, false, None).expect("delegation threads --follow");
         client.assert_consumed_in_order();
     }
 
@@ -703,7 +729,66 @@ mod tests {
             }
         };
 
-        run_picker(&mut client, pick, true, true).expect("delegation threads --overview");
+        run_picker(&mut client, pick, true, true, None).expect("delegation threads --overview");
+        client.assert_consumed_in_order();
+    }
+
+    // ---- --workspace explicit-target tests ----------------------------------
+
+    /// `--workspace 42` passed to `move-workspace` named-arg form: the
+    /// `MoveWorkspaceToActivity` request must carry
+    /// `workspace: Some(WorkspaceReferenceArg::Id(42))` — not `None`.
+    #[test]
+    fn move_workspace_explicit_workspace_threads_into_request_payload() {
+        let mut client = MockClient::new();
+        // Explicit workspace: no Workspaces snapshot capture needed before
+        // the move (follow is false here).
+        client.expect(
+            Request::Action(Action::MoveWorkspaceToActivity {
+                workspace: Some(WorkspaceReferenceArg::Id(42)),
+                activity: ActivityReferenceArg::Name("Personal".to_owned()),
+                focus: false,
+            }),
+            Reply::Ok(Response::Handled),
+        );
+        run(
+            &mut client,
+            "Personal",
+            no_follow_pick,
+            false,
+            false,
+            Some(42),
+        )
+        .expect("explicit --workspace succeeds");
+        client.assert_consumed_in_order();
+    }
+
+    /// `--workspace 42` with `--follow true`: the `Request::Workspaces`
+    /// capture round-trip is skipped (the explicit id is used directly
+    /// as the follow target). The MockClient queue has no `Request::Workspaces`
+    /// before the move; only the move and follow-confirm dispatch appear.
+    #[test]
+    fn move_workspace_explicit_workspace_with_follow_skips_capture_roundtrip() {
+        let mut client = MockClient::new();
+        // No Request::Workspaces queued — the test asserts that absence by
+        // virtue of assert_consumed_in_order succeeding without it.
+        client.expect(
+            Request::Action(Action::MoveWorkspaceToActivity {
+                workspace: Some(WorkspaceReferenceArg::Id(42)),
+                activity: ActivityReferenceArg::Name("Personal".to_owned()),
+                focus: false,
+            }),
+            Reply::Ok(Response::Handled),
+        );
+        // Follow picker confirms → FocusWorkspace fires against the explicit id.
+        client.expect(focus_workspace_req(42), Reply::Ok(Response::Handled));
+
+        let pick = |prompt: &str, items: &[String]| -> Result<PickerOutcome, CliError> {
+            assert_eq!(prompt, "Follow?");
+            Ok(PickerOutcome::Selected(items[0].clone()))
+        };
+        run(&mut client, "Personal", pick, true, false, Some(42))
+            .expect("--workspace with --follow skips snapshot round-trip");
         client.assert_consumed_in_order();
     }
 }

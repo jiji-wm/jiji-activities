@@ -57,6 +57,10 @@ pub(crate) enum Cmd {
         // in `dispatch` via `resolve_follow_overview`.
         #[arg(long)]
         overview: bool,
+        /// Move this specific window id instead of the focused window.
+        /// Replaces the "use the focused window" default.
+        #[arg(long)]
+        window: Option<u64>,
     },
 
     /// Move the focused window to a workspace within the current activity (picker).
@@ -70,6 +74,10 @@ pub(crate) enum Cmd {
         // in `dispatch` via `resolve_follow_overview`.
         #[arg(long)]
         overview: bool,
+        /// Move this specific window id instead of the focused window.
+        /// Replaces the "use the focused window" default.
+        #[arg(long)]
+        window: Option<u64>,
     },
 
     /// Move the focused workspace to an activity (picker if no name).
@@ -84,6 +92,10 @@ pub(crate) enum Cmd {
         // in `dispatch` via `resolve_follow_overview`.
         #[arg(long)]
         overview: bool,
+        /// Move this specific workspace id instead of the focused workspace.
+        /// Replaces the "use the focused workspace" default.
+        #[arg(long)]
+        workspace: Option<u64>,
     },
 
     /// Assign the focused workspace to one or more activities via picker.
@@ -151,21 +163,27 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             name,
             follow,
             overview,
+            window,
         } => {
             let (follow, overview) = resolve_follow_overview(follow, overview);
-            cmd_move_window(name, follow, overview)
+            cmd_move_window(name, follow, overview, window)
         }
-        Cmd::MoveWindowHere { follow, overview } => {
+        Cmd::MoveWindowHere {
+            follow,
+            overview,
+            window,
+        } => {
             let (follow, overview) = resolve_follow_overview(follow, overview);
-            cmd_move_window_here(follow, overview)
+            cmd_move_window_here(follow, overview, window)
         }
         Cmd::MoveWorkspace {
             name,
             follow,
             overview,
+            workspace,
         } => {
             let (follow, overview) = resolve_follow_overview(follow, overview);
-            cmd_move_workspace(name, follow, overview)
+            cmd_move_workspace(name, follow, overview, workspace)
         }
         Cmd::AssignWorkspace { follow, overview } => {
             let (follow, overview) = resolve_follow_overview(follow, overview);
@@ -206,7 +224,12 @@ fn cmd_switch_previous() -> Result<()> {
     switch_previous::run(client.as_mut())
 }
 
-fn cmd_move_window(name: Option<String>, follow: bool, overview: bool) -> Result<()> {
+fn cmd_move_window(
+    name: Option<String>,
+    follow: bool,
+    overview: bool,
+    window: Option<u64>,
+) -> Result<()> {
     match name {
         Some(n) => {
             // When `--follow` is set the named-arg form also spawns a
@@ -220,7 +243,14 @@ fn cmd_move_window(name: Option<String>, follow: bool, overview: bool) -> Result
                     .context("verifying move-window follow picker availability")?;
             }
             let mut client = ipc::make_client();
-            move_window::run(client.as_mut(), &n, picker::pick_one, follow, overview)
+            move_window::run(
+                client.as_mut(),
+                &n,
+                picker::pick_one,
+                follow,
+                overview,
+                window,
+            )
         }
         None => {
             // Verify `fuzzel` is on $PATH BEFORE any IPC round-trip so a
@@ -236,23 +266,29 @@ fn cmd_move_window(name: Option<String>, follow: bool, overview: bool) -> Result
                 picker::prompt_name,
                 follow,
                 overview,
+                window,
             )
             .context("running move-window picker")
         }
     }
 }
 
-fn cmd_move_window_here(follow: bool, overview: bool) -> Result<()> {
+fn cmd_move_window_here(follow: bool, overview: bool, window: Option<u64>) -> Result<()> {
     // Verify `fuzzel` is on $PATH BEFORE any IPC round-trip — same
     // rationale as cmd_move_window's no-arg branch. `move-window-here`
     // has no named-arg form; it is always picker-driven.
     picker::ensure_available().context("verifying move-window-here picker availability")?;
     let mut client = ipc::make_client();
-    move_window::run_here_picker(client.as_mut(), picker::pick_one, follow, overview)
+    move_window::run_here_picker(client.as_mut(), picker::pick_one, follow, overview, window)
         .context("running move-window-here picker")
 }
 
-fn cmd_move_workspace(name: Option<String>, follow: bool, overview: bool) -> Result<()> {
+fn cmd_move_workspace(
+    name: Option<String>,
+    follow: bool,
+    overview: bool,
+    workspace: Option<u64>,
+) -> Result<()> {
     match name {
         Some(n) => {
             // Same rationale as `cmd_move_window`'s named-arg branch:
@@ -265,7 +301,14 @@ fn cmd_move_workspace(name: Option<String>, follow: bool, overview: bool) -> Res
                     .context("verifying move-workspace follow picker availability")?;
             }
             let mut client = ipc::make_client();
-            move_workspace::run(client.as_mut(), &n, picker::pick_one, follow, overview)
+            move_workspace::run(
+                client.as_mut(),
+                &n,
+                picker::pick_one,
+                follow,
+                overview,
+                workspace,
+            )
         }
         None => {
             // Verify `fuzzel` is on $PATH BEFORE any IPC round-trip so a
@@ -275,8 +318,14 @@ fn cmd_move_workspace(name: Option<String>, follow: bool, overview: bool) -> Res
             // produce on a disconnected socket.
             picker::ensure_available().context("verifying move-workspace picker availability")?;
             let mut client = ipc::make_client();
-            move_workspace::run_picker(client.as_mut(), picker::pick_one, follow, overview)
-                .context("running move-workspace picker")
+            move_workspace::run_picker(
+                client.as_mut(),
+                picker::pick_one,
+                follow,
+                overview,
+                workspace,
+            )
+            .context("running move-workspace picker")
         }
     }
 }
