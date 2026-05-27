@@ -19,6 +19,11 @@ cargo clippy --all --all-targets  # zero-warning baseline established Phase 3.1
 
 Smoke tests against a live compositor are gated behind `#[ignore]`; run with `cargo test --test smoke -- --ignored --test-threads=1`. The smoke layer leaves no residue if all six tests pass (each runtime activity created carries the `__nact_smoke_<test>_<pid>_<nanos>` prefix; `RuntimeActivityGuard` does best-effort cleanup on Drop).
 
+### Implementer discipline (read by jiji-rust-implementer)
+
+- **`assert_cmd` rigor.** End-to-end CLI behavior is tested via `assert_cmd` with `$PATH`-scoped shim executables — never by mutating the real environment or talking to a live compositor.
+- **Exit-code consistency.** Map error classes to stable exit codes; pin them in tests. A changed exit code without a test update is a stop-and-report condition.
+
 ## Live install
 
 The user's installed binary lives at `~/.cargo/bin/jiji-activities`. After any feature change touching the CLI surface:
