@@ -130,6 +130,9 @@ pub(crate) enum Cmd {
         json: bool,
         #[arg(long, conflicts_with = "json")]
         format: Option<String>,
+        /// Narrow output to a single named activity. Unknown name → exit 66.
+        #[arg(long)]
+        activity: Option<String>,
     },
 
     /// Emit a shell completion script for the given shell to stdout.
@@ -200,7 +203,11 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
         Cmd::Create { name } => cmd_create(name),
         Cmd::Remove { name } => cmd_remove(name),
         Cmd::Save { name } => cmd_save(name),
-        Cmd::List { json, format } => cmd_list(json, format),
+        Cmd::List {
+            json,
+            format,
+            activity,
+        } => cmd_list(json, format, activity),
         Cmd::Completions { shell } => cmd_completions(shell),
     }
 }
@@ -382,7 +389,7 @@ fn cmd_save(name: String) -> Result<()> {
     save::run(client.as_mut(), &name, &save::RealConfigPaths).context("saving activity to config")
 }
 
-fn cmd_list(json: bool, format: Option<String>) -> Result<()> {
+fn cmd_list(json: bool, format: Option<String>, activity: Option<String>) -> Result<()> {
     let mut client = ipc::make_client();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -391,6 +398,7 @@ fn cmd_list(json: bool, format: Option<String>) -> Result<()> {
         ListOpts {
             json,
             format: format.as_deref(),
+            activity: activity.as_deref(),
         },
         &mut out,
     )

@@ -31,6 +31,11 @@ pub(crate) struct ListOpts<'a> {
     pub(crate) json: bool,
     /// `--format=<spec>`. `None` means use plain mode.
     pub(crate) format: Option<&'a str>,
+    /// `--activity=<name>`. When `Some`, narrow output to the named
+    /// activity. An unknown name is rejected immediately after the
+    /// `Activities` IPC response with [`CliError::ActivityNotFound`]
+    /// (exit 66); no further IPC calls are issued.
+    pub(crate) activity: Option<&'a str>,
 }
 
 /// Runs the `list` subcommand against `client`, writing output to `out`.
@@ -57,10 +62,35 @@ pub(crate) fn run(
     };
 
     let activities = send_expect_activities(client).context("requesting activities")?;
+
+    // Validate --activity before issuing any further IPC. An unknown name
+    // is a usage error (exit 66); failing fast here means the Workspaces
+    // and Windows calls are skipped, which matches the early-exit behaviour
+    // of the WrongVariant paths tested in `run_returns_wrong_variant_*`.
+    if let Some(name) = opts.activity
+        && !activities.iter().any(|a| a.name == name)
+    {
+        return Err(CliError::ActivityNotFound(name.to_string()).into());
+    }
+
     let workspaces = send_expect_workspaces(client).context("requesting workspaces")?;
     let windows = send_expect_windows(client).context("requesting windows")?;
 
     let view = join(activities, workspaces, windows);
+
+    // Narrow to the requested activity after join so all three render
+    // paths see the same filtered shape uniformly.
+    let view = if let Some(name) = opts.activity {
+        ListView {
+            activities: view
+                .activities
+                .into_iter()
+                .filter(|a| a.name == name)
+                .collect(),
+        }
+    } else {
+        view
+    };
 
     if opts.json {
         render_json(&view, out).map_err(classify_write_err)?;
@@ -852,6 +882,7 @@ mod tests {
             ListOpts {
                 json: false,
                 format: None,
+                activity: None,
             },
             &mut buf,
         )
@@ -905,6 +936,7 @@ mod tests {
             ListOpts {
                 json: false,
                 format: None,
+                activity: None,
             },
             &mut buf,
         )
@@ -953,6 +985,7 @@ mod tests {
             ListOpts {
                 json: false,
                 format: None,
+                activity: None,
             },
             &mut buf,
         )
@@ -1002,6 +1035,7 @@ mod tests {
             ListOpts {
                 json: false,
                 format: None,
+                activity: None,
             },
             &mut buf,
         )
@@ -1044,6 +1078,7 @@ mod tests {
             ListOpts {
                 json: true,
                 format: None,
+                activity: None,
             },
             &mut buf,
         )
@@ -1072,6 +1107,7 @@ mod tests {
             ListOpts {
                 json: false,
                 format: Some("name"),
+                activity: None,
             },
             &mut buf,
         )
@@ -1085,6 +1121,156 @@ mod tests {
         assert!(
             out.contains("Work"),
             "--format=name output must contain activity name; got: {out}",
+        );
+    }
+
+    // ---- --activity filter ----
+
+    /// Fixture: two activities ("Work" focused, "Personal" not), one
+    /// workspace per activity, one window each.
+    fn queue_two_activity_replies(client: &mut MockClient) {
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![
+                act(1, "Work", true, true),
+                act(2, "Personal", false, true),
+            ])),
+        );
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![
+                ws(10, None, vec![1], false),
+                ws(20, None, vec![2], false),
+            ])),
+        );
+        client.expect(
+            Request::Windows,
+            Reply::Ok(Response::Windows(vec![
+                win(100, Some(10)),
+                win(200, Some(20)),
+            ])),
+        );
+    }
+
+    #[test]
+    fn run_activity_filter_narrows_plain() {
+        // --activity Work → plain output contains only "Work", not "Personal".
+        let mut client = MockClient::new();
+        queue_two_activity_replies(&mut client);
+        let mut buf = Vec::new();
+        run(
+            &mut client,
+            ListOpts {
+                json: false,
+                format: None,
+                activity: Some("Work"),
+            },
+            &mut buf,
+        )
+        .expect("run --activity Work must succeed");
+        client.assert_consumed_in_order();
+        let out = String::from_utf8(buf).expect("utf-8 stdout");
+        assert!(out.contains("Work"), "Work must appear in output: {out}");
+        assert!(
+            !out.contains("Personal"),
+            "Personal must not appear in filtered output: {out}",
+        );
+    }
+
+    #[test]
+    fn run_activity_filter_narrows_json() {
+        // --activity Work with --json → envelope contains exactly one activity.
+        let mut client = MockClient::new();
+        queue_two_activity_replies(&mut client);
+        let mut buf = Vec::new();
+        run(
+            &mut client,
+            ListOpts {
+                json: true,
+                format: None,
+                activity: Some("Work"),
+            },
+            &mut buf,
+        )
+        .expect("run --activity Work --json must succeed");
+        client.assert_consumed_in_order();
+        let out = String::from_utf8(buf).expect("utf-8 stdout");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("output must be JSON");
+        let acts = parsed["activities"]
+            .as_array()
+            .expect("activities must be array");
+        assert_eq!(acts.len(), 1, "exactly one activity after filter: {out}");
+        assert_eq!(
+            acts[0]["name"], "Work",
+            "filtered activity must be Work: {out}"
+        );
+    }
+
+    #[test]
+    fn run_activity_filter_narrows_format() {
+        // --activity Work with --format=name → only "Work\n" on stdout.
+        let mut client = MockClient::new();
+        queue_two_activity_replies(&mut client);
+        let mut buf = Vec::new();
+        run(
+            &mut client,
+            ListOpts {
+                json: false,
+                format: Some("name"),
+                activity: Some("Work"),
+            },
+            &mut buf,
+        )
+        .expect("run --activity Work --format=name must succeed");
+        client.assert_consumed_in_order();
+        let out = String::from_utf8(buf).expect("utf-8 stdout");
+        assert_eq!(out, "Work\n", "filtered --format=name output: {out}");
+    }
+
+    #[test]
+    fn run_activity_unknown_returns_not_found() {
+        // An unknown --activity name must fail immediately after Activities
+        // (no Workspaces or Windows IPC call issued) with ActivityNotFound.
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![act(1, "Work", true, true)])),
+        );
+        // Intentionally no Workspaces or Windows queue entries — the
+        // remaining_count() assert below enforces they were not issued.
+        let mut buf = Vec::new();
+        let err = run(
+            &mut client,
+            ListOpts {
+                json: false,
+                format: None,
+                activity: Some("Bogus"),
+            },
+            &mut buf,
+        )
+        .expect_err("unknown activity must be an error");
+        let cli_err = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<CliError>())
+            .expect("CliError must be in chain");
+        match cli_err {
+            CliError::ActivityNotFound(name) => {
+                assert_eq!(name, "Bogus", "error must name the unknown activity");
+            }
+            other => panic!("expected ActivityNotFound, got {other:?}"),
+        }
+        // Chain-walk must recover exit code 66.
+        assert_eq!(
+            err.chain()
+                .find_map(|e| e.downcast_ref::<CliError>())
+                .map(|e| e.exit_code()),
+            Some(66),
+            "ActivityNotFound must produce exit code 66",
+        );
+        assert_eq!(
+            client.remaining_count(),
+            0,
+            "no Workspaces/Windows call should be issued for an unknown activity",
         );
     }
 }
