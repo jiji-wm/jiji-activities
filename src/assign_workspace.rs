@@ -48,6 +48,12 @@ use crate::picker::multi_select::{self, MultiPickerOutcome};
 /// (rofi for multi-select, optionally fuzzel for the chained
 /// single-select) is invoked between IPC calls.
 ///
+/// When `workspace` is `Some(id)`, the workspace with that id is looked up in
+/// the fetched Workspaces snapshot and used as the assignment target instead
+/// of the focused workspace. The `Request::Workspaces` fetch always occurs
+/// because the handler needs the workspace's current activity membership to
+/// seed the multi-select picker's pre-checked rows.
+///
 /// **Returns `Ok(())` when:**
 /// - `SetWorkspaceActivities` is dispatched and the compositor replies
 ///   `Response::Handled`.
@@ -55,7 +61,13 @@ use crate::picker::multi_select::{self, MultiPickerOutcome};
 /// - The activity list is empty (no picker spawn; eprintln diagnostic).
 ///
 /// **Returns `Err` when:**
-/// - No workspace has `is_focused: true` →
+/// - `workspace` is `Some(id)` and no workspace with that id exists in the
+///   snapshot →
+///   `CliError::MalformedResponse(Server("workspace id <N> not found in snapshot"))` (exit 65).
+///   The `"workspace id <N> not found in snapshot"` string is a
+///   **CLI-synthetic** marker, not a compositor wire emission — see the
+///   snapshot-miss construction site below.
+/// - `workspace` is `None` and no workspace has `is_focused: true` →
 ///   `CliError::MalformedResponse(Server("no focused workspace"))` (exit 65).
 ///   The `"no focused workspace"` string is a **CLI-synthetic** marker, not
 ///   a compositor wire emission — see [`focused_workspace`].
@@ -67,7 +79,11 @@ use crate::picker::multi_select::{self, MultiPickerOutcome};
 /// **`--follow`.** When `follow: true`, after a successful dispatch a
 /// follow picker is spawned over the saved activity names plus a `« Stay »`
 /// sentinel. On confirmation, [`dispatch_follow_activity_and_workspace`] is
-/// invoked. If the picker returns an unrecognised row →
+/// invoked against the **assignment target** workspace id (the explicit id
+/// when `--workspace` is supplied, or the focused workspace id otherwise).
+/// When `--workspace <id>` and `--follow` are combined, the follow
+/// `FocusWorkspace` targets the explicit workspace, not the focused one.
+/// If the picker returns an unrecognised row →
 /// `MalformedResponse(Server("follow picker returned row not in items: …"))`
 /// (exit 65). `overview: true` causes an additional `OpenOverview` IPC call
 /// after `FocusWorkspace` on the follow path.
@@ -84,6 +100,7 @@ pub(crate) fn run<F>(
     pick: F,
     follow: bool,
     overview: bool,
+    workspace: Option<u64>,
 ) -> Result<()>
 where
     F: FnOnce(&str, &[String]) -> Result<PickerOutcome, CliError>,
@@ -94,7 +111,24 @@ where
         return Ok(());
     }
     let workspaces = send_expect_workspaces(client).context("requesting workspaces")?;
-    let ws = focused_workspace(&workspaces).context("locating focused workspace")?;
+    // Select the target workspace: explicit id takes priority over focus.
+    //
+    // **Synthetic-string discipline.** The `"workspace id <N> not found in
+    // snapshot"` literal constructed below is a **CLI-internal** value — it
+    // is **not** emitted on the wire by the niri compositor. A future grep
+    // that audits compositor wire-string matches must skip this site.
+    let ws = match workspace {
+        Some(id) => workspaces
+            .iter()
+            .find(|w| w.id == id)
+            .ok_or_else(|| {
+                CliError::MalformedResponse(MalformedResponseSource::Server(format!(
+                    "workspace id {id} not found in snapshot"
+                )))
+            })
+            .context("locating explicit workspace in snapshot")?,
+        None => focused_workspace(&workspaces).context("locating focused workspace")?,
+    };
     let ws_id = ws.id;
     let activity_names: Vec<String> = activities.iter().map(|a| a.name.clone()).collect();
     let current = workspace_activity_names(ws, &activities);
@@ -330,6 +364,7 @@ mod tests {
         follow_pick: FP,
         follow: bool,
         overview: bool,
+        workspace: Option<u64>,
     ) -> Result<()>
     where
         MS: FnOnce(&[String], &HashSet<String>) -> Result<MultiPickerOutcome, CliError>,
@@ -342,7 +377,18 @@ mod tests {
             return Ok(());
         }
         let workspaces = send_expect_workspaces(client).context("requesting workspaces")?;
-        let ws = focused_workspace(&workspaces)?;
+        let ws = match workspace {
+            Some(id) => workspaces
+                .iter()
+                .find(|w| w.id == id)
+                .ok_or_else(|| {
+                    CliError::MalformedResponse(MalformedResponseSource::Server(format!(
+                        "workspace id {id} not found in snapshot"
+                    )))
+                })
+                .context("locating explicit workspace in snapshot")?,
+            None => focused_workspace(&workspaces).context("locating focused workspace")?,
+        };
         let ws_id = ws.id;
         let activity_names: Vec<String> = activities.iter().map(|a| a.name.clone()).collect();
         let current = workspace_activity_names(ws, &activities);
@@ -422,7 +468,7 @@ mod tests {
         let one = |_: &[String]| -> Result<PickerOutcome, CliError> {
             panic!("chained picker must not be called for Selected outcome");
         };
-        run_with_pickers(&mut client, multi, one, no_follow_pick, false, false)
+        run_with_pickers(&mut client, multi, one, no_follow_pick, false, false, None)
             .expect("happy path succeeds");
         client.assert_consumed_in_order();
     }
@@ -457,7 +503,7 @@ mod tests {
             assert_eq!(names, &["Work", "Personal"]);
             Ok(PickerOutcome::Selected("Personal".into()))
         };
-        run_with_pickers(&mut client, multi, one, no_follow_pick, false, false)
+        run_with_pickers(&mut client, multi, one, no_follow_pick, false, false, None)
             .expect("chain path succeeds");
         client.assert_consumed_in_order();
     }
@@ -478,7 +524,7 @@ mod tests {
         );
         let multi = |_: &[String], _: &HashSet<String>| Ok(MultiPickerOutcome::ChainSingle);
         let one = |_: &[String]| Ok(PickerOutcome::Cancelled);
-        run_with_pickers(&mut client, multi, one, no_follow_pick, false, false)
+        run_with_pickers(&mut client, multi, one, no_follow_pick, false, false, None)
             .expect("cancellation is silent Ok");
         client.assert_consumed_in_order();
     }
@@ -500,7 +546,7 @@ mod tests {
         let one = |_: &[String]| -> Result<PickerOutcome, CliError> {
             panic!("chained picker must not be called on Cancelled");
         };
-        run_with_pickers(&mut client, multi, one, no_follow_pick, false, false)
+        run_with_pickers(&mut client, multi, one, no_follow_pick, false, false, None)
             .expect("cancellation is silent Ok");
         client.assert_consumed_in_order();
     }
@@ -526,7 +572,7 @@ mod tests {
         let one = |_: &[String]| -> Result<PickerOutcome, CliError> {
             panic!("chained picker must not be called when no workspace is focused");
         };
-        let err = run_with_pickers(&mut client, multi, one, no_follow_pick, false, false)
+        let err = run_with_pickers(&mut client, multi, one, no_follow_pick, false, false, None)
             .expect_err("no focused workspace must surface as error");
         let cli_err = err
             .chain()
@@ -554,7 +600,7 @@ mod tests {
         let one = |_: &[String]| -> Result<PickerOutcome, CliError> {
             panic!("chained picker must not be called when activity list is empty");
         };
-        run_with_pickers(&mut client, multi, one, no_follow_pick, false, false)
+        run_with_pickers(&mut client, multi, one, no_follow_pick, false, false, None)
             .expect("empty list exits Ok");
         client.assert_consumed_in_order();
     }
@@ -570,7 +616,7 @@ mod tests {
             panic!("picker must not be called on malformed Activities response");
         };
         let one = |_: &[String]| -> Result<PickerOutcome, CliError> { unreachable!() };
-        let err = run_with_pickers(&mut client, multi, one, no_follow_pick, false, false)
+        let err = run_with_pickers(&mut client, multi, one, no_follow_pick, false, false, None)
             .expect_err("wrong variant must surface");
         let cli_err = err
             .chain()
@@ -604,7 +650,7 @@ mod tests {
             panic!("picker must not be called on malformed Workspaces response");
         };
         let one = |_: &[String]| -> Result<PickerOutcome, CliError> { unreachable!() };
-        let err = run_with_pickers(&mut client, multi, one, no_follow_pick, false, false)
+        let err = run_with_pickers(&mut client, multi, one, no_follow_pick, false, false, None)
             .expect_err("wrong variant must surface");
         let cli_err = err
             .chain()
@@ -649,7 +695,7 @@ mod tests {
             Ok(MultiPickerOutcome::Selected(vec!["Work".into()]))
         };
         let one = |_: &[String]| -> Result<PickerOutcome, CliError> { unreachable!() };
-        let err = run_with_pickers(&mut client, multi, one, no_follow_pick, false, false)
+        let err = run_with_pickers(&mut client, multi, one, no_follow_pick, false, false, None)
             .expect_err("server error must propagate");
         let cli_err = err
             .chain()
@@ -733,6 +779,7 @@ mod tests {
             follow_pick,
             true,
             false,
+            None,
         )
         .expect("item-shape assertion exits Ok");
         client.assert_consumed_in_order();
@@ -758,6 +805,7 @@ mod tests {
             follow_pick,
             true,
             false,
+            None,
         )
         .expect("cancelled follow picker exits Ok");
         client.assert_consumed_in_order();
@@ -806,7 +854,7 @@ mod tests {
             assert_eq!(items[0], "Work");
             Ok(PickerOutcome::Selected("Work".into()))
         };
-        run_with_pickers(&mut client, multi, one, follow_pick, true, false)
+        run_with_pickers(&mut client, multi, one, follow_pick, true, false, None)
             .expect("follow happy-path succeeds");
         client.assert_consumed_in_order();
     }
@@ -840,7 +888,7 @@ mod tests {
         let follow_pick = |_: &str, _: &[String]| -> Result<PickerOutcome, CliError> {
             Ok(PickerOutcome::Selected("not-an-item".into()))
         };
-        let err = run_with_pickers(&mut client, multi, one, follow_pick, true, false)
+        let err = run_with_pickers(&mut client, multi, one, follow_pick, true, false, None)
             .expect_err("unknown row must surface as error");
         let cli_err = err
             .chain()
@@ -856,6 +904,228 @@ mod tests {
             other => panic!("expected MalformedResponse(Server), got {other:?}"),
         }
         assert_eq!(cli_err.exit_code(), 65);
+        client.assert_consumed_in_order();
+    }
+
+    // ---- --workspace explicit-target -----------------------------------------
+
+    /// `--workspace <id>` present in the snapshot: the explicit workspace is
+    /// used as the assignment target (not the focused one). The picker is seeded
+    /// from the explicit workspace's activity membership, and
+    /// `SetWorkspaceActivities` is dispatched with the explicit workspace's id.
+    ///
+    /// Uses a setup where the focused workspace (id=7, activity=[1]) differs
+    /// from the explicit-id workspace (id=99, activity=[2]), so the seeding-
+    /// from-explicit-not-focused property is actually verified rather than
+    /// coincidentally passing.
+    #[test]
+    fn assign_explicit_workspace_id_uses_that_workspace_not_focused() {
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![
+                act(1, "Work"),
+                act(2, "Personal"),
+            ])),
+        );
+        // Workspace 7 is focused (activity 1). Workspace 99 is not focused
+        // (activity 2). The explicit --workspace 99 must select workspace 99.
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![
+                ws(7, true, vec![1]),
+                ws(99, false, vec![2]),
+            ])),
+        );
+        // Dispatch must use Id(99), not Id(7).
+        client.expect(
+            Request::Action(Action::SetWorkspaceActivities {
+                workspace: Some(WorkspaceReferenceArg::Id(99)),
+                activities: vec![ActivityReferenceArg::Name("Personal".into())],
+            }),
+            Reply::Ok(Response::Handled),
+        );
+
+        // The multi picker must be seeded with "Personal" as the pre-checked
+        // set (because workspace 99 is in activity 2 = "Personal").
+        let multi = |_names: &[String], current: &HashSet<String>| {
+            assert!(
+                current.contains("Personal"),
+                "picker must be seeded from explicit workspace (Personal), not focused (Work)",
+            );
+            assert!(
+                !current.contains("Work"),
+                "focused workspace activity (Work) must NOT appear in pre-checked set",
+            );
+            Ok(MultiPickerOutcome::Selected(vec!["Personal".into()]))
+        };
+        let one = |_: &[String]| -> Result<PickerOutcome, CliError> { unreachable!() };
+        run_with_pickers(
+            &mut client,
+            multi,
+            one,
+            no_follow_pick,
+            false,
+            false,
+            Some(99),
+        )
+        .expect("explicit-workspace happy path succeeds");
+        client.assert_consumed_in_order();
+    }
+
+    /// `--workspace <id>` with an id NOT in the snapshot: must return
+    /// `MalformedResponse(Server("workspace id <N> not found in snapshot"))`,
+    /// exit 65, and must NOT dispatch `SetWorkspaceActivities`.
+    #[test]
+    fn assign_explicit_workspace_id_not_in_snapshot_routes_to_malformed_response() {
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![act(1, "Work")])),
+        );
+        // Snapshot contains only workspace 5 — not workspace 42.
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![ws(5, true, vec![1])])),
+        );
+        let multi = |_: &[String], _: &HashSet<String>| -> Result<MultiPickerOutcome, CliError> {
+            panic!("picker must not be called when explicit workspace id is missing from snapshot");
+        };
+        let one = |_: &[String]| -> Result<PickerOutcome, CliError> {
+            panic!("chained picker must not be called when explicit workspace id is missing");
+        };
+        let err = run_with_pickers(
+            &mut client,
+            multi,
+            one,
+            no_follow_pick,
+            false,
+            false,
+            Some(42),
+        )
+        .expect_err("missing explicit workspace id must surface as error");
+        let cli_err = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<CliError>())
+            .expect("CliError must be in chain");
+        match cli_err {
+            CliError::MalformedResponse(MalformedResponseSource::Server(msg)) => {
+                assert!(
+                    msg.contains("workspace id 42 not found in snapshot"),
+                    "expected synthetic-string carrier message, got: {msg}",
+                );
+            }
+            other => panic!("expected MalformedResponse(Server), got {other:?}"),
+        }
+        assert_eq!(cli_err.exit_code(), 65);
+        client.assert_consumed_in_order();
+    }
+
+    /// `--workspace <id>` combined with `--follow`: the follow leg's
+    /// `FocusWorkspace` must target the EXPLICIT workspace id (ws 99), not the
+    /// focused workspace (ws 7). Mirrors
+    /// `move_workspace_explicit_workspace_with_follow_skips_capture_roundtrip`
+    /// for the `assign-workspace` verb.
+    ///
+    /// Setup: ws 7 is focused (activity 1 = "Work"), ws 99 is not focused
+    /// (activity 2 = "Personal"). `--workspace 99 --follow` is passed.
+    /// The expected IPC sequence is:
+    ///   1. `Activities` (fetch)
+    ///   2. `Workspaces` (fetch)
+    ///   3. `SetWorkspaceActivities { Id(99), ["Personal"] }` (assign)
+    ///   4. `SwitchActivity { Name("Personal") }` (follow)
+    ///   5. `FocusWorkspace { Id(99) }` (follow — explicit workspace, not ws 7)
+    #[test]
+    fn assign_explicit_workspace_with_follow_targets_explicit_workspace() {
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![
+                act(1, "Work"),
+                act(2, "Personal"),
+            ])),
+        );
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![
+                ws(7, true, vec![1]),
+                ws(99, false, vec![2]),
+            ])),
+        );
+        client.expect(
+            Request::Action(Action::SetWorkspaceActivities {
+                workspace: Some(WorkspaceReferenceArg::Id(99)),
+                activities: vec![ActivityReferenceArg::Name("Personal".into())],
+            }),
+            Reply::Ok(Response::Handled),
+        );
+        // Follow: switch to "Personal" then focus ws 99 (explicit id).
+        client.expect(
+            switch_activity_req("Personal"),
+            Reply::Ok(Response::Handled),
+        );
+        client.expect(focus_workspace_req(99), Reply::Ok(Response::Handled));
+
+        let multi = |_names: &[String], current: &HashSet<String>| {
+            // Picker is seeded from ws 99's membership ("Personal").
+            assert!(current.contains("Personal"));
+            Ok(MultiPickerOutcome::Selected(vec!["Personal".into()]))
+        };
+        let one = |_: &[String]| -> Result<PickerOutcome, CliError> { unreachable!() };
+        let follow_pick = |_: &str, items: &[String]| -> Result<PickerOutcome, CliError> {
+            // Pick "Personal" to trigger the follow path.
+            Ok(PickerOutcome::Selected(items[0].clone()))
+        };
+        run_with_pickers(&mut client, multi, one, follow_pick, true, false, Some(99))
+            .expect("explicit workspace + follow targets the explicit workspace");
+        client.assert_consumed_in_order();
+    }
+
+    /// `--workspace` unset (regression pin): the focused-workspace path runs
+    /// unchanged — the focused workspace's id is used for dispatch and the
+    /// picker is seeded from its activity membership.
+    #[test]
+    fn assign_workspace_unset_uses_focused_workspace() {
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![
+                act(1, "Work"),
+                act(2, "Personal"),
+            ])),
+        );
+        client.expect(
+            Request::Workspaces,
+            Reply::Ok(Response::Workspaces(vec![
+                ws(7, true, vec![1]),
+                ws(99, false, vec![2]),
+            ])),
+        );
+        // Dispatch must use the focused workspace id (7), not the non-focused
+        // one (99).
+        client.expect(
+            Request::Action(Action::SetWorkspaceActivities {
+                workspace: Some(WorkspaceReferenceArg::Id(7)),
+                activities: vec![ActivityReferenceArg::Name("Work".into())],
+            }),
+            Reply::Ok(Response::Handled),
+        );
+
+        // Pre-checked set must reflect the focused workspace's memberships.
+        let multi = |_: &[String], current: &HashSet<String>| {
+            assert!(
+                current.contains("Work"),
+                "picker must be seeded from focused workspace (Work)",
+            );
+            assert!(
+                !current.contains("Personal"),
+                "non-focused workspace activity (Personal) must NOT appear in pre-checked set",
+            );
+            Ok(MultiPickerOutcome::Selected(vec!["Work".into()]))
+        };
+        let one = |_: &[String]| -> Result<PickerOutcome, CliError> { unreachable!() };
+        run_with_pickers(&mut client, multi, one, no_follow_pick, false, false, None)
+            .expect("unset workspace uses focused path");
         client.assert_consumed_in_order();
     }
 }

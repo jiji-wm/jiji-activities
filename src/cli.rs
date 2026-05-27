@@ -109,6 +109,10 @@ pub(crate) enum Cmd {
         // in `dispatch` via `resolve_follow_overview`.
         #[arg(long)]
         overview: bool,
+        /// Assign this specific workspace id instead of the focused workspace.
+        /// Replaces the "use the focused workspace" default.
+        #[arg(long)]
+        workspace: Option<u64>,
     },
 
     /// Create a new activity with the given name.
@@ -185,9 +189,13 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             let (follow, overview) = resolve_follow_overview(follow, overview);
             cmd_move_workspace(name, follow, overview, workspace)
         }
-        Cmd::AssignWorkspace { follow, overview } => {
+        Cmd::AssignWorkspace {
+            follow,
+            overview,
+            workspace,
+        } => {
             let (follow, overview) = resolve_follow_overview(follow, overview);
-            cmd_assign_workspace(follow, overview)
+            cmd_assign_workspace(follow, overview, workspace)
         }
         Cmd::Create { name } => cmd_create(name),
         Cmd::Remove { name } => cmd_remove(name),
@@ -330,7 +338,7 @@ fn cmd_move_workspace(
     }
 }
 
-fn cmd_assign_workspace(follow: bool, overview: bool) -> Result<()> {
+fn cmd_assign_workspace(follow: bool, overview: bool, workspace: Option<u64>) -> Result<()> {
     // Verify `rofi` is on $PATH BEFORE any IPC round-trip so a
     // missing-dep failure surfaces with a rofi-naming stderr message
     // rather than the generic "niri socket unavailable" the IPC layer
@@ -349,8 +357,14 @@ fn cmd_assign_workspace(follow: bool, overview: bool) -> Result<()> {
             .context("verifying assign-workspace follow picker availability")?;
     }
     let mut client = ipc::make_client();
-    assign_workspace::run(client.as_mut(), picker::pick_one, follow, overview)
-        .context("running assign-workspace picker")
+    assign_workspace::run(
+        client.as_mut(),
+        picker::pick_one,
+        follow,
+        overview,
+        workspace,
+    )
+    .context("running assign-workspace picker")
 }
 
 fn cmd_create(name: String) -> Result<()> {
