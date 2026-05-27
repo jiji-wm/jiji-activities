@@ -71,7 +71,7 @@
 //!   compositor's snapshot violates an invariant we depend on. The
 //!   CLI-internal synthetic strings (each annotated at its construction
 //!   site; not on the wire):
-//!   - `"no focused workspace"` — [`focused_workspace`] (via
+//!   - `"no focused workspace"` — [`crate::ipc_helpers::focused_workspace`] (via
 //!     [`focused_output_name`])
 //!   - `"focused workspace has no output"` — [`focused_output_name`]
 //!   - `"no active activity"` — [`current_activity`]
@@ -100,7 +100,7 @@
 //!     unreachable; runtime regression guard).
 //!
 //!   All use the same rustdoc-discipline pattern as
-//!   [`crate::assign_workspace::focused_workspace`].
+//!   [`crate::ipc_helpers::focused_workspace`].
 
 use std::collections::HashMap;
 
@@ -111,8 +111,8 @@ use crate::error::{CliError, MalformedResponseSource};
 use crate::follow::{self, dispatch_follow_workspace, dispatch_follow_workspace_and_window};
 use crate::ipc::{IpcError, NiriClient};
 use crate::ipc_helpers::{
-    HandledOutcome, send_expect_activities, send_expect_handled_or_no_op, send_expect_workspaces,
-    variant_name,
+    HandledOutcome, focused_window_id, focused_workspace, send_expect_activities,
+    send_expect_handled_or_no_op, send_expect_workspaces, variant_name,
 };
 use crate::picker::{NameOutcome, PickerOutcome};
 
@@ -481,7 +481,7 @@ fn handle_move_outcome(
 /// **Synthetic-string discipline.** The
 /// `"follow picker returned row not in items: …"` literal is a
 /// CLI-internal value, not on the wire. Same discipline as
-/// [`focused_workspace`]'s `"no focused workspace"`.
+/// [`crate::ipc_helpers::focused_workspace`]'s `"no focused workspace"`.
 fn run_move_window_follow_picker<F>(
     client: &mut dyn NiriClient,
     pick: F,
@@ -779,7 +779,7 @@ where
 /// **Synthetic-string discipline.** The `"creating activity from
 /// move-window picker"` context label is a CLI-internal string — it is
 /// not on the wire. Same audit-skip discipline as
-/// [`focused_workspace`]'s `"no focused workspace"`.
+/// [`crate::ipc_helpers::focused_workspace`]'s `"no focused workspace"`.
 fn create_activity_via_ipc(client: &mut dyn NiriClient, name: &str) -> Result<()> {
     let req = Request::Action(Action::CreateActivity {
         name: name.to_owned(),
@@ -887,7 +887,7 @@ where
 /// compositor wire-string matches must skip this site. It routes through
 /// `MalformedResponse(Server)` → exit 65 via the same
 /// `IpcError::Server → MalformedResponseSource::Server` `Display` path
-/// as [`focused_workspace`].
+/// as [`crate::ipc_helpers::focused_workspace`].
 ///
 /// The `pick` parameter accepts an `Fn` because the function may invoke
 /// it twice — once for stage 2, and a second time for the post-move
@@ -1138,7 +1138,7 @@ where
         // is a CLI-internal value — it is **not** emitted on the wire
         // by the niri compositor. A future grep that audits compositor
         // wire-string matches must skip this site. Same pattern as
-        // [`focused_workspace`]'s `"no focused workspace"`.
+        // [`crate::ipc_helpers::focused_workspace`]'s `"no focused workspace"`.
         Stage2ResolutionLiteralOnly::NewWorkspace => {
             Err(CliError::MalformedResponse(MalformedResponseSource::Server(
                 "stage-2 literal-only path produced new-workspace sentinel".to_owned(),
@@ -1184,26 +1184,6 @@ fn dispatch_move(
     send_expect_handled_or_no_op(client, req).context("moving window to workspace")
 }
 
-/// Returns the `active_window_id` of the focused workspace, or `None`
-/// when no workspace is focused OR the focused workspace has no active
-/// window.
-///
-/// **Why pure.** The two "cannot capture" cases collapse to a single
-/// `None` because the caller treats them identically: emit a stderr
-/// fallback diagnostic and dispatch with `window_id: None`. The
-/// "no focused workspace at all" condition is already surfaced as
-/// [`CliError::MalformedResponse(Server("no focused workspace"))`] by
-/// [`focused_workspace`] / [`focused_output_name`], which fire before
-/// this helper in every dispatcher; if execution reaches here, the
-/// focused-workspace probe has already passed, so this helper's `None`
-/// strictly means "focused workspace has no active window."
-///
-/// **No new IPC call.** Reads from the `Workspaces` snapshot already in
-/// scope at the dispatch site.
-fn capture_focused_window_id(workspaces: &[Workspace]) -> Option<u64> {
-    focused_workspace(workspaces).ok()?.active_window_id
-}
-
 /// Decides what to pass as `Action::MoveWindowToWorkspace.window_id`
 /// based on the explicit `--window` flag, the `--follow` flag, and the
 /// focused-window snapshot.
@@ -1233,7 +1213,7 @@ fn capture_focused_window_id(workspaces: &[Workspace]) -> Option<u64> {
 /// CLI-internal diagnostic — it is **not** emitted on the wire by the
 /// niri compositor. A future grep that audits compositor wire-string
 /// matches must skip this site. Same audit-skip discipline as
-/// [`focused_workspace`]'s `"no focused workspace"`.
+/// [`crate::ipc_helpers::focused_workspace`]'s `"no focused workspace"`.
 fn decide_window_id_for_dispatch(
     explicit: Option<u64>,
     follow: bool,
@@ -1249,7 +1229,7 @@ fn decide_window_id_for_dispatch(
     if !follow {
         return None;
     }
-    let captured = capture_focused_window_id(workspaces);
+    let captured = focused_window_id(workspaces);
     if captured.is_none() {
         eprintln!(
             "jiji-activities: --follow set but no focused window to capture; \
@@ -1294,30 +1274,15 @@ fn print_move_confirmation(ws_id: u64, activity_name: &str) {
 
 // ---- Pure helpers ----------------------------------------------------------
 
-/// Returns the workspace whose `is_focused` flag is `true`, or
-/// `MalformedResponse(Server("no focused workspace"))` when no such
-/// workspace exists.
-///
-/// **Synthetic-string discipline.** The literal `"no focused workspace"`
-/// is a **CLI-internal** value — it is **not** emitted on the wire by
-/// the niri compositor. A future grep that audits compositor wire-string
-/// matches must skip this site. Chosen for human-readable diagnostics
-/// via the existing `IpcError::Server → MalformedResponseSource::Server`
-/// `Display` path.
-fn focused_workspace(workspaces: &[Workspace]) -> Result<&Workspace, CliError> {
-    workspaces.iter().find(|w| w.is_focused).ok_or_else(|| {
-        CliError::MalformedResponse(MalformedResponseSource::Server(
-            "no focused workspace".to_owned(),
-        ))
-    })
-}
-
 /// Returns the `output` of the focused workspace, or
 /// `MalformedResponse(Server("focused workspace has no output"))` when
 /// the focused workspace's `output` field is `None`.
 ///
-/// **Synthetic-string discipline.** Same as [`focused_workspace`] —
-/// CLI-internal, not on the wire.
+/// **Synthetic-string discipline.** Same as
+/// [`crate::ipc_helpers::focused_workspace`] — CLI-internal, not on the
+/// wire. Delegates to the shared helper for the "no focused workspace"
+/// step; the `"focused workspace has no output"` synthetic is added by
+/// this function only.
 fn focused_output_name(workspaces: &[Workspace]) -> Result<&str, CliError> {
     let ws = focused_workspace(workspaces)?;
     ws.output.as_deref().ok_or_else(|| {
@@ -1331,11 +1296,11 @@ fn focused_output_name(workspaces: &[Workspace]) -> Result<&str, CliError> {
 /// `MalformedResponse(Server("no active activity"))` when none has
 /// `is_active: true`.
 ///
-/// **Synthetic-string discipline.** Same as [`focused_workspace`] —
-/// CLI-internal, not on the wire. Defensive: the compositor invariant
-/// is that exactly one activity is active at a time, but a
-/// hand-constructed test snapshot or a future protocol drift could
-/// violate that.
+/// **Synthetic-string discipline.** Same as
+/// [`crate::ipc_helpers::focused_workspace`] — CLI-internal, not on the
+/// wire. Defensive: the compositor invariant is that exactly one activity
+/// is active at a time, but a hand-constructed test snapshot or a future
+/// protocol drift could violate that.
 fn current_activity(activities: &[Activity]) -> Result<&Activity, CliError> {
     activities.iter().find(|a| a.is_active).ok_or_else(|| {
         CliError::MalformedResponse(MalformedResponseSource::Server(
@@ -4011,35 +3976,35 @@ mod tests {
         client.assert_consumed_in_order();
     }
 
-    // ---- capture_focused_window_id / --follow thread-through ---------------
+    // ---- focused_window_id / --follow thread-through ---------------
 
     #[test]
-    fn capture_focused_window_id_returns_active_window_when_focused_workspace_has_window() {
+    fn focused_window_id_returns_active_window_when_focused_workspace_has_window() {
         let workspaces = vec![
             ws(1, 0, false, Some("DP-1"), vec![1], None),
             ws(2, 1, true, Some("DP-1"), vec![1], Some(42)),
         ];
-        assert_eq!(capture_focused_window_id(&workspaces), Some(42));
+        assert_eq!(focused_window_id(&workspaces), Some(42));
     }
 
     #[test]
-    fn capture_focused_window_id_returns_none_when_focused_workspace_has_no_active_window() {
+    fn focused_window_id_returns_none_when_focused_workspace_has_no_active_window() {
         // Focused workspace exists but `active_window_id: None`. The
         // "empty focused workspace" case the helper must collapse to
         // None (the dispatcher then emits the eprintln fallback).
         let workspaces = vec![ws(1, 0, true, Some("DP-1"), vec![1], None)];
-        assert_eq!(capture_focused_window_id(&workspaces), None);
+        assert_eq!(focused_window_id(&workspaces), None);
     }
 
     #[test]
-    fn capture_focused_window_id_returns_none_when_no_workspace_is_focused() {
+    fn focused_window_id_returns_none_when_no_workspace_is_focused() {
         // Defensive: in production `focused_workspace` already surfaces
         // this as `MalformedResponse(Server("no focused workspace"))`
-        // before any caller reaches `capture_focused_window_id`. Pinned
+        // before any caller reaches `focused_window_id`. Pinned
         // here so a refactor that bypasses the `focused_workspace`
         // probe cannot silently turn this into a panic.
         let workspaces = vec![ws(1, 0, false, Some("DP-1"), vec![1], Some(42))];
-        assert_eq!(capture_focused_window_id(&workspaces), None);
+        assert_eq!(focused_window_id(&workspaces), None);
     }
 
     #[test]
@@ -4384,7 +4349,7 @@ mod tests {
     /// `Some(5)` rather than `None` (which would mean the eprintln fired).
     #[test]
     fn decide_window_id_for_dispatch_explicit_set_no_focused_window_suppresses_fallback_eprintln() {
-        // No active_window_id on the focused workspace → capture_focused_window_id returns None.
+        // No active_window_id on the focused workspace → focused_window_id returns None.
         let workspaces = vec![ws(1, 0, true, Some("DP-1"), vec![1], None)];
         let result = decide_window_id_for_dispatch(Some(5), true, &workspaces);
         // The eprintln path would produce None; explicit early-return must

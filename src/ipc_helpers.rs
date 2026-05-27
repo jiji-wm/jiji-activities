@@ -24,6 +24,16 @@
 //! - [`names_focused_first`] — pure helper that reorders an
 //!   [`Activity`] slice's names so the focused activity (if any) is
 //!   first; remaining names preserve their compositor-supplied order.
+//! - [`focused_workspace`] — returns the workspace with `is_focused: true`
+//!   from a `Workspaces` snapshot, or a synthetic
+//!   `MalformedResponse(Server("no focused workspace"))` error when none
+//!   is present.
+//! - [`focused_workspace_id`] — like [`focused_workspace`] but returns
+//!   only the workspace `id` (`u64`). Callers that need only the id avoid
+//!   pattern-matching the full [`Workspace`] struct.
+//! - [`focused_window_id`] — returns the `active_window_id` of the focused
+//!   workspace, or `None` when no workspace is focused or the focused
+//!   workspace has no active window. Pure snapshot read; no IPC call.
 //!
 //! Centralising these avoids N-way duplication between
 //! `crate::switch`, `crate::switch_previous`,
@@ -223,6 +233,65 @@ pub(crate) fn send_expect_workspaces(
             .into(),
         ),
     }
+}
+
+/// Returns the workspace whose `is_focused` flag is `true`, or
+/// `MalformedResponse(Server("no focused workspace"))` when no such
+/// workspace is present.
+///
+/// **Synthetic-string discipline.** The literal `"no focused workspace"`
+/// is a **CLI-internal** value — it is **not** emitted on the wire by
+/// the niri compositor. A future grep that audits compositor wire-string
+/// matches must skip this site. Chosen for human-readable diagnostics
+/// via the existing `IpcError::Server → MalformedResponseSource::Server`
+/// `Display` path.
+///
+/// **Callers:**
+/// - `crate::assign_workspace` — directly, for the focused-workspace lookup.
+/// - `crate::move_window` — via the module-local `focused_output_name` AND
+///   directly in `dispatch_stage2_with_new` and `dispatch_stage2_literal_only`
+///   to derive the `focused_workspace_id` for picker annotation.
+/// - `crate::move_workspace` — via [`focused_workspace_id`].
+///
+/// This is the single authoritative definition; previously each verb module
+/// carried its own private copy.
+pub(crate) fn focused_workspace(workspaces: &[Workspace]) -> Result<&Workspace, CliError> {
+    workspaces.iter().find(|w| w.is_focused).ok_or_else(|| {
+        CliError::MalformedResponse(MalformedResponseSource::Server(
+            "no focused workspace".to_owned(),
+        ))
+    })
+}
+
+/// Returns the `id` of the workspace whose `is_focused` flag is `true`.
+///
+/// Thin wrapper over [`focused_workspace`] for call sites that only need
+/// the id; avoids pattern-matching the full [`Workspace`] struct. The
+/// same synthetic-string contract applies — see [`focused_workspace`]
+/// for the `"no focused workspace"` annotation.
+pub(crate) fn focused_workspace_id(workspaces: &[Workspace]) -> Result<u64, CliError> {
+    focused_workspace(workspaces).map(|w| w.id)
+}
+
+/// Returns the `active_window_id` of the focused workspace, or `None`
+/// when no workspace is focused OR the focused workspace has no active
+/// window.
+///
+/// **Why pure.** The two "cannot capture" cases collapse to `None`
+/// because the caller treats them identically: emit a stderr fallback
+/// diagnostic and dispatch with `window_id: None`. The "no focused
+/// workspace" condition is already surfaced as
+/// [`CliError::MalformedResponse(Server("no focused workspace"))`] by
+/// [`focused_workspace`] / the module-local `focused_output_name`,
+/// which fire before this helper in every dispatcher; if execution
+/// reaches here, the focused-workspace probe has already passed, so
+/// this helper's `None` strictly means "focused workspace has no active
+/// window."
+///
+/// **No IPC call.** Reads from the `Workspaces` snapshot already in
+/// scope at the dispatch site.
+pub(crate) fn focused_window_id(workspaces: &[Workspace]) -> Option<u64> {
+    focused_workspace(workspaces).ok()?.active_window_id
 }
 
 /// Returns activity names with the focused one (if any) hoisted to the

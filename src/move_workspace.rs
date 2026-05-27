@@ -60,7 +60,8 @@ use crate::error::{CliError, MalformedResponseSource};
 use crate::follow::{self, dispatch_follow_workspace};
 use crate::ipc::NiriClient;
 use crate::ipc_helpers::{
-    names_focused_first, send_expect_activities, send_expect_handled, send_expect_workspaces,
+    focused_workspace_id, names_focused_first, send_expect_activities, send_expect_handled,
+    send_expect_workspaces,
 };
 use crate::picker::PickerOutcome;
 
@@ -144,25 +145,6 @@ where
     Ok(())
 }
 
-/// Returns the `id` of the workspace whose `is_focused` flag is `true`.
-///
-/// **Synthetic-string discipline.** The literal `"no focused workspace"`
-/// is a **CLI-internal** value — it is **not** emitted on the wire by
-/// the niri compositor. A future grep that audits compositor wire-string
-/// matches must skip this site. Same pattern as
-/// `crate::assign_workspace::focused_workspace`'s `"no focused workspace"`.
-fn focused_workspace_id(workspaces: &[niri_ipc::Workspace]) -> Result<u64, CliError> {
-    workspaces
-        .iter()
-        .find(|w| w.is_focused)
-        .map(|w| w.id)
-        .ok_or_else(|| {
-            CliError::MalformedResponse(MalformedResponseSource::Server(
-                "no focused workspace".to_owned(),
-            ))
-        })
-}
-
 /// Spawns the follow picker after a successful `MoveWorkspaceToActivity`
 /// dispatch. Two rows: a confirmation row and the `« Stay »` sentinel.
 ///
@@ -181,8 +163,7 @@ fn focused_workspace_id(workspaces: &[niri_ipc::Workspace]) -> Result<u64, CliEr
 /// **Synthetic-string discipline.** The
 /// `"follow picker returned row not in items: …"` literal is a
 /// CLI-internal value, not on the wire. Same discipline as
-/// [`crate::assign_workspace::focused_workspace`]'s `"no focused
-/// workspace"`.
+/// [`crate::ipc_helpers::focused_workspace`]'s `"no focused workspace"`.
 fn run_move_workspace_follow_picker<F>(
     client: &mut dyn NiriClient,
     pick: F,

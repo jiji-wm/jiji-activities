@@ -38,7 +38,9 @@ use niri_ipc::{
 use crate::error::{CliError, MalformedResponseSource};
 use crate::follow::{self, dispatch_follow_activity_and_workspace};
 use crate::ipc::{IpcError, NiriClient};
-use crate::ipc_helpers::{send_expect_activities, send_expect_workspaces, variant_name};
+use crate::ipc_helpers::{
+    focused_workspace, send_expect_activities, send_expect_workspaces, variant_name,
+};
 use crate::picker::PickerOutcome;
 use crate::picker::multi_select::{self, MultiPickerOutcome};
 
@@ -70,7 +72,7 @@ use crate::picker::multi_select::{self, MultiPickerOutcome};
 /// - `workspace` is `None` and no workspace has `is_focused: true` →
 ///   `CliError::MalformedResponse(Server("no focused workspace"))` (exit 65).
 ///   The `"no focused workspace"` string is a **CLI-synthetic** marker, not
-///   a compositor wire emission — see [`focused_workspace`].
+///   a compositor wire emission — see [`crate::ipc_helpers::focused_workspace`].
 /// - An IPC reply's `Response` variant didn't match the request shape →
 ///   `CliError::MalformedResponse(WrongVariant { .. })` (exit 65).
 /// - Other IPC failures flow through the existing `IpcError → CliError`
@@ -187,7 +189,7 @@ where
 /// **Synthetic-string discipline.** The
 /// `"follow picker returned row not in items: …"` literal is a
 /// CLI-internal value, not on the wire. Same discipline as
-/// [`focused_workspace`]'s `"no focused workspace"`.
+/// [`crate::ipc_helpers::focused_workspace`]'s `"no focused workspace"`.
 fn run_assign_workspace_follow_picker<F>(
     client: &mut dyn NiriClient,
     pick: F,
@@ -216,27 +218,6 @@ where
         )
         .into()),
     }
-}
-
-/// Returns the workspace whose `is_focused` flag is `true`, or
-/// `MalformedResponse(Server("no focused workspace"))` if no such
-/// workspace exists.
-///
-/// **Synthetic-string discipline.** The literal `"no focused workspace"`
-/// embedded in the `Server` payload here is a **CLI-internal** value —
-/// it is **not** emitted on the wire by the niri compositor. A future
-/// grep that audits compositor wire-string matches must skip this
-/// site. The string was chosen so a stderr-reading user sees a
-/// human-readable diagnostic via the existing
-/// `IpcError::Server → MalformedResponseSource::Server` `Display` path
-/// (`malformed compositor response: server error: no focused
-/// workspace`).
-fn focused_workspace(workspaces: &[Workspace]) -> Result<&Workspace, CliError> {
-    workspaces.iter().find(|w| w.is_focused).ok_or_else(|| {
-        CliError::MalformedResponse(MalformedResponseSource::Server(
-            "no focused workspace".to_owned(),
-        ))
-    })
 }
 
 /// Builds the set of activity *names* the workspace currently belongs
