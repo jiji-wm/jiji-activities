@@ -568,7 +568,31 @@ The race lesson from Phase 3.6b Task 6 was "don't display a captured id when the
     - Tests pin: row count matches assigned set; row labels match activity names; selection routing fires `SwitchActivity` then `FocusWorkspace` in that strict order (FIFO MockClient queue); `with_overview` threading adds `OpenOverview` last; Escape / `« Stay »` no-op; `--follow` off skips the picker.
 - [x] Task 6 — Verify behavior under `--follow` interacts cleanly with Phase 3.6c's `AlreadyCurrent` no-op routing: when the move would have been a self-move and is now a no-op, the `--follow` picker should NOT spawn (nothing moved, nothing to follow). Test pins this — the eprintln breadcrumb from 3.6c fires; the follow picker does not. Landed as `af7d35c` (four negative-space tests pin no-follow-spawn on AlreadyCurrent (eager) and Response::NoOp(AlreadyOnTarget) (wire) arms across both Stage 2 dispatcher paths).
 - [ ] Task 7 — Manual verification: run each verb interactively across the four flag combinations (neither / `--follow` / `--follow --overview` / `--overview` alone). Confirm (a) the follow picker appears only when `--follow` or `--overview` is set, (b) selecting routes to the destination workspace, (c) for `move-window`/`move-window-here`, the moved window is the highlighted tile in the destination workspace, (d) overview opens only when `--overview` is set (or `--overview` alone — which should behave identically to `--follow --overview`), (e) Escape exits cleanly with no IPC dispatched beyond the move/assign. Pin overview-open behavior in the live niri.
+
+  **Verification checklist** (run from a terminal inside a running **jiji fork** session; needs `fuzzel` + `rofi`, ≥2 activities with workspaces, a focused window; reinstall first: `cargo install --path . --offline`):
+
+  | Verb | Command (× each flag combo) | Watch for |
+  |---|---|---|
+  | `move-window` | `jiji-activities move-window [--follow] [--overview]` | Stage1 activity → Stage2 workspace, then follow picker; window is highlighted tile post-follow (c) |
+  | `move-window-here` | `jiji-activities move-window-here [--follow] [--overview]` | workspace picker in active activity; same follow + highlight check |
+  | `move-workspace` | `jiji-activities move-workspace [--follow] [--overview]` | follow row `Follow workspace to <activity>?`; ws id preserved, activity changes |
+  | `assign-workspace` | `jiji-activities assign-workspace [--follow] [--overview]` | rofi multi-select, then **multi-row** follow (one per assigned activity); each row `SwitchActivity`→`FocusWorkspace` |
+
+  Per combo: *(neither)* = move + stderr, **no** follow picker; `--follow` = follow picker, focus jumps, **no** overview; `--follow --overview` and `--overview` alone = follow + overview opens with item highlighted (the two must behave identically). Escape on any follow picker = exit 0, move already done, **nothing further dispatched** (e). Ignore the 8 pre-existing `ipc::tests` env-mutex failures — orthogonal (Appendix C). On pass, flip this box with a `confirmed on live jiji session, <date>` note.
+
+  > **⚠ Known blocker surfaced 2026-05-28 (see BUG entry below):** `move-window` to a **different** activity currently silent-no-ops and prints a *false* success line. Cross-activity scenarios in this table cannot pass until the compositor-side fix lands. Within-current-activity moves work. See `### BUG: cross-activity move-window silent no-op` below.
 - [ ] Task 8 — DD update: this section's `Reviewed: YYYY-MM-DD (<sha>, ...)` line filled in by the cli-scribe.
+
+### BUG: cross-activity move-window silent no-op + false success (reported 2026-05-28, HIGH)
+
+`jiji-activities move-window` to a **different** activity does nothing (the window stays in the current activity) but prints a false success line: `jiji-activities: moved focused window to workspace 2 in activity 'system'`. Moving within the **current** activity works correctly.
+
+**Root cause (traced end-to-end; the fix is compositor-side — `compositor` loop).** One defect, two layers:
+
+- **D1 — capability gap.** `move-window` correctly dispatches `Action::MoveWindowToWorkspace(Id(ws_id), focus:false)` against a workspace in the target activity (this CLI has no `MoveWindowToActivity` — see the module note in `src/move_window.rs`; that is by design). But the compositor handler (`repos/jiji/src/input/mod.rs:1486`) resolves the reference through `find_output_and_workspace_index` → `Layout::find_workspace_by_id` (`repos/jiji/src/layout/mod.rs:2267`), which scans **only active-activity per-output views + `disconnected_workspace_ids`**. A workspace in a *dormant* activity is in the `workspaces` pool but in no monitor's active view → the resolver returns `None`, and the handler's `if let Some(...)` move block is skipped entirely. (`resolve_workspace_reference_to_id` at `repos/jiji/src/niri.rs:3711` is active-view-scoped the same way.)
+- **D2 — silent failure / false success.** On the unresolved reference the handler falls through with no error; the IPC layer returns `Response::Handled`; the CLI's `format_move_confirmation` (`src/move_window.rs:1229`) prints success on `Handled`. A lie at the boundary — same class the Phase 2.10 no-op-signaling work was meant to eliminate.
+
+**Fix (must-fix D2 + capability D1).** D2 is the truthfulness fix: the compositor must return a typed error (or a `NoOp` signal the CLI already understands) when the reference does not resolve to a movable target, so the CLI stops reporting a non-move as a move. D1 is the real feature: support relocating a tile into a pool workspace that is not currently on a monitor (the cross-activity move). D1 carries behavioral design choices (auto-switch to the target activity? land on the target activity's trailing-empty bookend? interaction with `verify_invariants`) → a compositor sub-phase with a ratification gate, not a drive-by patch. Tracked in memory: [[bug-move-window-cross-activity-silent-noop]]. **Until the compositor fix lands, the cross-activity rows of the Task 7 table cannot pass.**
 
 **Out of scope:**
 
