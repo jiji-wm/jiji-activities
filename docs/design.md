@@ -720,6 +720,23 @@ Actions the `Stage2Opts` / `FollowMode` type-design observation parked in Append
 
 ---
 
+### Phase 3.12 — `rename` verb (launcher command-expansion prerequisite)
+
+**Phase A** of the jiji-do command-expansion design (`~/projects/desktop/de/jiji/docs/superpowers/specs/2026-06-03-jiji-do-command-expansion-design.md`). Adds a `rename` subcommand wrapping `Action::RenameActivity`, so jiji-do's future `rename-activity` passthrough (its Stage 7 Phase C) delegates to a real jiji-activities verb rather than jiji-do calling the compositor action directly — keeping every activity operation behind the single delegate. **No ratification gate**: it threads one new action through the established action-subcommand machinery (Phase 3.6), against an IPC variant that already exists (`Action::RenameActivity { activity: ActivityReferenceArg, name: String }`); no new IPC variant, no rev bump.
+
+**CLI shape (resolved during planning).** `rename <new-name> [--activity <ref>]`. The positional is the **new** freeform name (required). `--activity <ref>` selects the target activity; **omitted → single-select fuzzel picker** over the activity inventory (reuse the `switch` picker path). This shape is chosen over the design doc's `rename <activity> <new-name>` because an optional-first-then-required positional pair does not disambiguate cleanly in clap; a single required positional + an optional target flag is unambiguous and keeps picker-on-omit. Error model: a named `--activity` miss maps to `CliError::ActivityNotFound` (exit 66), consistent with every other named-activity verb.
+
+- [ ] §3 CLI surface — document `rename <new-name> [--activity <ref>]` (renames the `--activity` target, or the picker-chosen activity, to `<new-name>`).
+- [ ] `src/cli.rs` — `Cmd::Rename { name: String, activity: Option<String> }` (`#[arg]` positional `name`, `#[arg(long)] activity`). Route to `cmd_rename` → a `rename` handler in `dispatch`. Extend `tests/cli.rs::help_lists_all_subcommands` with `"rename"`.
+- [ ] `src/rename.rs` (new module, mirroring an existing single-action verb such as `src/switch.rs`) — resolve the target activity (`--activity` ref → `ActivityReferenceArg`, else fuzzel single-select over the `Request::Activities` inventory, reusing the established picker + zero-case/cancel discipline), then dispatch `Action::RenameActivity { activity, name }` via the existing `send_expect_handled` seam. A named-ref miss → `ActivityNotFound` (exit 66); an empty inventory in the picker path → the established zero-case UX (eprintln + exit 0).
+- [ ] `src/completions.rs` — `rename` stays **OUT** of `FISH_SINGLE_ARG_VERBS`: its positional is a **new** name (like `create`), not an existing-activity name, so dynamic activity-name completion of the positional would be wrong. Add `fish_dynamic_does_not_emit_line_for_rename` as the negative-space pin. (`--activity` option-*value* completion is deferred with the other option-value completions per Phase 3.10's out-of-scope note.)
+- [ ] `tests/cli.rs` / `tests/` — `assert_cmd` coverage: (1) `rename newname --activity old` → recorded action argv carries the rename with target `old` + name `newname`; (2) named-`--activity` miss → exit 66; (3) picker path (shimmed fuzzel returns a target) → rename dispatched against the chosen target; (4) picker zero-case → exit 0, no dispatch. Account for the IPC-probe invocation in argv assertions.
+- [ ] Post-landing (human / chezmoi, not a loop deliverable): `cargo install --path . --offline`; bump `# hash:` in chezmoi `run_onchange_install-packages.sh.tmpl` so the regenerated completion carries the new `rename` subcommand (clap-derive base auto-tracks it; only the reinstall + hash bump are needed).
+
+**Exit criteria:** all boxes `[x]`; `cargo test --all` clean; `cargo clippy --all --all-targets` zero new warnings; `rename` reachable via `jiji-activities rename --help`; one round of CLI loop review.
+
+---
+
 ## Appendix A: Source code map (one-liner per file)
 
 Populated as files land. Initial state: `src/main.rs` is the stub from the bootstrap commit (`92e26ef`).
