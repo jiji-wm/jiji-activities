@@ -12,7 +12,7 @@
 //!    only `fuzzel` the binary can resolve.
 //! 4. For tests that need the IPC `Request::Activities` round-trip to
 //!    succeed (so the single-select picker is actually reached), bind a
-//!    one-shot Unix listener and point `$NIRI_SOCKET` at it. The listener
+//!    one-shot Unix listener and point `$JIJI_SOCKET` at it. The listener
 //!    replies with a fixed `Response::Activities` payload then exits.
 //!
 //! `env_clear` is load-bearing — leaving the parent's `$PATH` in place
@@ -94,7 +94,7 @@ impl Drop for ShimDir {
 /// that need the `run_picker` IPC round-trip to succeed so the picker
 /// is actually invoked.
 ///
-/// The path is returned so the caller can point `$NIRI_SOCKET` at it.
+/// The path is returned so the caller can point `$JIJI_SOCKET` at it.
 fn spawn_one_shot_activities_listener(tag: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -121,8 +121,8 @@ fn spawn_one_shot_activities_listener(tag: &str) -> PathBuf {
             // Two activities: "Work" (focused) and "Personal".
             // Field ordering follows the niri-ipc `Activity` struct.
             let reply = "{\"Ok\":{\"Activities\":[\
-                 {\"id\":1,\"name\":\"Work\",\"is_config_declared\":true,\"is_active\":true,\"is_urgent\":false},\
-                 {\"id\":2,\"name\":\"Personal\",\"is_config_declared\":true,\"is_active\":false,\"is_urgent\":false}\
+                 {\"id\":1,\"name\":\"Work\",\"is_config_declared\":true,\"is_active\":true,\"is_urgent\":false,\"last_active_seq\":2},\
+                 {\"id\":2,\"name\":\"Personal\",\"is_config_declared\":true,\"is_active\":false,\"is_urgent\":false,\"last_active_seq\":1}\
                  ]}}\n";
             let _ = sock.write_all(reply.as_bytes());
         }
@@ -146,7 +146,9 @@ fn fuzzel_cancel_exits_0() {
     // with empty stdout). The CLI must classify that as cancellation and
     // exit 0 silently.
     let shim = ShimDir::new("cancel");
-    shim.install_fuzzel("exit 1\n");
+    // Drain stdin to EOF before exiting so the binary's stdin write
+    // does not race with the shim's exit and produce EPIPE.
+    shim.install_fuzzel("while IFS= read -r _line; do :; done\nexit 1\n");
     let sock = spawn_one_shot_activities_listener("cancel");
 
     Command::cargo_bin(BIN)
@@ -154,7 +156,7 @@ fn fuzzel_cancel_exits_0() {
         .arg("switch")
         .env_clear()
         .env("PATH", shim.as_path())
-        .env("NIRI_SOCKET", &sock)
+        .env("JIJI_SOCKET", &sock)
         .assert()
         .code(0);
 }
@@ -166,7 +168,7 @@ fn fuzzel_select_then_second_ipc_fails_exits_69() {
     // returns Selected("Work"). `run_picker` then dispatches a SECOND
     // IPC call (`SwitchActivity`); the one-shot listener already
     // closed, so that second call hits a dead socket and exit 69
-    // surfaces. `$NIRI_SOCKET` IS set, but the post-pick socket is
+    // surfaces. `$JIJI_SOCKET` IS set, but the post-pick socket is
     // dead. The exit-code contract is what's pinned: select + dead
     // second IPC → 69.
     let shim = ShimDir::new("select");
@@ -178,7 +180,7 @@ fn fuzzel_select_then_second_ipc_fails_exits_69() {
         .arg("switch")
         .env_clear()
         .env("PATH", shim.as_path())
-        .env("NIRI_SOCKET", &sock)
+        .env("JIJI_SOCKET", &sock)
         .assert()
         .code(69);
 }
@@ -211,7 +213,7 @@ fn fuzzel_stdin_payload_reaches_shim() {
         .arg("switch")
         .env_clear()
         .env("PATH", shim.as_path())
-        .env("NIRI_SOCKET", &sock)
+        .env("JIJI_SOCKET", &sock)
         .env("SHIM_STDIN_CAPTURE", &capture)
         .assert()
         .code(0);
@@ -234,7 +236,9 @@ fn fuzzel_prompt_arg_is_switch_prompt() {
     // shim writes `$@` to `$SHIM_ARGS_CAPTURE`, then cancels.
     let shim = ShimDir::new("args-capture");
     let capture = shim.as_path().join("args.cap");
-    shim.install_fuzzel("printf '%s\\n' \"$@\" > \"$SHIM_ARGS_CAPTURE\"\nexit 1\n");
+    // Drain stdin before capturing args so the binary's stdin write does
+    // not race with the shim's exit and produce EPIPE.
+    shim.install_fuzzel("while IFS= read -r _line; do :; done\nprintf '%s\\n' \"$@\" > \"$SHIM_ARGS_CAPTURE\"\nexit 1\n");
     let sock = spawn_one_shot_activities_listener("args-capture");
 
     Command::cargo_bin(BIN)
@@ -242,7 +246,7 @@ fn fuzzel_prompt_arg_is_switch_prompt() {
         .arg("switch")
         .env_clear()
         .env("PATH", shim.as_path())
-        .env("NIRI_SOCKET", &sock)
+        .env("JIJI_SOCKET", &sock)
         .env("SHIM_ARGS_CAPTURE", &capture)
         .assert()
         .code(0);
@@ -271,7 +275,7 @@ fn fuzzel_missing_from_path_exits_69() {
     // round-trip) returns PickerUnavailable with the canonical
     // missing-fuzzel message. Exit code 69 with stderr naming `fuzzel`.
     //
-    // `$NIRI_SOCKET` is unset deliberately: even with a missing socket,
+    // `$JIJI_SOCKET` is unset deliberately: even with a missing socket,
     // the missing-fuzzel error must surface first because the
     // availability check runs before any IPC.
     let shim = ShimDir::new("missing");
@@ -282,7 +286,7 @@ fn fuzzel_missing_from_path_exits_69() {
         .arg("switch")
         .env_clear()
         .env("PATH", shim.as_path())
-        .env_remove("NIRI_SOCKET")
+        .env_remove("JIJI_SOCKET")
         .assert()
         .code(69)
         .stderr(contains("picker unavailable").and(contains("fuzzel")));
@@ -314,7 +318,7 @@ fn run_picker_empty_activities_warns_and_exits_zero() {
         .arg("switch")
         .env_clear()
         .env("PATH", shim.as_path())
-        .env("NIRI_SOCKET", &sock)
+        .env("JIJI_SOCKET", &sock)
         .env("SHIM_INVOKED", &sentinel)
         .assert()
         .code(0)
@@ -337,7 +341,9 @@ fn move_workspace_picker_cancel_exits_zero() {
     // empty stdout). The CLI must classify as cancellation and exit 0
     // silently.
     let shim = ShimDir::new("mw-cancel");
-    shim.install_fuzzel("exit 1\n");
+    // Drain stdin to EOF before exiting so the binary's stdin write
+    // does not race with the shim's exit and produce EPIPE.
+    shim.install_fuzzel("while IFS= read -r _line; do :; done\nexit 1\n");
     let sock = spawn_one_shot_activities_listener("mw-cancel");
 
     Command::cargo_bin(BIN)
@@ -345,7 +351,7 @@ fn move_workspace_picker_cancel_exits_zero() {
         .arg("move-workspace")
         .env_clear()
         .env("PATH", shim.as_path())
-        .env("NIRI_SOCKET", &sock)
+        .env("JIJI_SOCKET", &sock)
         .assert()
         .code(0);
 }
@@ -369,7 +375,7 @@ fn move_workspace_picker_select_then_second_ipc_fails_exits_69() {
         .arg("move-workspace")
         .env_clear()
         .env("PATH", shim.as_path())
-        .env("NIRI_SOCKET", &sock)
+        .env("JIJI_SOCKET", &sock)
         .assert()
         .code(69);
 }
@@ -383,7 +389,9 @@ fn move_workspace_picker_prompt_arg_is_move_prompt() {
     // `$SHIM_ARGS_CAPTURE`, then cancels.
     let shim = ShimDir::new("mw-args");
     let capture = shim.as_path().join("args.cap");
-    shim.install_fuzzel("printf '%s\\n' \"$@\" > \"$SHIM_ARGS_CAPTURE\"\nexit 1\n");
+    // Drain stdin before capturing args so the binary's stdin write does
+    // not race with the shim's exit and produce EPIPE.
+    shim.install_fuzzel("while IFS= read -r _line; do :; done\nprintf '%s\\n' \"$@\" > \"$SHIM_ARGS_CAPTURE\"\nexit 1\n");
     let sock = spawn_one_shot_activities_listener("mw-args");
 
     Command::cargo_bin(BIN)
@@ -391,7 +399,7 @@ fn move_workspace_picker_prompt_arg_is_move_prompt() {
         .arg("move-workspace")
         .env_clear()
         .env("PATH", shim.as_path())
-        .env("NIRI_SOCKET", &sock)
+        .env("JIJI_SOCKET", &sock)
         .env("SHIM_ARGS_CAPTURE", &capture)
         .assert()
         .code(0);
@@ -467,8 +475,8 @@ fn spawn_two_shot_listener_for_move_window(
 /// Hard-coded `Activities` JSON reply with two activities (Work
 /// focused, Personal). Used by the two-stage move-window shim tests.
 const MOVE_WINDOW_ACTIVITIES_REPLY: &str = "{\"Ok\":{\"Activities\":[\
-    {\"id\":1,\"name\":\"Work\",\"is_config_declared\":true,\"is_active\":true,\"is_urgent\":false},\
-    {\"id\":2,\"name\":\"Personal\",\"is_config_declared\":true,\"is_active\":false,\"is_urgent\":false}\
+    {\"id\":1,\"name\":\"Work\",\"is_config_declared\":true,\"is_active\":true,\"is_urgent\":false,\"last_active_seq\":2},\
+    {\"id\":2,\"name\":\"Personal\",\"is_config_declared\":true,\"is_active\":false,\"is_urgent\":false,\"last_active_seq\":1}\
     ]}}\n";
 
 /// Hard-coded `Workspaces` JSON reply: one focused workspace on DP-1 in
@@ -547,7 +555,7 @@ fn move_window_two_stage_cancel_at_stage1_exits_zero() {
         .arg("move-window")
         .env_clear()
         .env("PATH", shim.as_path())
-        .env("NIRI_SOCKET", &sock)
+        .env("JIJI_SOCKET", &sock)
         .env("SHIM_COUNTER_FILE", &counter)
         .env("SHIM_STAGE1_RESPONSE", "cancel")
         .env("SHIM_STAGE2_RESPONSE", "cancel")
@@ -576,7 +584,7 @@ fn move_window_two_stage_select_then_dead_socket_exits_69() {
         .arg("move-window")
         .env_clear()
         .env("PATH", shim.as_path())
-        .env("NIRI_SOCKET", &sock)
+        .env("JIJI_SOCKET", &sock)
         .env("SHIM_COUNTER_FILE", &counter)
         // Stage 1: pick the active activity "Work".
         .env("SHIM_STAGE1_RESPONSE", "select:Work")
@@ -612,7 +620,7 @@ fn move_window_stage2_non_active_no_workspaces_exits_zero_with_eprintln() {
         .arg("move-window")
         .env_clear()
         .env("PATH", shim.as_path())
-        .env("NIRI_SOCKET", &sock)
+        .env("JIJI_SOCKET", &sock)
         .env("SHIM_COUNTER_FILE", &counter)
         .env("SHIM_STAGE1_RESPONSE", "select:Personal")
         .env("SHIM_STAGE2_RESPONSE", "cancel")
@@ -651,7 +659,7 @@ fn move_window_named_arg_skips_picker() {
         .args(["move-window", "Personal"])
         .env_clear()
         .env("PATH", shim.as_path())
-        .env("NIRI_SOCKET", &sock)
+        .env("JIJI_SOCKET", &sock)
         .env("SHIM_INVOKED", &sentinel)
         .assert()
         // 'Personal' is non-active and has no workspaces on DP-1 in
@@ -685,7 +693,7 @@ fn move_window_stage1_prompt_arg_is_activity_prompt() {
         .arg("move-window")
         .env_clear()
         .env("PATH", shim.as_path())
-        .env("NIRI_SOCKET", &sock)
+        .env("JIJI_SOCKET", &sock)
         .env("SHIM_COUNTER_FILE", &counter)
         // Stage 1: write args, then cancel.
         .env(
@@ -726,7 +734,7 @@ fn move_window_stage2_prompt_arg_is_workspace_prompt() {
         .arg("move-window")
         .env_clear()
         .env("PATH", shim.as_path())
-        .env("NIRI_SOCKET", &sock)
+        .env("JIJI_SOCKET", &sock)
         .env("SHIM_COUNTER_FILE", &counter)
         // Stage 1: select Work so stage 2 fires.
         .env("SHIM_STAGE1_RESPONSE", "select:Work")
@@ -769,7 +777,7 @@ fn move_window_here_picker_cancel_exits_zero() {
         .arg("move-window-here")
         .env_clear()
         .env("PATH", shim.as_path())
-        .env("NIRI_SOCKET", &sock)
+        .env("JIJI_SOCKET", &sock)
         .env("SHIM_COUNTER_FILE", &counter)
         .env("SHIM_STAGE1_RESPONSE", "cancel")
         .env("SHIM_STAGE2_RESPONSE", "cancel")
@@ -786,7 +794,9 @@ fn rename_picker_cancel_exits_zero() {
     // (exit 1, empty stdout). The CLI must classify that as cancellation and
     // exit 0 silently.
     let shim = ShimDir::new("rename-cancel");
-    shim.install_fuzzel("exit 1\n");
+    // Drain stdin to EOF before exiting so the binary's stdin write
+    // does not race with the shim's exit and produce EPIPE.
+    shim.install_fuzzel("while IFS= read -r _line; do :; done\nexit 1\n");
     let sock = spawn_one_shot_activities_listener("rename-cancel");
 
     Command::cargo_bin(BIN)
@@ -794,7 +804,7 @@ fn rename_picker_cancel_exits_zero() {
         .args(["rename", "NewName"])
         .env_clear()
         .env("PATH", shim.as_path())
-        .env("NIRI_SOCKET", &sock)
+        .env("JIJI_SOCKET", &sock)
         .assert()
         .code(0);
 }
@@ -817,7 +827,7 @@ fn rename_picker_select_then_second_ipc_fails_exits_69() {
         .args(["rename", "NewName"])
         .env_clear()
         .env("PATH", shim.as_path())
-        .env("NIRI_SOCKET", &sock)
+        .env("JIJI_SOCKET", &sock)
         .assert()
         .code(69);
 }
@@ -830,7 +840,9 @@ fn rename_picker_prompt_arg_is_rename_prompt() {
     // `$SHIM_ARGS_CAPTURE`, then cancels.
     let shim = ShimDir::new("rename-args");
     let capture = shim.as_path().join("args.cap");
-    shim.install_fuzzel("printf '%s\\n' \"$@\" > \"$SHIM_ARGS_CAPTURE\"\nexit 1\n");
+    // Drain stdin before capturing args so the binary's stdin write does
+    // not race with the shim's exit and produce EPIPE.
+    shim.install_fuzzel("while IFS= read -r _line; do :; done\nprintf '%s\\n' \"$@\" > \"$SHIM_ARGS_CAPTURE\"\nexit 1\n");
     let sock = spawn_one_shot_activities_listener("rename-args");
 
     Command::cargo_bin(BIN)
@@ -838,7 +850,7 @@ fn rename_picker_prompt_arg_is_rename_prompt() {
         .args(["rename", "NewName"])
         .env_clear()
         .env("PATH", shim.as_path())
-        .env("NIRI_SOCKET", &sock)
+        .env("JIJI_SOCKET", &sock)
         .env("SHIM_ARGS_CAPTURE", &capture)
         .assert()
         .code(0);

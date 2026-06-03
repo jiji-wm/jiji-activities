@@ -153,13 +153,13 @@ fn unknown_subcommand_exits_64() {
 fn switch_named_no_socket_exits_69() {
     // Pins the binary-boundary wiring: `switch <name>` dispatches
     // through switch::run (not the NotImplemented stub), which hits the
-    // IPC factory. With $NIRI_SOCKET unset the factory returns
+    // IPC factory. With $JIJI_SOCKET unset the factory returns
     // SocketUnavailable (exit 69) — proving the named path is wired end-
     // to-end rather than returning NotImplemented (exit 70).
     Command::cargo_bin(BIN)
         .unwrap()
         .args(["switch", "Work"])
-        .env_remove("NIRI_SOCKET")
+        .env_remove("JIJI_SOCKET")
         .assert()
         .code(69);
 }
@@ -167,7 +167,7 @@ fn switch_named_no_socket_exits_69() {
 #[test]
 fn switch_no_arg_no_socket_exits_69() {
     // `switch` with no arg now opens the fuzzel picker. With
-    // `$NIRI_SOCKET` unset, two distinct paths can produce exit 69:
+    // `$JIJI_SOCKET` unset, two distinct paths can produce exit 69:
     //
     // 1. If `fuzzel` IS installed on this host (the common case on dev
     //    machines), `which fuzzel` succeeds but `Request::Activities`
@@ -184,7 +184,7 @@ fn switch_no_arg_no_socket_exits_69() {
     Command::cargo_bin(BIN)
         .unwrap()
         .args(["switch"])
-        .env_remove("NIRI_SOCKET")
+        .env_remove("JIJI_SOCKET")
         .assert()
         .code(69);
 }
@@ -198,7 +198,7 @@ fn no_args_exits_64() {
 fn assign_workspace_no_socket_exits_69() {
     // Pins the wiring: `assign-workspace` dispatches through the picker
     // availability check + IPC factory rather than the `NotImplemented`
-    // stub it used to fall back to. With `$NIRI_SOCKET` unset, two
+    // stub it used to fall back to. With `$JIJI_SOCKET` unset, two
     // distinct routes can produce exit 69:
     //
     // 1. If `rofi` IS installed on this host, the availability check
@@ -212,7 +212,7 @@ fn assign_workspace_no_socket_exits_69() {
     Command::cargo_bin(BIN)
         .unwrap()
         .arg("assign-workspace")
-        .env_remove("NIRI_SOCKET")
+        .env_remove("JIJI_SOCKET")
         .assert()
         .code(69);
 }
@@ -221,14 +221,14 @@ fn assign_workspace_no_socket_exits_69() {
 fn switch_previous_no_socket_exits_69() {
     // Pins the binary-boundary wiring: `switch-previous` dispatches
     // through switch_previous::run (not the NotImplemented stub), which
-    // hits the IPC factory. With $NIRI_SOCKET unset the factory returns
+    // hits the IPC factory. With $JIJI_SOCKET unset the factory returns
     // SocketUnavailable (exit 69) — proving the wired path replaced the
     // stub. A regression to exit 70 would mean it fell back to
     // NotImplemented.
     Command::cargo_bin(BIN)
         .unwrap()
         .args(["switch-previous"])
-        .env_remove("NIRI_SOCKET")
+        .env_remove("JIJI_SOCKET")
         .assert()
         .code(69);
 }
@@ -241,7 +241,7 @@ fn toggle_alias_no_socket_exits_69() {
     Command::cargo_bin(BIN)
         .unwrap()
         .arg("toggle")
-        .env_remove("NIRI_SOCKET")
+        .env_remove("JIJI_SOCKET")
         .assert()
         .code(69);
 }
@@ -249,7 +249,7 @@ fn toggle_alias_no_socket_exits_69() {
 #[test]
 fn move_window_no_socket_exits_69() {
     // `move-window` with no arg opens the fuzzel picker. With
-    // `$NIRI_SOCKET` unset, two distinct paths can produce exit 69:
+    // `$JIJI_SOCKET` unset, two distinct paths can produce exit 69:
     //
     // 1. If `fuzzel` IS installed on this host, `which fuzzel` succeeds
     //    but `Request::Activities` fails on the missing socket →
@@ -265,7 +265,7 @@ fn move_window_no_socket_exits_69() {
     Command::cargo_bin(BIN)
         .unwrap()
         .args(["move-window"])
-        .env_remove("NIRI_SOCKET")
+        .env_remove("JIJI_SOCKET")
         .assert()
         .code(69);
 }
@@ -278,7 +278,7 @@ fn move_window_here_no_socket_exits_69() {
     Command::cargo_bin(BIN)
         .unwrap()
         .args(["move-window-here"])
-        .env_remove("NIRI_SOCKET")
+        .env_remove("JIJI_SOCKET")
         .assert()
         .code(69);
 }
@@ -287,12 +287,12 @@ fn move_window_here_no_socket_exits_69() {
 fn move_workspace_named_no_socket_exits_69() {
     // Pins the binary-boundary wiring: `move-workspace <name>`
     // dispatches through move_workspace::run (not NotImplemented),
-    // hitting the IPC factory. With $NIRI_SOCKET unset the factory
+    // hitting the IPC factory. With $JIJI_SOCKET unset the factory
     // returns SocketUnavailable (exit 69).
     Command::cargo_bin(BIN)
         .unwrap()
         .args(["move-workspace", "Work"])
-        .env_remove("NIRI_SOCKET")
+        .env_remove("JIJI_SOCKET")
         .assert()
         .code(69);
 }
@@ -300,7 +300,7 @@ fn move_workspace_named_no_socket_exits_69() {
 #[test]
 fn move_workspace_no_arg_no_socket_exits_69() {
     // `move-workspace` with no arg now opens the fuzzel picker. With
-    // `$NIRI_SOCKET` unset, two distinct paths can produce exit 69:
+    // `$JIJI_SOCKET` unset, two distinct paths can produce exit 69:
     //
     // 1. If `fuzzel` IS installed on this host, `which fuzzel` succeeds
     //    but `Request::Activities` fails on the missing socket →
@@ -316,7 +316,7 @@ fn move_workspace_no_arg_no_socket_exits_69() {
     Command::cargo_bin(BIN)
         .unwrap()
         .args(["move-workspace"])
-        .env_remove("NIRI_SOCKET")
+        .env_remove("JIJI_SOCKET")
         .assert()
         .code(69);
 }
@@ -325,14 +325,14 @@ fn move_workspace_no_arg_no_socket_exits_69() {
 fn create_no_socket_exits_69() {
     // Pins the binary-boundary wiring: `create <name>` dispatches
     // through create::run (not the NotImplemented stub), which hits the
-    // IPC factory. With $NIRI_SOCKET unset the factory returns
+    // IPC factory. With $JIJI_SOCKET unset the factory returns
     // SocketUnavailable (exit 69) — proving the wired path replaced the
     // stub. A regression to exit 70 would mean it fell back to
     // NotImplemented.
     Command::cargo_bin(BIN)
         .unwrap()
         .args(["create", "Foo"])
-        .env_remove("NIRI_SOCKET")
+        .env_remove("JIJI_SOCKET")
         .assert()
         .code(69);
 }
@@ -341,14 +341,14 @@ fn create_no_socket_exits_69() {
 fn remove_no_socket_exits_69() {
     // Pins the binary-boundary wiring: `remove <name>` dispatches
     // through remove::run (not the NotImplemented stub), which hits the
-    // IPC factory. With $NIRI_SOCKET unset the factory returns
+    // IPC factory. With $JIJI_SOCKET unset the factory returns
     // SocketUnavailable (exit 69) — proving the wired path replaced the
     // stub. A regression to exit 70 would mean it fell back to
     // NotImplemented.
     Command::cargo_bin(BIN)
         .unwrap()
         .args(["remove", "Foo"])
-        .env_remove("NIRI_SOCKET")
+        .env_remove("JIJI_SOCKET")
         .assert()
         .code(69);
 }
@@ -359,7 +359,7 @@ fn save_no_socket_exits_69() {
     // save::run (not the NotImplemented stub), which performs a
     // filesystem write FIRST, then crosses the IPC factory for the
     // LoadConfigFile reload. With $NIRI_CONFIG pointing at a writable
-    // tempdir and $NIRI_SOCKET unset, the fs-edit step succeeds and
+    // tempdir and $JIJI_SOCKET unset, the fs-edit step succeeds and
     // the reload IPC call fails on the dead socket → exit 69. A
     // regression to exit 70 would mean save fell back to
     // NotImplemented; a regression to exit 73 would mean the fs-edit
@@ -372,7 +372,7 @@ fn save_no_socket_exits_69() {
         .unwrap()
         .args(["save", "Foo"])
         .env("NIRI_CONFIG", &cfg)
-        .env_remove("NIRI_SOCKET")
+        .env_remove("JIJI_SOCKET")
         .assert()
         .code(69)
         // C1: the recovery breadcrumb must always appear on stderr when
@@ -403,7 +403,7 @@ fn list_json_and_format_conflict_exits_64() {
 fn list_unknown_format_field_exits_64() {
     // The format-spec parser runs *before* any IPC connect attempt, so
     // a bogus field name short-circuits to exit 64 regardless of
-    // whether `$NIRI_SOCKET` is set or reachable. Pin that end-to-end.
+    // whether `$JIJI_SOCKET` is set or reachable. Pin that end-to-end.
     Command::cargo_bin(BIN)
         .unwrap()
         .args(["list", "--format", "bogus"])
@@ -428,7 +428,7 @@ fn toggle_alias_routes_to_switch_activity_previous() {
     Command::cargo_bin(BIN)
         .unwrap()
         .arg("toggle")
-        .env("NIRI_SOCKET", &sock)
+        .env("JIJI_SOCKET", &sock)
         .assert()
         .success();
 
@@ -532,7 +532,7 @@ fn move_window_named_prints_confirmation_to_stderr_on_success() {
     //
     // The compositor JSON for Activities and Workspaces is inline — it
     // matches the niri-ipc wire format.
-    let activities_reply = r#"{"Ok":{"Activities":[{"id":1,"name":"Work","is_active":true,"is_config_declared":true,"is_urgent":false},{"id":2,"name":"Personal","is_active":false,"is_config_declared":true,"is_urgent":false}]}}"#;
+    let activities_reply = r#"{"Ok":{"Activities":[{"id":1,"name":"Work","is_active":true,"is_config_declared":true,"is_urgent":false,"last_active_seq":2},{"id":2,"name":"Personal","is_active":false,"is_config_declared":true,"is_urgent":false,"last_active_seq":1}]}}"#;
     let workspaces_reply = r#"{"Ok":{"Workspaces":[{"id":10,"idx":0,"name":null,"output":"DP-1","is_urgent":false,"is_active":false,"is_focused":true,"active_window_id":42,"activities":[1],"is_sticky":false,"is_in_active_activity":true},{"id":20,"idx":0,"name":null,"output":"DP-1","is_urgent":false,"is_active":false,"is_focused":false,"active_window_id":null,"activities":[2],"is_sticky":false,"is_in_active_activity":false}]}}"#;
     let handled_reply = r#"{"Ok":"Handled"}"#;
 
@@ -544,7 +544,7 @@ fn move_window_named_prints_confirmation_to_stderr_on_success() {
     Command::cargo_bin(BIN)
         .unwrap()
         .args(["move-window", "Personal"])
-        .env("NIRI_SOCKET", &sock)
+        .env("JIJI_SOCKET", &sock)
         .assert()
         .success()
         .stderr(contains("moved focused window"))
@@ -555,13 +555,13 @@ fn move_window_named_prints_confirmation_to_stderr_on_success() {
 fn rename_named_target_no_socket_exits_69() {
     // Pins the binary-boundary wiring: `rename <new-name> --activity <old>`
     // dispatches through rename::run (not a NotImplemented stub), which hits
-    // the IPC factory. With $NIRI_SOCKET unset the factory returns
+    // the IPC factory. With $JIJI_SOCKET unset the factory returns
     // SocketUnavailable (exit 69) — proving the named path is wired end-to-
     // end. A regression to exit 70 would mean rename fell back to a stub.
     Command::cargo_bin(BIN)
         .unwrap()
         .args(["rename", "newname", "--activity", "old"])
-        .env_remove("NIRI_SOCKET")
+        .env_remove("JIJI_SOCKET")
         .assert()
         .code(69);
 }

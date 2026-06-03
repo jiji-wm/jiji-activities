@@ -2,7 +2,7 @@
 //!
 //! These tests are **not** run by `cargo test`. They require:
 //!
-//! - A running niri compositor exposing its IPC socket at `$NIRI_SOCKET`.
+//! - A running niri compositor exposing its IPC socket at `$JIJI_SOCKET`.
 //! - `niri` on `$PATH` (used as a side-effect verifier via `niri msg --json`).
 //!
 //! Run cadence (operator):
@@ -43,11 +43,11 @@ const SMOKE_PREFIX: &str = "__nact_smoke_";
 /// skip breadcrumb — `#[ignore]`-gated tests do not have a native
 /// skip mechanism, so we simulate one by returning a passing test.
 fn require_live_niri() -> Option<String> {
-    let socket = match std::env::var("NIRI_SOCKET") {
+    let socket = match std::env::var("JIJI_SOCKET") {
         Ok(s) if !s.is_empty() => s,
         _ => {
             eprintln!(
-                "smoke: SKIP — $NIRI_SOCKET unset; smoke tests require a running niri compositor",
+                "smoke: SKIP — $JIJI_SOCKET unset; smoke tests require a running niri compositor",
             );
             return None;
         }
@@ -61,7 +61,7 @@ fn require_live_niri() -> Option<String> {
     // operator a single clear diagnostic.
     let probe = StdCommand::new("niri")
         .args(["msg", "--json", "activities"])
-        .env("NIRI_SOCKET", &socket)
+        .env("JIJI_SOCKET", &socket)
         .output();
     match probe {
         Ok(out) if out.status.success() => Some(socket),
@@ -90,7 +90,7 @@ fn niri_msg(socket: &str, args: &[&str]) -> Value {
         .arg("msg")
         .arg("--json")
         .args(args)
-        .env("NIRI_SOCKET", socket)
+        .env("JIJI_SOCKET", socket)
         .output()
         .unwrap_or_else(|e| panic!("exec `niri msg --json {}` failed: {e}", args.join(" ")));
     if !out.status.success() {
@@ -117,15 +117,15 @@ fn niri_msg(socket: &str, args: &[&str]) -> Value {
 }
 
 /// Build an `assert_cmd::Command` for the test-compiled `jiji-activities`
-/// binary with `$NIRI_SOCKET` pre-populated.
+/// binary with `$JIJI_SOCKET` pre-populated.
 ///
 /// `assert_cmd::Command` does not strip env by default, but inheriting
-/// `$NIRI_SOCKET` explicitly keeps the binary-under-test connecting to
+/// `$JIJI_SOCKET` explicitly keeps the binary-under-test connecting to
 /// the same compositor the test helper queries — even if future
 /// versions of `assert_cmd` change defaults.
 fn nact(socket: &str) -> Command {
     let mut c = Command::cargo_bin(BIN).expect("locate jiji-activities binary");
-    c.env("NIRI_SOCKET", socket);
+    c.env("JIJI_SOCKET", socket);
     c
 }
 
@@ -181,7 +181,7 @@ impl Drop for RuntimeActivityGuard {
             }
         };
         if let Err(e) = cmd
-            .env("NIRI_SOCKET", &self.socket)
+            .env("JIJI_SOCKET", &self.socket)
             .args(["remove", &self.name])
             .output()
         {

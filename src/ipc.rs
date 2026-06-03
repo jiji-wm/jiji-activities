@@ -6,7 +6,7 @@
 //!   `send(Request) -> Result<Response, IpcError>`. Sync, blocking,
 //!   one round-trip per call.
 //! - [`SocketClient`] — production impl. Each call connects to
-//!   `$NIRI_SOCKET`, writes a JSON-encoded `Request` line, reads a
+//!   `$JIJI_SOCKET`, writes a JSON-encoded `Request` line, reads a
 //!   JSON-encoded `Reply` line, unwraps the outer `Result`. No
 //!   persistent state, no connection pooling, no event-stream support.
 //! - [`MockClient`] — test-only impl. Subcommand tests queue
@@ -29,7 +29,7 @@
 //! through [`make_client`]; in non-test builds that returns a fresh
 //! [`SocketClient`]. In test builds it first consults a thread-local
 //! override populated by [`install_mock`], so a subcommand test can
-//! drop in a `MockClient` without touching `$NIRI_SOCKET` or threading
+//! drop in a `MockClient` without touching `$JIJI_SOCKET` or threading
 //! the client through every call site.
 
 use std::fmt;
@@ -58,7 +58,7 @@ pub(crate) trait NiriClient {
 ///
 /// | Variant     | Trigger                                                            | Maps to                              |
 /// | ----------- | ------------------------------------------------------------------ | ------------------------------------ |
-/// | `Transport` | `$NIRI_SOCKET` unset, connect refused, read/write IO failure       | [`CliError::SocketUnavailable`] (69) |
+/// | `Transport` | `$JIJI_SOCKET` unset, connect refused, read/write IO failure       | [`CliError::SocketUnavailable`] (69) |
 /// | `Decode`    | reply line did not deserialize as a `Reply`                        | [`CliError::MalformedResponse`] (65) |
 /// | `Server`    | compositor responded with `Reply::Err(String)`                     | [`CliError::MalformedResponse`] (65) |
 ///
@@ -68,7 +68,7 @@ pub(crate) trait NiriClient {
 /// inspecting the string contents, which would be brittle.
 #[derive(Debug)]
 pub(crate) enum IpcError {
-    /// `$NIRI_SOCKET` unset, connect refused, or read/write IO failure
+    /// `$JIJI_SOCKET` unset, connect refused, or read/write IO failure
     /// during the round-trip.
     Transport(io::Error),
     /// The reply line on the wire was not valid JSON or did not
@@ -354,7 +354,7 @@ mod tests {
     use super::*;
     use crate::error::{CliError, MalformedResponseSource};
 
-    // `$NIRI_SOCKET` is process-global; tests that mutate it must run
+    // `$JIJI_SOCKET` is process-global; tests that mutate it must run
     // serialized. Rust 2024 made `std::env::set_var` unsafe — wrap
     // accordingly inside the lock.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -367,7 +367,7 @@ mod tests {
         fn set(value: &std::path::Path) -> Self {
             let prev = std::env::var_os(SOCKET_PATH_ENV);
             // SAFETY: ENV_LOCK serializes all `set_var` / `remove_var`
-            // calls on `NIRI_SOCKET` within this test module. No other
+            // calls on `JIJI_SOCKET` within this test module. No other
             // thread in the test process touches the variable.
             unsafe { std::env::set_var(SOCKET_PATH_ENV, value) };
             EnvGuard { prev }
@@ -664,16 +664,16 @@ mod tests {
         {
             let _inner = EnvGuard::set(std::path::Path::new("/sentinel-inner"));
             assert_eq!(
-                std::env::var("NIRI_SOCKET").as_deref(),
+                std::env::var("JIJI_SOCKET").as_deref(),
                 Ok("/sentinel-inner")
             );
         }
         assert_eq!(
-            std::env::var("NIRI_SOCKET").as_deref(),
+            std::env::var("JIJI_SOCKET").as_deref(),
             Ok("/sentinel-prior"),
             "EnvGuard drop must restore prior value",
         );
-        // _outer's drop restores NIRI_SOCKET's prior state (None, since the
+        // _outer's drop restores JIJI_SOCKET's prior state (None, since the
         // lock acquirer started clean).
     }
 
@@ -682,18 +682,18 @@ mod tests {
         let _lock = ENV_LOCK.lock().expect("env lock not poisoned");
         // SAFETY: env mutation serialized by ENV_LOCK.
         unsafe {
-            std::env::remove_var("NIRI_SOCKET");
+            std::env::remove_var("JIJI_SOCKET");
         }
         {
             let _g = EnvGuard::set(std::path::Path::new("/sentinel-inner"));
             assert_eq!(
-                std::env::var("NIRI_SOCKET").as_deref(),
+                std::env::var("JIJI_SOCKET").as_deref(),
                 Ok("/sentinel-inner"),
                 "EnvGuard::set must apply the new value when prior was unset",
             );
         }
         assert!(
-            std::env::var_os("NIRI_SOCKET").is_none(),
+            std::env::var_os("JIJI_SOCKET").is_none(),
             "EnvGuard drop must restore unset state when prior was unset",
         );
     }

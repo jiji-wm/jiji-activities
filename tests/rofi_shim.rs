@@ -101,8 +101,8 @@ fn spawn_one_shot_assign_listener(tag: &str) -> PathBuf {
     thread::spawn(move || {
         // Reply #1 — Activities.
         let activities_reply = "{\"Ok\":{\"Activities\":[\
-             {\"id\":1,\"name\":\"Work\",\"is_config_declared\":true,\"is_active\":true,\"is_urgent\":false},\
-             {\"id\":2,\"name\":\"Personal\",\"is_config_declared\":true,\"is_active\":false,\"is_urgent\":false}\
+             {\"id\":1,\"name\":\"Work\",\"is_config_declared\":true,\"is_active\":true,\"is_urgent\":false,\"last_active_seq\":2},\
+             {\"id\":2,\"name\":\"Personal\",\"is_config_declared\":true,\"is_active\":false,\"is_urgent\":false,\"last_active_seq\":1}\
              ]}}\n";
         // Reply #2 — Workspaces with one focused workspace (id 42,
         // currently in activity 1).
@@ -157,8 +157,8 @@ fn spawn_one_shot_assign_listener_capturing(tag: &str) -> (PathBuf, Arc<Mutex<Ve
     let captured_clone = Arc::clone(&captured);
     thread::spawn(move || {
         let activities_reply = "{\"Ok\":{\"Activities\":[\
-             {\"id\":1,\"name\":\"Work\",\"is_config_declared\":true,\"is_active\":true,\"is_urgent\":false},\
-             {\"id\":2,\"name\":\"Personal\",\"is_config_declared\":true,\"is_active\":false,\"is_urgent\":false}\
+             {\"id\":1,\"name\":\"Work\",\"is_config_declared\":true,\"is_active\":true,\"is_urgent\":false,\"last_active_seq\":2},\
+             {\"id\":2,\"name\":\"Personal\",\"is_config_declared\":true,\"is_active\":false,\"is_urgent\":false,\"last_active_seq\":1}\
              ]}}\n";
         let workspaces_reply = "{\"Ok\":{\"Workspaces\":[\
              {\"id\":42,\"idx\":1,\"name\":null,\"output\":\"DP-1\",\"is_urgent\":false,\
@@ -210,7 +210,7 @@ fn rofi_cancel_exits_0() {
         .arg("assign-workspace")
         .env_clear()
         .env("PATH", shim.as_path())
-        .env("NIRI_SOCKET", &sock)
+        .env("JIJI_SOCKET", &sock)
         .assert()
         .code(0)
         .stderr(str::is_empty());
@@ -232,7 +232,7 @@ fn rofi_select_dispatches_set_and_exits_0() {
         .arg("assign-workspace")
         .env_clear()
         .env("PATH", shim.as_path())
-        .env("NIRI_SOCKET", &sock)
+        .env("JIJI_SOCKET", &sock)
         .assert()
         .code(0)
         .stderr(str::is_empty());
@@ -269,7 +269,7 @@ fn rofi_only_one_chains_and_dispatches() {
         .arg("assign-workspace")
         .env_clear()
         .env("PATH", shim.as_path())
-        .env("NIRI_SOCKET", &sock)
+        .env("JIJI_SOCKET", &sock)
         .assert()
         .code(0)
         .stderr(contains("error").not());
@@ -302,7 +302,7 @@ fn rofi_missing_from_path_exits_69() {
         .arg("assign-workspace")
         .env_clear()
         .env("PATH", shim.as_path())
-        .env_remove("NIRI_SOCKET")
+        .env_remove("JIJI_SOCKET")
         .assert()
         .code(69)
         .stderr(contains("picker unavailable").and(contains("rofi")));

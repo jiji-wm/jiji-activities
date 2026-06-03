@@ -12,7 +12,7 @@
 //! | `Usage`              |   64 | argument-parse failure (clap or our own) |
 //! | `MalformedResponse`  |   65 | compositor returned an unexpected shape  |
 //! | `ActivityNotFound`   |   66 | named activity does not exist            |
-//! | `SocketUnavailable`  |   69 | `$NIRI_SOCKET` unreachable / IPC failed  |
+//! | `SocketUnavailable`  |   69 | `$JIJI_SOCKET` unreachable / IPC failed  |
 //! | `PickerUnavailable`  |   69 | external picker missing / spawn failed   |
 //! | `NotImplemented`     |   70 | subcommand stub not yet wired            |
 //! | `CantCreate`         |   73 | `create`/`save` could not produce target |
@@ -96,10 +96,10 @@ pub(crate) enum CliError {
     /// (`EX_NOINPUT`).
     ActivityNotFound(String),
 
-    /// `$NIRI_SOCKET` is unset, the socket file is missing, or the IPC
+    /// `$JIJI_SOCKET` is unset, the socket file is missing, or the IPC
     /// round-trip failed at the transport layer. Distinct from
-    /// [`Self::MalformedResponse`] so the user can tell "niri isn't
-    /// running" from "niri is running but spoke gibberish."
+    /// [`Self::MalformedResponse`] so the user can tell "jiji isn't
+    /// running" from "jiji is running but spoke gibberish."
     /// Exit code 69 (`EX_UNAVAILABLE`). The typed `io::Error` source
     /// remains reachable via [`std::error::Error::source`].
     SocketUnavailable(std::io::Error),
@@ -110,7 +110,7 @@ pub(crate) enum CliError {
     /// [`std::error::Error::source`]. Exit code 69
     /// (`EX_UNAVAILABLE`) — shared with [`Self::SocketUnavailable`];
     /// the user-visible distinction is the `Display` prefix
-    /// (`picker unavailable:` vs `niri socket unavailable:`).
+    /// (`picker unavailable:` vs `jiji socket unavailable:`).
     PickerUnavailable(std::io::Error),
 
     /// Subcommand stub has not been wired to its IPC call yet.
@@ -176,7 +176,7 @@ impl fmt::Display for CliError {
             CliError::Usage(msg) => write!(f, "usage: {msg}"),
             CliError::MalformedResponse(src) => write!(f, "malformed compositor response: {src}"),
             CliError::ActivityNotFound(name) => write!(f, "no such activity: {name}"),
-            CliError::SocketUnavailable(io) => write!(f, "niri socket unavailable: {io}"),
+            CliError::SocketUnavailable(io) => write!(f, "jiji socket unavailable: {io}"),
             CliError::PickerUnavailable(io) => write!(f, "picker unavailable: {io}"),
             CliError::NotImplemented(name) => write!(f, "subcommand not yet implemented: {name}"),
             CliError::CantCreate(msg) => write!(f, "cannot create activity: {msg}"),
@@ -339,7 +339,7 @@ mod tests {
         // exit code — not fall through to 1. This pins the chain-walk
         // contract before any real IPC layer exists to exercise it.
         let base: anyhow::Error = CliError::SocketUnavailable(sample_io_error()).into();
-        let wrapped = base.context("connecting to $NIRI_SOCKET");
+        let wrapped = base.context("connecting to $JIJI_SOCKET");
         // Pin the post-context downcast: chain-walk must still recover the
         // typed CliError once wrapped.
         let recovered = wrapped
@@ -356,10 +356,10 @@ mod tests {
         // the CliError Display output. Pins the display contract before
         // any real chain flows through main.
         let base: anyhow::Error = CliError::SocketUnavailable(sample_io_error()).into();
-        let wrapped = base.context("connecting to $NIRI_SOCKET");
+        let wrapped = base.context("connecting to $JIJI_SOCKET");
         let formatted = format!("{wrapped:#}");
         assert!(
-            formatted.contains("connecting to $NIRI_SOCKET"),
+            formatted.contains("connecting to $JIJI_SOCKET"),
             "context layer missing from: {formatted}",
         );
         assert!(

@@ -57,7 +57,7 @@ const FISH_SINGLE_ARG_VERBS: [&str; 5] =
     ["switch", "move-window", "move-workspace", "remove", "save"];
 
 /// Shell command invoked at fish tab-completion time to enumerate candidate
-/// activity names. `2>/dev/null` swallows the "niri socket unavailable"
+/// activity names. `2>/dev/null` swallows the "jiji socket unavailable"
 /// stderr path so a stopped compositor yields zero candidates silently
 /// rather than producing visible error noise during a tab press.
 const FISH_NAMES_CMD: &str = "jiji-activities list --format=name 2>/dev/null";
