@@ -440,6 +440,10 @@ fn toggle_alias_routes_to_switch_activity_previous() {
         "toggle must emit SwitchActivityPrevious, not Switch or Activities; got: {req_json:?}",
     );
     assert!(
+        req_json.contains("\"depth\":1"),
+        "toggle must emit depth:1 in SwitchActivityPrevious; got: {req_json:?}",
+    );
+    assert!(
         !req_json.contains("Activities"),
         "toggle must NOT emit Activities (picker path); got: {req_json:?}",
     );

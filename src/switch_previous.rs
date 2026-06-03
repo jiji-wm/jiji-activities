@@ -1,10 +1,10 @@
 //! `switch-previous` subcommand: switch to the previously-active
 //! activity (toggle behaviour).
 //!
-//! Dispatches `Action::SwitchActivityPrevious {}` over IPC and expects
-//! `Response::Handled`. No name argument; no picker. The compositor
-//! maintains the "previous activity" pointer internally — the CLI is a
-//! one-shot trigger.
+//! Dispatches `Action::SwitchActivityPrevious { depth: 1 }` over IPC and
+//! expects `Response::Handled`. No name argument; no picker. The compositor
+//! maintains the activity recency list internally — the CLI is a one-shot
+//! trigger that switches to the previously-active activity (depth 1).
 //!
 //! ## Error model
 //!
@@ -31,14 +31,14 @@ use niri_ipc::{Action, Request};
 use crate::ipc::NiriClient;
 use crate::ipc_helpers::send_expect_handled;
 
-/// Issues `Request::Action(Action::SwitchActivityPrevious {})`.
+/// Issues `Request::Action(Action::SwitchActivityPrevious { depth: 1 })`.
 ///
 /// **Contract:** exactly one IPC round-trip; `Response::Handled` ⇒
 /// `Ok(())`; everything else routes through
 /// [`send_expect_handled`] with `activity_name: None`. See module
 /// docs for the full error matrix.
 pub(crate) fn run(client: &mut dyn NiriClient) -> Result<()> {
-    let req = Request::Action(Action::SwitchActivityPrevious {});
+    let req = Request::Action(Action::SwitchActivityPrevious { depth: 1 });
     send_expect_handled(client, req, None).context("switching to previous activity")
 }
 
@@ -51,15 +51,15 @@ mod tests {
     use crate::ipc::MockClient;
 
     fn previous_req() -> Request {
-        Request::Action(Action::SwitchActivityPrevious {})
+        Request::Action(Action::SwitchActivityPrevious { depth: 1 })
     }
 
     #[test]
     fn switch_previous_dispatches_action_with_no_args() {
-        // Pin the request shape: Action::SwitchActivityPrevious {} —
-        // an empty-struct variant, not a sibling that happens to share
-        // a name. MockClient's queue-equality already enforces this,
-        // but a dedicated test pins the contract at a glance.
+        // Pin the request shape: Action::SwitchActivityPrevious { depth: 1 }
+        // for the toggle-to-previous semantics. MockClient's queue-equality
+        // already enforces this, but a dedicated test pins the contract at
+        // a glance.
         let mut client = MockClient::new();
         client.expect(previous_req(), Reply::Ok(Response::Handled));
         run(&mut client).expect("happy path");
