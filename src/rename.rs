@@ -10,21 +10,24 @@
 //!
 //! ## Error model
 //!
-//! [`run`] routes through [`send_expect_handled`] with the **target**
-//! activity name as the `activity_name` carrier. This means:
+//! [`run`] open-codes the IPC response match (like `create.rs`) because the
+//! `"activity name must not be empty"` arm requires a `Usage` exit code (64)
+//! that the shared [`send_expect_handled`] helper does not surface. This means:
 //!
-//! - `Reply::Ok(Response::Handled)` → `Ok(())`.
-//! - `Reply::Ok(other)` →
+//! - `Ok(Response::Handled)` → `Ok(())`.
+//! - `Ok(other)` →
 //!   `CliError::MalformedResponse(WrongVariant { .. })` (exit 65).
-//! - `Reply::Err("activity not found")` →
+//! - `Err(IpcError::Server("activity not found"))` →
 //!   `CliError::ActivityNotFound(target)` (exit 66).
-//! - All other `Reply::Err(msg)` — including compositor refusals such as
-//!   `"activity is config-declared; edit config and reload to rename"`,
-//!   `"activity name must not be empty"`, and `"activity name already
-//!   exists"` — flow through to `CliError::MalformedResponse(Server(msg))`
-//!   (exit 65) verbatim. The compositor is the source of truth for those
-//!   strings; surfacing them unmolested keeps the user-facing diagnostic
-//!   in sync as the compositor refines its tokens.
+//! - `Err(IpcError::Server("activity name must not be empty"))` →
+//!   `CliError::Usage("activity name must not be empty")` (exit 64),
+//!   mirroring `create`. The compositor is the source of truth for the
+//!   "empty" condition; the CLI does not pre-validate.
+//! - All other `Err(IpcError::Server(msg))` — including compositor
+//!   refusals such as `"activity is config-declared; edit config and
+//!   reload to rename"` and `"activity name already exists"` — flow
+//!   through to `CliError::MalformedResponse(Server(msg))` (exit 65)
+//!   verbatim.
 //! - Transport / decode errors flow through `IpcError → CliError`
 //!   unchanged.
 //!
@@ -32,21 +35,20 @@
 //! operation surfaces in the stderr chain.
 
 use anyhow::{Context, Result};
-use niri_ipc::{Action, ActivityReferenceArg, Request};
+use niri_ipc::{Action, ActivityReferenceArg, Request, Response};
 
-use crate::error::CliError;
-use crate::ipc::NiriClient;
-use crate::ipc_helpers::{names_focused_first, send_expect_activities, send_expect_handled};
+use crate::error::{CliError, MalformedResponseSource};
+use crate::ipc::{IpcError, NiriClient};
+use crate::ipc_helpers::{names_focused_first, send_expect_activities, variant_name};
 use crate::picker::PickerOutcome;
 
 /// Renames the activity identified by `target` to `new_name`.
 ///
 /// **Contract:** issues exactly one `RenameActivity` IPC request referencing
 /// the activity by `target` and expects `Response::Handled`. The
-/// `target_name_for_err` parameter is forwarded to [`send_expect_handled`] as
-/// the `activity_name` carrier — it must be the target activity's name (not
-/// the new name) so a `"activity not found"` wire error maps to
-/// `ActivityNotFound(<target>)`.
+/// `target_name_for_err` parameter is used to map a `"activity not found"`
+/// wire error to `ActivityNotFound(<target>)` — it must be the target
+/// activity's name (not the new name).
 ///
 /// See module docs for the full error matrix.
 pub(crate) fn run(
@@ -59,7 +61,28 @@ pub(crate) fn run(
         activity: target.clone(),
         name: new_name.to_owned(),
     });
-    send_expect_handled(client, req, target_name_for_err).context("renaming activity")
+    // The explicit type annotation is required: rustc cannot infer the `Ok`
+    // variant's type from `?`-propagation alone (E0282) when the match arms
+    // produce heterogeneous `Err` forms through `.into()`.
+    let result: anyhow::Result<()> = match client.send(req) {
+        Ok(Response::Handled) => Ok(()),
+        Ok(other) => Err(
+            CliError::MalformedResponse(MalformedResponseSource::WrongVariant {
+                expected: "Response::Handled",
+                got: variant_name(&other).into(),
+            })
+            .into(),
+        ),
+        Err(IpcError::Server(msg)) if msg == "activity not found" => match target_name_for_err {
+            Some(name) => Err(CliError::ActivityNotFound(name.to_owned()).into()),
+            None => Err(CliError::MalformedResponse(MalformedResponseSource::Server(msg)).into()),
+        },
+        Err(IpcError::Server(msg)) if msg == "activity name must not be empty" => {
+            Err(CliError::Usage("activity name must not be empty".to_owned()).into())
+        }
+        Err(other) => Err(CliError::from(other).into()),
+    };
+    result.context("renaming activity")
 }
 
 /// Opens a single-select picker over the current activity list, then
@@ -209,6 +232,64 @@ mod tests {
                 );
             }
             other => panic!("expected MalformedResponse(Server), got {other:?}"),
+        }
+        assert_eq!(cli_err.exit_code(), 65);
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn rename_empty_name_routes_to_usage_64() {
+        // The compositor's wire string is the source of truth for "empty" —
+        // the CLI does not pre-validate. A `rename "   "` invocation (clap
+        // accepts it) reaches this arm. Mirrors create's empty-name→Usage
+        // test.
+        let mut client = MockClient::new();
+        client.expect(
+            rename_req("Work", ""),
+            Err("activity name must not be empty".to_owned()),
+        );
+        let err = run(&mut client, &make_target("Work"), "", Some("Work"))
+            .expect_err("empty-name must fail");
+        let cli_err = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<CliError>())
+            .expect("CliError must be in chain");
+        match cli_err {
+            CliError::Usage(msg) => {
+                assert_eq!(msg, "activity name must not be empty");
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+        assert_eq!(cli_err.exit_code(), 64);
+        // Pin shape-(b) ordering hazard: .context("renaming activity") must
+        // still appear in the chain even after the Usage rewrite.
+        let formatted = format!("{err:#}");
+        assert!(
+            formatted.contains("renaming activity"),
+            "context layer must remain in chain: {formatted}",
+        );
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn rename_empty_name_capitalized_routes_to_malformed() {
+        // Pins strict-equality on the "activity name must not be empty" match
+        // arm. A capitalized variant must NOT route to Usage — it must fall
+        // through to MalformedResponse(Server), mirroring create's discipline.
+        let mut client = MockClient::new();
+        client.expect(
+            rename_req("Work", "   "),
+            Err("Activity name must not be empty".to_owned()),
+        );
+        let err = run(&mut client, &make_target("Work"), "   ", Some("Work"))
+            .expect_err("capitalized string must not match Usage");
+        let cli_err = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<CliError>())
+            .expect("CliError must be in chain");
+        match cli_err {
+            CliError::MalformedResponse(MalformedResponseSource::Server(_)) => {}
+            other => panic!("expected MalformedResponse(Server), not Usage; got {other:?}"),
         }
         assert_eq!(cli_err.exit_code(), 65);
         client.assert_consumed_in_order();
