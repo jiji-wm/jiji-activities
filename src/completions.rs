@@ -13,6 +13,9 @@
 //!
 //! - `create <name>` — the argument is a new name; completing against
 //!   existing names would be misleading.
+//! - `rename <new-name>` — the first positional is also a new name (the
+//!   target activity is chosen via `--activity` or a picker); completing
+//!   the positional against existing names would be misleading.
 //! - `assign-workspace` — takes no positional argument. The picker
 //!   handles multi-select internally; the CLI surface itself is a unit
 //!   variant. Any completion at `assign-workspace <TAB>` is wrong.
@@ -155,6 +158,18 @@ mod tests {
         assert!(
             !out.contains("__fish_jiji_activities_using_subcommand create"),
             "fish dynamic output must not include `create`:\n{out}",
+        );
+    }
+
+    #[test]
+    fn fish_dynamic_does_not_emit_line_for_rename() {
+        // `rename <new-name>` takes a new name as its positional; completing
+        // against existing names would be misleading. Guards against an
+        // accidental addition of "rename" to `FISH_SINGLE_ARG_VERBS`.
+        let out = String::from_utf8(fish_dynamic_bytes()).unwrap();
+        assert!(
+            !out.contains("__fish_jiji_activities_using_subcommand rename"),
+            "fish dynamic output must not include `rename`:\n{out}",
         );
     }
 

@@ -122,6 +122,7 @@ fn help_lists_all_subcommands() {
         "assign-workspace",
         "create",
         "remove",
+        "rename",
         "save",
         "list",
         "completions",
@@ -548,6 +549,21 @@ fn move_window_named_prints_confirmation_to_stderr_on_success() {
         .success()
         .stderr(contains("moved focused window"))
         .stderr(contains("'Personal'"));
+}
+
+#[test]
+fn rename_named_target_no_socket_exits_69() {
+    // Pins the binary-boundary wiring: `rename <new-name> --activity <old>`
+    // dispatches through rename::run (not a NotImplemented stub), which hits
+    // the IPC factory. With $NIRI_SOCKET unset the factory returns
+    // SocketUnavailable (exit 69) — proving the named path is wired end-to-
+    // end. A regression to exit 70 would mean rename fell back to a stub.
+    Command::cargo_bin(BIN)
+        .unwrap()
+        .args(["rename", "newname", "--activity", "old"])
+        .env_remove("NIRI_SOCKET")
+        .assert()
+        .code(69);
 }
 
 #[test]

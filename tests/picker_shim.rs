@@ -777,6 +777,83 @@ fn move_window_here_picker_cancel_exits_zero() {
         .code(0);
 }
 
+// ---- rename picker tests ---------------------------------------------------
+
+#[test]
+fn rename_picker_cancel_exits_zero() {
+    // Full pipe-and-read flow for `rename`: socket listener answers
+    // Activities, the single-select fuzzel shim simulates a user dismissal
+    // (exit 1, empty stdout). The CLI must classify that as cancellation and
+    // exit 0 silently.
+    let shim = ShimDir::new("rename-cancel");
+    shim.install_fuzzel("exit 1\n");
+    let sock = spawn_one_shot_activities_listener("rename-cancel");
+
+    Command::cargo_bin(BIN)
+        .unwrap()
+        .args(["rename", "NewName"])
+        .env_clear()
+        .env("PATH", shim.as_path())
+        .env("NIRI_SOCKET", &sock)
+        .assert()
+        .code(0);
+}
+
+#[test]
+fn rename_picker_select_then_second_ipc_fails_exits_69() {
+    // Full pipe-and-read flow: socket listener answers Activities, the picker
+    // spawns the shim, which prints "Work" and exits 0 — picker returns
+    // Selected("Work"). `run_picker` then dispatches a SECOND IPC call
+    // (RenameActivity); the one-shot listener already closed, so that second
+    // call hits a dead socket and exit 69 surfaces. Pins that the picker path
+    // reaches rename::run (regression to exit 0 would mean no second IPC
+    // call fired).
+    let shim = ShimDir::new("rename-select");
+    shim.install_fuzzel("printf 'Work\\n'\nexit 0\n");
+    let sock = spawn_one_shot_activities_listener("rename-select");
+
+    Command::cargo_bin(BIN)
+        .unwrap()
+        .args(["rename", "NewName"])
+        .env_clear()
+        .env("PATH", shim.as_path())
+        .env("NIRI_SOCKET", &sock)
+        .assert()
+        .code(69);
+}
+
+#[test]
+fn rename_picker_prompt_arg_is_rename_prompt() {
+    // Pins that the rename picker passes `--prompt "Rename activity:"` to
+    // fuzzel. A regression that re-used another verb's prompt string would
+    // not be caught by the cancel/select tests. The shim writes `$@` to
+    // `$SHIM_ARGS_CAPTURE`, then cancels.
+    let shim = ShimDir::new("rename-args");
+    let capture = shim.as_path().join("args.cap");
+    shim.install_fuzzel("printf '%s\\n' \"$@\" > \"$SHIM_ARGS_CAPTURE\"\nexit 1\n");
+    let sock = spawn_one_shot_activities_listener("rename-args");
+
+    Command::cargo_bin(BIN)
+        .unwrap()
+        .args(["rename", "NewName"])
+        .env_clear()
+        .env("PATH", shim.as_path())
+        .env("NIRI_SOCKET", &sock)
+        .env("SHIM_ARGS_CAPTURE", &capture)
+        .assert()
+        .code(0);
+
+    let args = fs::read_to_string(&capture).expect("shim must have written args capture file");
+    assert!(
+        args.contains("--prompt"),
+        "--prompt flag must be present in rename fuzzel args: {args:?}",
+    );
+    assert!(
+        args.contains("Rename activity:"),
+        "prompt value must be 'Rename activity:' in rename fuzzel args: {args:?}",
+    );
+}
+
 /// Sibling of [`spawn_one_shot_activities_listener`] that replies with an
 /// empty `Activities` payload. Used by the empty-list short-circuit
 /// integration test.

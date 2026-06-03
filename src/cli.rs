@@ -3,8 +3,8 @@
 //! Each subcommand routes to a `cmd_<name>` helper. All current
 //! subcommands (`switch`, `switch-previous`, `move-window`,
 //! `move-window-here`, `move-workspace`, `assign-workspace`, `create`,
-//! `remove`, `save`, `list`) issue real IPC. The dispatch shape and CLI
-//! surface are pinned by `tests/cli.rs`.
+//! `remove`, `rename`, `save`, `list`) issue real IPC. The dispatch shape
+//! and CLI surface are pinned by `tests/cli.rs`.
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -18,6 +18,7 @@ use crate::move_window;
 use crate::move_workspace;
 use crate::picker;
 use crate::remove;
+use crate::rename;
 use crate::save;
 use crate::switch;
 use crate::switch_previous;
@@ -120,6 +121,15 @@ pub(crate) enum Cmd {
 
     /// Remove an activity by name.
     Remove { name: String },
+
+    /// Rename an activity to a new name. Without `--activity`, opens a picker to choose the target.
+    Rename {
+        /// New name for the activity.
+        name: String,
+        /// Target activity to rename (by name or id). Without this, a picker opens.
+        #[arg(long)]
+        activity: Option<String>,
+    },
 
     /// Save the current activity layout under the given name.
     Save { name: String },
@@ -252,6 +262,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
         }
         Cmd::Create { name } => cmd_create(name),
         Cmd::Remove { name } => cmd_remove(name),
+        Cmd::Rename { name, activity } => cmd_rename(name, activity),
         Cmd::Save { name } => cmd_save(name),
         Cmd::List {
             json,
@@ -409,6 +420,31 @@ fn cmd_create(name: String) -> Result<()> {
 fn cmd_remove(name: String) -> Result<()> {
     let mut client = ipc::make_client();
     remove::run(client.as_mut(), &name)
+}
+
+fn cmd_rename(name: String, activity: Option<String>) -> Result<()> {
+    match activity {
+        Some(ref target) => {
+            // Named-target path: no picker needed.
+            let mut client = ipc::make_client();
+            rename::run(
+                client.as_mut(),
+                &niri_ipc::ActivityReferenceArg::Name(target.clone()),
+                &name,
+                Some(target.as_str()),
+            )
+        }
+        None => {
+            // Picker path: verify fuzzel is available BEFORE any IPC
+            // round-trip so a missing-dep failure surfaces with a
+            // fuzzel-naming stderr message rather than "niri socket
+            // unavailable" (the IPC layer's error on a dead socket).
+            picker::ensure_available().context("verifying rename picker availability")?;
+            let mut client = ipc::make_client();
+            rename::run_picker(client.as_mut(), &name, picker::pick_one)
+                .context("running rename picker")
+        }
+    }
 }
 
 fn cmd_save(name: String) -> Result<()> {

@@ -21,6 +21,7 @@ mod move_window;
 mod move_workspace;
 mod picker;
 mod remove;
+mod rename;
 mod save;
 mod switch;
 mod switch_previous;
