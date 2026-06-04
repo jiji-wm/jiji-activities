@@ -146,8 +146,11 @@ pub(crate) fn pick_one(prompt: &str, items: &[String]) -> Result<PickerOutcome, 
     // check here keeps `pick_one` correct in isolation.
     ensure_available()?;
 
+    // Dynamic width: fuzzel defaults to 30 characters, which truncates
+    // context-bearing prompts and long item names.
+    let width = fuzzel_width(prompt, items).to_string();
     let mut child = Command::new("fuzzel")
-        .args(["--dmenu", "--prompt", prompt])
+        .args(["--dmenu", "--prompt", prompt, "--width", &width])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -214,8 +217,11 @@ pub(crate) fn prompt_name(prompt: &str) -> Result<NameOutcome, CliError> {
     // rationale.
     ensure_available()?;
 
+    // Same dynamic-width rationale as pick_one; no items here, so the
+    // prompt alone drives the width.
+    let width = fuzzel_width(prompt, &[]).to_string();
     let mut child = Command::new("fuzzel")
-        .args(["--dmenu", "--prompt", prompt])
+        .args(["--dmenu", "--prompt", prompt, "--width", &width])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -268,6 +274,39 @@ fn decode_name_outcome(success: bool, stdout: &[u8]) -> NameOutcome {
         (true, true) => NameOutcome::Unnamed,
         (false, _) => NameOutcome::Cancelled,
     }
+}
+
+/// fuzzel's built-in default window width (characters); also our floor so
+/// short menus keep the familiar footprint.
+const FUZZEL_MIN_WIDTH: usize = 30;
+
+/// Upper bound on the computed width so a pathologically long prompt or
+/// item (e.g. a window title) cannot stretch the picker across the screen.
+const FUZZEL_MAX_WIDTH: usize = 120;
+
+/// Typing room reserved after the prompt — prompt and typed input share
+/// fuzzel's single input row.
+const PROMPT_TYPING_PAD: usize = 12;
+
+/// Slack added past the longest item for the selection highlight margin.
+const ITEM_PAD: usize = 4;
+
+/// Computes the `--width` (in characters, fuzzel's unit) needed so neither
+/// the prompt row nor any item is truncated: the max of the prompt plus
+/// typing room and the longest item plus highlight slack, clamped to
+/// [`FUZZEL_MIN_WIDTH`]..=[`FUZZEL_MAX_WIDTH`]. Counts `char`s, not bytes,
+/// so non-ASCII activity names don't over-widen the window. Pure
+/// (unit-tested).
+fn fuzzel_width(prompt: &str, items: &[String]) -> usize {
+    let prompt_need = prompt.chars().count() + PROMPT_TYPING_PAD;
+    let item_need = items
+        .iter()
+        .map(|i| i.chars().count() + ITEM_PAD)
+        .max()
+        .unwrap_or(0);
+    prompt_need
+        .max(item_need)
+        .clamp(FUZZEL_MIN_WIDTH, FUZZEL_MAX_WIDTH)
 }
 
 /// Joins `items` with newlines, with a trailing newline so the last item
@@ -518,6 +557,44 @@ mod tests {
             NameOutcome::Typed(s) => assert_eq!(s, "spaced"),
             other => panic!("expected Typed, got {other:?}"),
         }
+    }
+
+    // ---- fuzzel_width ------------------------------------------------
+
+    #[test]
+    fn fuzzel_width_floors_at_fuzzel_default_for_short_content() {
+        // Short prompt + short items must not shrink below fuzzel's own
+        // default footprint.
+        assert_eq!(fuzzel_width("> ", &["a".to_owned()]), FUZZEL_MIN_WIDTH);
+    }
+
+    #[test]
+    fn fuzzel_width_grows_with_long_prompt() {
+        let prompt = "Switch to activity with a rather long context:";
+        let expected = prompt.chars().count() + PROMPT_TYPING_PAD;
+        assert_eq!(fuzzel_width(prompt, &[]), expected);
+    }
+
+    #[test]
+    fn fuzzel_width_grows_with_longest_item() {
+        let items = vec!["short".to_owned(), "a".repeat(60)];
+        assert_eq!(fuzzel_width("> ", &items), 60 + ITEM_PAD);
+    }
+
+    #[test]
+    fn fuzzel_width_caps_at_max() {
+        // A pathologically long item (e.g. a window title) must not
+        // stretch the picker across the screen.
+        let items = vec!["x".repeat(500)];
+        assert_eq!(fuzzel_width("> ", &items), FUZZEL_MAX_WIDTH);
+    }
+
+    #[test]
+    fn fuzzel_width_counts_chars_not_bytes() {
+        // 40 multi-byte chars: width must follow the char count (40 + pad),
+        // not the byte count (120 + pad, which would hit the cap).
+        let items = vec!["č".repeat(40)];
+        assert_eq!(fuzzel_width("> ", &items), 40 + ITEM_PAD);
     }
 
     // ---- items_to_payload ------------------------------------------------

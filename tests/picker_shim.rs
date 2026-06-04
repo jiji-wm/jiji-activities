@@ -219,14 +219,14 @@ fn fuzzel_stdin_payload_reaches_shim() {
         .code(0);
 
     // The one-shot listener sends Work (active, seq=2) + Personal (seq=1).
-    // `names_for_switch` (MRU default) excludes the active "Work" into
-    // `current`; only "Personal" appears in `rows` (and therefore in
-    // the picker's stdin payload).
+    // `names_for_switch` (MRU default) pulls the active "Work" into
+    // `current`; "Personal" leads the rows (preselected) and the current
+    // activity rides along as a marked last row on its own line.
     let payload = fs::read_to_string(&capture)
         .expect("shim must have written stdin capture file (file missing)");
     assert_eq!(
-        payload, "Personal\n",
-        "stdin payload must list only the non-active activity names, one per line with trailing newline; got: {payload:?}",
+        payload, "Personal\nWork (current)\n",
+        "stdin payload must list non-active names first and the marked current activity last, one per line with trailing newline; got: {payload:?}",
     );
 }
 
@@ -264,12 +264,18 @@ fn fuzzel_prompt_arg_is_switch_prompt() {
         args.contains("--prompt"),
         "--prompt flag must be present in fuzzel args: {args:?}",
     );
-    // The one-shot listener sends Work (active, seq=2) + Personal (seq=1).
-    // The switch picker builds a context-aware prompt including the active
-    // activity's name.
+    // The current activity is surfaced as a marked row, not in the prompt
+    // (fuzzel's prompt and input share one fixed-width line), so the prompt
+    // stays short.
     assert!(
-        args.contains("Switch to activity (current: Work):"),
-        "prompt value must be 'Switch to activity (current: Work):' in fuzzel args: {args:?}",
+        args.contains("Switch to activity:"),
+        "prompt value must be 'Switch to activity:' in fuzzel args: {args:?}",
+    );
+    // Dynamic width: pick_one passes --width so context-bearing rows are
+    // never truncated by fuzzel's 30-character default.
+    assert!(
+        args.contains("--width"),
+        "--width flag must be present in fuzzel args: {args:?}",
     );
 }
 

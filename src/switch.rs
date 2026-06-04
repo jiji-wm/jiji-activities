@@ -69,11 +69,17 @@ pub(crate) fn run(client: &mut dyn NiriClient, name: &str) -> Result<()> {
 ///   only the active activity exists; nothing to switch to`) and the
 ///   picker is not spawned.
 /// - Otherwise builds a [`crate::ipc_helpers::SwitchMenu`] via
-///   [`names_for_switch`] (using `order`) and calls `pick` with a
-///   context-aware prompt `"Switch to activity (current: <name>):"` when
-///   the active activity is known, or `"Switch to activity:"` when it
-///   is not. On `Selected(name)` delegates to [`run`] (second IPC call:
-///   `Request::Action(SwitchActivity)`).
+///   [`names_for_switch`] (using `order`) and calls `pick` with the
+///   prompt `"Switch to activity:"`. When the active activity is known
+///   it is appended as the **last** row, marked `"<name> (current)"` —
+///   it gets its own line instead of stretching the prompt (fuzzel has
+///   no second prompt line), while the first row (the previous
+///   activity under MRU order) stays preselected. Selecting the marked
+///   row dispatches a switch to the already-active activity, which the
+///   compositor handles as a no-op (`Handled`).
+/// - On `Selected(name)` delegates to [`run`] (second IPC call:
+///   `Request::Action(SwitchActivity)`). A selection equal to the
+///   marked current label maps back to the bare activity name first.
 /// - On `Cancelled`, returns `Ok(())` — user dismissal is exit 0.
 ///
 /// The `pick` parameter is a closure so unit tests can inject a stub
@@ -99,13 +105,29 @@ where
         eprintln!("jiji-activities: only the active activity exists; nothing to switch to");
         return Ok(());
     }
-    let prompt = match &menu.current {
-        Some(name) => format!("Switch to activity (current: {name}):"),
-        None => "Switch to activity:".to_owned(),
-    };
-    match pick(&prompt, &menu.rows)? {
+    // The current activity rides along as a marked last row rather than in
+    // the prompt: fuzzel's prompt and input share one fixed-width line, so
+    // long names would squeeze the typing area, while a row scales for
+    // free. Last keeps the previous activity (row 0 under MRU) preselected.
+    let mut rows = menu.rows;
+    let current_label = menu.current.as_ref().map(|n| format!("{n} (current)"));
+    if let Some(label) = &current_label {
+        rows.push(label.clone());
+    }
+    match pick("Switch to activity:", &rows)? {
         PickerOutcome::Cancelled => Ok(()),
-        PickerOutcome::Selected(name) => run(client, &name),
+        PickerOutcome::Selected(selection) => {
+            // Map the marked label back to the bare name. Exact-equality:
+            // a hypothetical activity literally named "<current> (current)"
+            // would collide, but the menu cannot render the two rows
+            // distinctly anyway, and the collision resolves to a no-op
+            // switch rather than a wrong switch.
+            let name = match (&current_label, &menu.current) {
+                (Some(label), Some(current)) if *label == selection => current.clone(),
+                _ => selection,
+            };
+            run(client, &name)
+        }
     }
 }
 
@@ -311,9 +333,10 @@ mod tests {
     }
 
     #[test]
-    fn run_picker_mru_excludes_active_and_uses_context_prompt() {
-        // MRU order: Work is active (seq=2), Personal (seq=1) appears in rows.
-        // Active activity is excluded from rows; prompt includes current name.
+    fn run_picker_mru_marks_active_as_last_row_with_short_prompt() {
+        // MRU order: Work is active (seq=2), Personal (seq=1) leads the rows.
+        // The active activity rides along as a marked LAST row (its own line,
+        // not in the prompt), keeping the previous activity preselected.
         let mut client = MockClient::new();
         client.expect(
             Request::Activities,
@@ -325,10 +348,10 @@ mod tests {
         client.expect(switch_req("Personal"), Reply::Ok(Response::Handled));
 
         let pick = |prompt: &str, items: &[String]| -> Result<PickerOutcome, CliError> {
-            // Context-aware prompt names the active activity.
-            assert_eq!(prompt, "Switch to activity (current: Work):");
-            // Active "Work" is excluded; only "Personal" remains.
-            assert_eq!(items, &["Personal".to_owned()]);
+            // The prompt stays short; the current activity is a row instead.
+            assert_eq!(prompt, "Switch to activity:");
+            // Previous activity first (preselected); marked current last.
+            assert_eq!(items, &["Personal".to_owned(), "Work (current)".to_owned()]);
             Ok(PickerOutcome::Selected("Personal".to_owned()))
         };
 
@@ -337,8 +360,32 @@ mod tests {
     }
 
     #[test]
-    fn run_picker_static_order_excludes_active_and_preserves_declaration_order() {
-        // Static order: declaration order preserved; active excluded from rows.
+    fn run_picker_marked_current_row_selection_dispatches_bare_name() {
+        // Selecting the marked "<name> (current)" row must dispatch the bare
+        // activity name on the wire (a no-op switch the compositor Handles),
+        // not the decorated label.
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![
+                act_seq(1, "Work", true, 2),
+                act_seq(2, "Personal", false, 1),
+            ])),
+        );
+        client.expect(switch_req("Work"), Reply::Ok(Response::Handled));
+
+        let pick = |_prompt: &str, _items: &[String]| -> Result<PickerOutcome, CliError> {
+            Ok(PickerOutcome::Selected("Work (current)".to_owned()))
+        };
+
+        run_picker(&mut client, Order::Mru, pick).expect("marked-row selection succeeds");
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn run_picker_static_order_marks_active_last_preserves_declaration_order() {
+        // Static order: declaration order preserved for the non-active rows;
+        // the marked current row is appended last, same as MRU.
         let mut client = MockClient::new();
         client.expect(
             Request::Activities,
@@ -351,9 +398,16 @@ mod tests {
         client.expect(switch_req("Gaming"), Reply::Ok(Response::Handled));
 
         let pick = |prompt: &str, items: &[String]| -> Result<PickerOutcome, CliError> {
-            assert_eq!(prompt, "Switch to activity (current: Work):");
-            // Static: declaration order minus active → Personal, Gaming.
-            assert_eq!(items, &["Personal".to_owned(), "Gaming".to_owned()]);
+            assert_eq!(prompt, "Switch to activity:");
+            // Static: declaration order minus active, then the marked row.
+            assert_eq!(
+                items,
+                &[
+                    "Personal".to_owned(),
+                    "Gaming".to_owned(),
+                    "Work (current)".to_owned()
+                ]
+            );
             Ok(PickerOutcome::Selected("Gaming".to_owned()))
         };
 
