@@ -21,9 +21,10 @@
 use anyhow::{Context, Result};
 use niri_ipc::{Action, ActivityReferenceArg, Request};
 
+use crate::cli::Order;
 use crate::error::CliError;
 use crate::ipc::NiriClient;
-use crate::ipc_helpers::{names_focused_first, send_expect_activities, send_expect_handled};
+use crate::ipc_helpers::{names_for_switch, send_expect_activities, send_expect_handled};
 use crate::picker::PickerOutcome;
 
 /// Switches to the activity named `name` over IPC.
@@ -63,16 +64,22 @@ pub(crate) fn run(client: &mut dyn NiriClient, name: &str) -> Result<()> {
 ///   switch to`) and returns `Ok(())` — exit 0. The picker is never
 ///   spawned because an empty menu is worse UX than a no-op; the
 ///   stderr line tells the user *why* nothing happened.
-/// - Otherwise reorders names with [`names_focused_first`] so the
-///   currently-focused activity is the default highlight, calls `pick`,
-///   and on `Selected(name)` delegates to [`run`] (which issues a second
-///   IPC call: `Request::Action(SwitchActivity)`).
+/// - If the activity list has exactly one entry (the active one), no
+///   rows remain to switch to. A distinct diagnostic fires (`jiji-activities:
+///   only the active activity exists; nothing to switch to`) and the
+///   picker is not spawned.
+/// - Otherwise builds a [`crate::ipc_helpers::SwitchMenu`] via
+///   [`names_for_switch`] (using `order`) and calls `pick` with a
+///   context-aware prompt `"Switch to activity (current: <name>):"` when
+///   the active activity is known, or `"Switch to activity:"` when it
+///   is not. On `Selected(name)` delegates to [`run`] (second IPC call:
+///   `Request::Action(SwitchActivity)`).
 /// - On `Cancelled`, returns `Ok(())` — user dismissal is exit 0.
 ///
 /// The `pick` parameter is a closure so unit tests can inject a stub
 /// without spawning `fuzzel`; production wiring passes
 /// [`picker::pick_one`].
-pub(crate) fn run_picker<F>(client: &mut dyn NiriClient, pick: F) -> Result<()>
+pub(crate) fn run_picker<F>(client: &mut dyn NiriClient, order: Order, pick: F) -> Result<()>
 where
     F: FnOnce(&str, &[String]) -> Result<PickerOutcome, CliError>,
 {
@@ -84,8 +91,19 @@ where
         eprintln!("jiji-activities: no activities configured; nothing to switch to");
         return Ok(());
     }
-    let names = names_focused_first(&activities);
-    match pick("Switch to activity:", &names)? {
+    let menu = names_for_switch(&activities, order);
+    if menu.rows.is_empty() {
+        // Only one activity (the active one) — no other activity to switch
+        // to. Emit a truthful diagnostic (there IS one activity, it is just
+        // the currently-active one) and do not spawn the picker.
+        eprintln!("jiji-activities: only the active activity exists; nothing to switch to");
+        return Ok(());
+    }
+    let prompt = match &menu.current {
+        Some(name) => format!("Switch to activity (current: {name}):"),
+        None => "Switch to activity:".to_owned(),
+    };
+    match pick(&prompt, &menu.rows)? {
         PickerOutcome::Cancelled => Ok(()),
         PickerOutcome::Selected(name) => run(client, &name),
     }
@@ -96,6 +114,7 @@ mod tests {
     use niri_ipc::{Action, Activity, ActivityReferenceArg, Reply, Request, Response};
 
     use super::*;
+    use crate::cli::Order;
     use crate::error::{CliError, MalformedResponseSource};
     use crate::ipc::MockClient;
 
@@ -280,38 +299,65 @@ mod tests {
 
     // ---- run_picker -----------------------------------------------------
 
-    fn act(id: u64, name: &str, is_active: bool) -> Activity {
+    fn act_seq(id: u64, name: &str, is_active: bool, seq: u64) -> Activity {
         Activity {
             id,
             name: name.into(),
             is_active,
             is_config_declared: true,
+            last_active_seq: seq,
             ..Default::default()
         }
     }
 
     #[test]
-    fn run_picker_selects_and_dispatches_switch() {
-        // Two IPC calls: Activities (for the menu), then SwitchActivity
-        // (after picker returns Selected). MockClient pins the order.
+    fn run_picker_mru_excludes_active_and_uses_context_prompt() {
+        // MRU order: Work is active (seq=2), Personal (seq=1) appears in rows.
+        // Active activity is excluded from rows; prompt includes current name.
         let mut client = MockClient::new();
         client.expect(
             Request::Activities,
             Reply::Ok(Response::Activities(vec![
-                act(1, "Work", true),
-                act(2, "Personal", false),
+                act_seq(1, "Work", true, 2),
+                act_seq(2, "Personal", false, 1),
             ])),
         );
         client.expect(switch_req("Personal"), Reply::Ok(Response::Handled));
 
         let pick = |prompt: &str, items: &[String]| -> Result<PickerOutcome, CliError> {
-            assert_eq!(prompt, "Switch to activity:");
-            // Focused-first reordering: Work (focused) precedes Personal.
-            assert_eq!(items, &["Work".to_owned(), "Personal".to_owned()]);
+            // Context-aware prompt names the active activity.
+            assert_eq!(prompt, "Switch to activity (current: Work):");
+            // Active "Work" is excluded; only "Personal" remains.
+            assert_eq!(items, &["Personal".to_owned()]);
             Ok(PickerOutcome::Selected("Personal".to_owned()))
         };
 
-        run_picker(&mut client, pick).expect("happy path succeeds");
+        run_picker(&mut client, Order::Mru, pick).expect("happy path succeeds");
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn run_picker_static_order_excludes_active_and_preserves_declaration_order() {
+        // Static order: declaration order preserved; active excluded from rows.
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![
+                act_seq(1, "Work", true, 2),
+                act_seq(2, "Personal", false, 1),
+                act_seq(3, "Gaming", false, 0),
+            ])),
+        );
+        client.expect(switch_req("Gaming"), Reply::Ok(Response::Handled));
+
+        let pick = |prompt: &str, items: &[String]| -> Result<PickerOutcome, CliError> {
+            assert_eq!(prompt, "Switch to activity (current: Work):");
+            // Static: declaration order minus active → Personal, Gaming.
+            assert_eq!(items, &["Personal".to_owned(), "Gaming".to_owned()]);
+            Ok(PickerOutcome::Selected("Gaming".to_owned()))
+        };
+
+        run_picker(&mut client, Order::Static, pick).expect("static order happy path succeeds");
         client.assert_consumed_in_order();
     }
 
@@ -329,7 +375,30 @@ mod tests {
             panic!("pick must not be called when activity list is empty");
         };
 
-        run_picker(&mut client, pick).expect("empty list exits Ok");
+        run_picker(&mut client, Order::Mru, pick).expect("empty list exits Ok");
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn run_picker_single_activity_warns_and_exits_zero() {
+        // Single activity (the active one): after excluding it, rows is empty.
+        // The picker must NOT be spawned; a truthful diagnostic fires naming
+        // the single-activity (not the "no activities configured") case.
+        //
+        // This test pins the no-spawn + Ok(()) contract. The end-to-end
+        // stderr assertion is pinned by the integration test in
+        // `tests/picker_shim.rs` (`run_picker_single_activity_warns_and_exits_zero`).
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![act_seq(1, "Work", true, 1)])),
+        );
+
+        let pick = |_prompt: &str, _items: &[String]| -> Result<PickerOutcome, CliError> {
+            panic!("pick must not be called when only the active activity exists");
+        };
+
+        run_picker(&mut client, Order::Mru, pick).expect("single-activity exits Ok");
         client.assert_consumed_in_order();
     }
 
@@ -341,14 +410,46 @@ mod tests {
         let mut client = MockClient::new();
         client.expect(
             Request::Activities,
-            Reply::Ok(Response::Activities(vec![act(1, "Work", true)])),
+            Reply::Ok(Response::Activities(vec![
+                act_seq(1, "Work", true, 2),
+                act_seq(2, "Personal", false, 1),
+            ])),
         );
 
         let pick = |_prompt: &str, _items: &[String]| -> Result<PickerOutcome, CliError> {
             Ok(PickerOutcome::Cancelled)
         };
 
-        run_picker(&mut client, pick).expect("cancellation is silent Ok");
+        run_picker(&mut client, Order::Mru, pick).expect("cancellation is silent Ok");
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn run_picker_no_active_activity_uses_bare_prompt_and_presents_all_rows() {
+        // Degenerate compositor state: all activities are inactive (no
+        // `is_active=true`). `names_for_switch` returns `current=None`, so
+        // `run_picker` must use the bare prompt "Switch to activity:" and
+        // must present all activity names in rows (nothing to exclude).
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![
+                act_seq(1, "Work", false, 2),
+                act_seq(2, "Personal", false, 1),
+            ])),
+        );
+        // Picker will cancel; no switch dispatch needed.
+
+        let pick = |prompt: &str, items: &[String]| -> Result<PickerOutcome, CliError> {
+            // No active activity → bare prompt, no "(current: …)" suffix.
+            assert_eq!(prompt, "Switch to activity:");
+            // Both activities appear in rows (none excluded).
+            assert_eq!(items, &["Work".to_owned(), "Personal".to_owned()]);
+            Ok(PickerOutcome::Cancelled)
+        };
+
+        run_picker(&mut client, Order::Mru, pick)
+            .expect("no-active-activity degenerate state exits Ok on cancellation");
         client.assert_consumed_in_order();
     }
 
@@ -367,7 +468,7 @@ mod tests {
             panic!("pick must not be called on a malformed Activities response");
         };
 
-        let err = run_picker(&mut client, pick).expect_err("wrong variant must fail");
+        let err = run_picker(&mut client, Order::Mru, pick).expect_err("wrong variant must fail");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())

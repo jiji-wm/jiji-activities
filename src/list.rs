@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use niri_ipc::{Activity, Request, Response, Window, Workspace};
 use serde::Serialize;
 
+use crate::cli::Order;
 use crate::error::{CliError, MalformedResponseSource};
 use crate::ipc::NiriClient;
 use crate::ipc_helpers::{send_expect_activities, send_expect_workspaces, variant_name};
@@ -36,6 +37,11 @@ pub(crate) struct ListOpts<'a> {
     /// `Activities` IPC response with [`CliError::ActivityNotFound`]
     /// (exit 66); no further IPC calls are issued.
     pub(crate) activity: Option<&'a str>,
+    /// `--order`. Controls the order of activities in the output.
+    /// [`Order::Static`] preserves the compositor-supplied declaration
+    /// order; [`Order::Mru`] sorts by `last_active_seq` descending
+    /// (stable, so `seq==0` ties retain declaration order).
+    pub(crate) order: Order,
 }
 
 /// Runs the `list` subcommand against `client`, writing output to `out`.
@@ -61,7 +67,7 @@ pub(crate) fn run(
         None => None,
     };
 
-    let activities = send_expect_activities(client).context("requesting activities")?;
+    let mut activities = send_expect_activities(client).context("requesting activities")?;
 
     // Validate --activity before issuing any further IPC. An unknown name
     // is a usage error (exit 66); failing fast here means the Workspaces
@@ -71,6 +77,13 @@ pub(crate) fn run(
         && !activities.iter().any(|a| a.name == name)
     {
         return Err(CliError::ActivityNotFound(name.to_string()).into());
+    }
+
+    // Apply MRU ordering before joining so all three render paths see
+    // the same activity order. Stable sort: equal seq values (including
+    // seq==0) retain their compositor-supplied declaration order.
+    if opts.order == Order::Mru {
+        activities.sort_by_key(|b| std::cmp::Reverse(b.last_active_seq));
     }
 
     let workspaces = send_expect_workspaces(client).context("requesting workspaces")?;
@@ -434,6 +447,7 @@ mod tests {
     use niri_ipc::{Activity, Reply, Request, Response, Window, Workspace};
 
     use super::*;
+    use crate::cli::Order;
     use crate::ipc::MockClient;
 
     // ---- Sample fixture builders ----
@@ -883,6 +897,7 @@ mod tests {
                 json: false,
                 format: None,
                 activity: None,
+                order: Order::Static,
             },
             &mut buf,
         )
@@ -937,6 +952,7 @@ mod tests {
                 json: false,
                 format: None,
                 activity: None,
+                order: Order::Static,
             },
             &mut buf,
         )
@@ -986,6 +1002,7 @@ mod tests {
                 json: false,
                 format: None,
                 activity: None,
+                order: Order::Static,
             },
             &mut buf,
         )
@@ -1036,6 +1053,7 @@ mod tests {
                 json: false,
                 format: None,
                 activity: None,
+                order: Order::Static,
             },
             &mut buf,
         )
@@ -1079,6 +1097,7 @@ mod tests {
                 json: true,
                 format: None,
                 activity: None,
+                order: Order::Static,
             },
             &mut buf,
         )
@@ -1108,6 +1127,7 @@ mod tests {
                 json: false,
                 format: Some("name"),
                 activity: None,
+                order: Order::Static,
             },
             &mut buf,
         )
@@ -1164,6 +1184,7 @@ mod tests {
                 json: false,
                 format: None,
                 activity: Some("Work"),
+                order: Order::Static,
             },
             &mut buf,
         )
@@ -1189,6 +1210,7 @@ mod tests {
                 json: true,
                 format: None,
                 activity: Some("Work"),
+                order: Order::Static,
             },
             &mut buf,
         )
@@ -1218,6 +1240,7 @@ mod tests {
                 json: false,
                 format: Some("name"),
                 activity: Some("Work"),
+                order: Order::Static,
             },
             &mut buf,
         )
@@ -1245,6 +1268,7 @@ mod tests {
                 json: false,
                 format: None,
                 activity: Some("Bogus"),
+                order: Order::Static,
             },
             &mut buf,
         )
@@ -1271,6 +1295,93 @@ mod tests {
             client.remaining_count(),
             0,
             "no Workspaces/Windows call should be issued for an unknown activity",
+        );
+    }
+
+    // ---- --order flag ----
+
+    fn act_seq(id: u64, name: &str, is_active: bool, seq: u64) -> Activity {
+        Activity {
+            id,
+            name: name.into(),
+            is_config_declared: true,
+            is_active,
+            last_active_seq: seq,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn list_mru_orders_by_recency() {
+        // MRU: Gaming (seq=3) before Personal (seq=1) before Work (seq=0).
+        // Work appears last because it was never activated (seq=0).
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![
+                act_seq(1, "Work", false, 0),
+                act_seq(2, "Personal", true, 1),
+                act_seq(3, "Gaming", false, 3),
+            ])),
+        );
+        client.expect(Request::Workspaces, Reply::Ok(Response::Workspaces(vec![])));
+        client.expect(Request::Windows, Reply::Ok(Response::Windows(vec![])));
+        let mut buf = Vec::new();
+        run(
+            &mut client,
+            ListOpts {
+                json: false,
+                format: Some("name"),
+                activity: None,
+                order: Order::Mru,
+            },
+            &mut buf,
+        )
+        .expect("list --order=mru must succeed");
+        client.assert_consumed_in_order();
+        let out = String::from_utf8(buf).expect("utf-8 stdout");
+        let names: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            names,
+            vec!["Gaming", "Personal", "Work"],
+            "MRU order must be Gaming (seq=3), Personal (seq=1), Work (seq=0); got: {names:?}",
+        );
+    }
+
+    #[test]
+    fn list_static_is_declaration_order() {
+        // Static: declaration order (Work, Personal, Gaming) preserved
+        // regardless of last_active_seq values.
+        let mut client = MockClient::new();
+        client.expect(
+            Request::Activities,
+            Reply::Ok(Response::Activities(vec![
+                act_seq(1, "Work", false, 0),
+                act_seq(2, "Personal", true, 1),
+                act_seq(3, "Gaming", false, 3),
+            ])),
+        );
+        client.expect(Request::Workspaces, Reply::Ok(Response::Workspaces(vec![])));
+        client.expect(Request::Windows, Reply::Ok(Response::Windows(vec![])));
+        let mut buf = Vec::new();
+        run(
+            &mut client,
+            ListOpts {
+                json: false,
+                format: Some("name"),
+                activity: None,
+                order: Order::Static,
+            },
+            &mut buf,
+        )
+        .expect("list --order=static must succeed");
+        client.assert_consumed_in_order();
+        let out = String::from_utf8(buf).expect("utf-8 stdout");
+        let names: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            names,
+            vec!["Work", "Personal", "Gaming"],
+            "Static order must match declaration order; got: {names:?}",
         );
     }
 }

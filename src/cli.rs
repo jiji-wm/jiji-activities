@@ -7,7 +7,7 @@
 //! and CLI surface are pinned by `tests/cli.rs`.
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::assign_workspace;
 use crate::completions;
@@ -22,6 +22,22 @@ use crate::rename;
 use crate::save;
 use crate::switch;
 use crate::switch_previous;
+
+/// Ordering policy for activity lists presented to the user.
+///
+/// Applies to the `switch` picker and the `list` output. The compositor
+/// always returns activities in declaration order; the CLI can reorder
+/// client-side using the `last_active_seq` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum Order {
+    /// Declaration order as supplied by the compositor. Current behavior
+    /// for `list`; opted-in via `--order=static`.
+    Static,
+    /// Sort by most-recently-used first, using `last_active_seq`
+    /// descending. Activities with `seq == 0` (never activated) fall to
+    /// the end in declaration order. Default for `switch`.
+    Mru,
+}
 
 /// Top-level CLI entry. `--version` and `--help` are handled by clap
 /// directly; everything else routes through [`Cmd`] and `dispatch`.
@@ -40,11 +56,22 @@ pub(crate) struct Cli {
 #[derive(Debug, Subcommand)]
 pub(crate) enum Cmd {
     /// Switch to an activity by name. Without `name`, opens a picker.
-    Switch { name: Option<String> },
+    Switch {
+        name: Option<String>,
+        /// Ordering for the picker rows. Default: recency (most-recently
+        /// used first, using compositor-tracked activation sequence).
+        #[arg(long, value_enum, default_value_t = Order::Mru)]
+        order: Order,
+    },
 
     /// Switch to the previously-active activity (toggle behaviour).
     #[command(alias = "toggle")]
-    SwitchPrevious,
+    SwitchPrevious {
+        /// How many steps back in activity history to go. 1 means the
+        /// immediately-previous activity; 2 means one further back, etc.
+        #[arg(long, default_value_t = 1)]
+        depth: u32,
+    },
 
     /// Move the focused window to a workspace in an activity (picker if no name).
     MoveWindow {
@@ -143,6 +170,10 @@ pub(crate) enum Cmd {
         /// Narrow output to a single named activity. Unknown name → exit 66.
         #[arg(long)]
         activity: Option<String>,
+        /// Ordering for the output rows. Default: declaration order as
+        /// supplied by the compositor.
+        #[arg(long, value_enum, default_value_t = Order::Static)]
+        order: Order,
     },
 
     /// Emit a shell completion script for the given shell to stdout.
@@ -224,8 +255,8 @@ fn resolve_follow_overview(follow: bool, overview: bool) -> FollowMode {
 /// [`Into<anyhow::Error>`], which `main()` recovers by downcasting.
 pub(crate) fn dispatch(cli: Cli) -> Result<()> {
     match cli.cmd {
-        Cmd::Switch { name } => cmd_switch(name),
-        Cmd::SwitchPrevious => cmd_switch_previous(),
+        Cmd::Switch { name, order } => cmd_switch(name, order),
+        Cmd::SwitchPrevious { depth } => cmd_switch_previous(depth),
         Cmd::MoveWindow {
             name,
             follow,
@@ -268,12 +299,13 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             json,
             format,
             activity,
-        } => cmd_list(json, format, activity),
+            order,
+        } => cmd_list(json, format, activity, order),
         Cmd::Completions { shell } => cmd_completions(shell),
     }
 }
 
-fn cmd_switch(name: Option<String>) -> Result<()> {
+fn cmd_switch(name: Option<String>, order: Order) -> Result<()> {
     match name {
         Some(n) => {
             let mut client = ipc::make_client();
@@ -290,14 +322,15 @@ fn cmd_switch(name: Option<String>) -> Result<()> {
             // for diagnostics.
             picker::ensure_available().context("verifying switch picker availability")?;
             let mut client = ipc::make_client();
-            switch::run_picker(client.as_mut(), picker::pick_one).context("running switch picker")
+            switch::run_picker(client.as_mut(), order, picker::pick_one)
+                .context("running switch picker")
         }
     }
 }
 
-fn cmd_switch_previous() -> Result<()> {
+fn cmd_switch_previous(depth: u32) -> Result<()> {
     let mut client = ipc::make_client();
-    switch_previous::run(client.as_mut())
+    switch_previous::run(client.as_mut(), depth)
 }
 
 fn cmd_move_window(
@@ -452,7 +485,12 @@ fn cmd_save(name: String) -> Result<()> {
     save::run(client.as_mut(), &name, &save::RealConfigPaths).context("saving activity to config")
 }
 
-fn cmd_list(json: bool, format: Option<String>, activity: Option<String>) -> Result<()> {
+fn cmd_list(
+    json: bool,
+    format: Option<String>,
+    activity: Option<String>,
+    order: Order,
+) -> Result<()> {
     let mut client = ipc::make_client();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -462,6 +500,7 @@ fn cmd_list(json: bool, format: Option<String>, activity: Option<String>) -> Res
             json,
             format: format.as_deref(),
             activity: activity.as_deref(),
+            order,
         },
         &mut out,
     )

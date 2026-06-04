@@ -599,3 +599,128 @@ fn move_and_assign_verbs_expose_follow_and_overview_flags() {
         );
     }
 }
+
+#[test]
+fn switch_previous_bare_emits_depth_one_on_wire() {
+    // Pins that bare `switch-previous` (no flag) emits
+    // `Action::SwitchActivityPrevious { depth: 1 }` on the wire — the
+    // default depth (toggle-to-previous semantics).
+    let capture = std::env::temp_dir().join(format!(
+        "jiji-activities-cli-swprev-bare-req-{}.json",
+        std::process::id(),
+    ));
+    let sock = spawn_one_shot_handled_listener("swprev-bare", capture.clone());
+
+    Command::cargo_bin(BIN)
+        .unwrap()
+        .arg("switch-previous")
+        .env("JIJI_SOCKET", &sock)
+        .assert()
+        .success();
+
+    let req_json = std::fs::read_to_string(&capture)
+        .expect("one-shot listener must have written the request capture file");
+    let _ = std::fs::remove_file(&capture);
+
+    assert!(
+        req_json.contains("SwitchActivityPrevious"),
+        "switch-previous must emit SwitchActivityPrevious; got: {req_json:?}",
+    );
+    assert!(
+        req_json.contains("\"depth\":1"),
+        "switch-previous (bare) must emit depth:1 on the wire; got: {req_json:?}",
+    );
+}
+
+#[test]
+fn switch_previous_depth_arg_forwards_depth_on_wire() {
+    // Pins that `switch-previous --depth 3` emits
+    // `Action::SwitchActivityPrevious { depth: 3 }` on the wire.
+    // A regression that hard-coded depth:1 would be caught by the JSON
+    // assertion here.
+    let capture = std::env::temp_dir().join(format!(
+        "jiji-activities-cli-swprev-depth-req-{}.json",
+        std::process::id(),
+    ));
+    let sock = spawn_one_shot_handled_listener("swprev-depth", capture.clone());
+
+    Command::cargo_bin(BIN)
+        .unwrap()
+        .args(["switch-previous", "--depth", "3"])
+        .env("JIJI_SOCKET", &sock)
+        .assert()
+        .success();
+
+    let req_json = std::fs::read_to_string(&capture)
+        .expect("one-shot listener must have written the request capture file");
+    let _ = std::fs::remove_file(&capture);
+
+    assert!(
+        req_json.contains("SwitchActivityPrevious"),
+        "switch-previous --depth 3 must emit SwitchActivityPrevious; got: {req_json:?}",
+    );
+    assert!(
+        req_json.contains("\"depth\":3"),
+        "switch-previous --depth 3 must emit depth:3 on the wire; got: {req_json:?}",
+    );
+}
+
+#[test]
+fn clap_defaults_for_order_and_depth() {
+    // Pins that `switch` defaults to `--order=mru`, `list` defaults to
+    // `--order=static`, and `switch-previous` defaults to `--depth=1`.
+    // Assertions target the `[default: <value>]` annotation that clap
+    // renders in help output — both possible values appear in `Possible
+    // values:` regardless of the default, so a test on bare `"mru"` /
+    // `"static"` would pass even if the two defaults were swapped. The
+    // `[default: …]` form is the minimal string that would change on a
+    // regression.
+
+    // switch --help must show `[default: mru]` for --order.
+    let assert = Command::cargo_bin(BIN)
+        .unwrap()
+        .args(["switch", "--help"])
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        out.contains("--order"),
+        "`switch --help` must list --order flag:\n{out}",
+    );
+    assert!(
+        out.contains("[default: mru]"),
+        "`switch --help` must show `[default: mru]` for --order (got a different default or none):\n{out}",
+    );
+
+    // list --help must show `[default: static]` for --order.
+    let assert = Command::cargo_bin(BIN)
+        .unwrap()
+        .args(["list", "--help"])
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        out.contains("--order"),
+        "`list --help` must list --order flag:\n{out}",
+    );
+    assert!(
+        out.contains("[default: static]"),
+        "`list --help` must show `[default: static]` for --order (got a different default or none):\n{out}",
+    );
+
+    // switch-previous --help must show `[default: 1]` for --depth.
+    let assert = Command::cargo_bin(BIN)
+        .unwrap()
+        .args(["switch-previous", "--help"])
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        out.contains("--depth"),
+        "`switch-previous --help` must list --depth flag:\n{out}",
+    );
+    assert!(
+        out.contains("[default: 1]"),
+        "`switch-previous --help` must show `[default: 1]` for --depth (got a different default or none):\n{out}",
+    );
+}

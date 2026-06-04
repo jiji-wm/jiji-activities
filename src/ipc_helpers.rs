@@ -21,9 +21,20 @@
 //! - [`send_expect_workspaces`] — wraps a `client.send(Request::Workspaces)`
 //!   call that expects `Response::Workspaces`; mismatched variants surface
 //!   as `WrongVariant`.
-//! - [`names_focused_first`] — pure helper that reorders an
-//!   [`Activity`] slice's names so the focused activity (if any) is
-//!   first; remaining names preserve their compositor-supplied order.
+//! - [`names_focused_first`] — pure helper used by the *target-selection*
+//!   pickers (`move-window`, `move-workspace`, `rename`) that reorders an
+//!   [`Activity`] slice's names so the focused activity (if any) is first;
+//!   remaining names preserve their compositor-supplied order.
+//!   (`assign-workspace` uses a rofi multi-select on the raw list and does
+//!   not call this helper.)
+//!   See [`names_for_switch`] for the switch-specific variant.
+//! - [`names_for_switch`] — pure helper used by the `switch` picker that
+//!   extracts a [`SwitchMenu`] from an [`Activity`] slice according to an
+//!   ordering policy ([`crate::cli::Order`]): MRU sorts by
+//!   `last_active_seq` descending; Static preserves compositor-supplied
+//!   order. The active activity is always separated into
+//!   [`SwitchMenu::current`] rather than appearing in
+//!   [`SwitchMenu::rows`], making the picker context-aware.
 //! - [`focused_workspace`] — returns the workspace with `is_focused: true`
 //!   from a `Workspaces` snapshot, or a synthetic
 //!   `MalformedResponse(Server("no focused workspace"))` error when none
@@ -43,8 +54,62 @@
 
 use niri_ipc::{Activity, NoOpReason, Request, Response, Workspace};
 
+use crate::cli::Order;
 use crate::error::{CliError, MalformedResponseSource};
 use crate::ipc::{IpcError, NiriClient};
+
+/// Projected output of [`names_for_switch`].
+///
+/// `current` holds the name of the currently-active activity (if any)
+/// so callers can build a context-aware picker prompt. `rows` holds the
+/// remaining activity names in the requested order — these are the items
+/// presented to the user. The active activity is excluded from `rows`
+/// because switching to it is a no-op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SwitchMenu {
+    /// Name of the active activity, or `None` when no activity is marked
+    /// active (degenerate compositor state).
+    pub(crate) current: Option<String>,
+    /// Picker rows: activity names minus the active one. Empty when only
+    /// one activity exists or none are configured.
+    pub(crate) rows: Vec<String>,
+}
+
+/// Builds a [`SwitchMenu`] from an activity list using the given ordering
+/// policy.
+///
+/// - [`Order::Mru`] stable-sorts activities by `last_active_seq`
+///   **descending** before projecting names. Activities with `seq == 0`
+///   retain their compositor-supplied declaration order relative to each
+///   other (stable sort). The active activity naturally holds the unique
+///   max seq, so it is excluded from `rows` by the `is_active` predicate
+///   rather than by position — this keeps the helper correct even if the
+///   compositor invariant ever drifts.
+/// - [`Order::Static`] preserves the compositor-supplied order unchanged.
+///
+/// In both modes the first `is_active` activity wins and is placed in
+/// `current`; subsequent `is_active` entries (anomalous compositor state)
+/// appear in `rows` at their sorted position.
+///
+/// Pure helper; no IPC.
+pub(crate) fn names_for_switch(activities: &[Activity], order: Order) -> SwitchMenu {
+    // Build a working copy sorted by order policy.
+    let mut sorted: Vec<&Activity> = activities.iter().collect();
+    if order == Order::Mru {
+        // Stable sort: equal seq values keep declaration order.
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.last_active_seq));
+    }
+    let mut current: Option<String> = None;
+    let mut rows: Vec<String> = Vec::with_capacity(sorted.len().saturating_sub(1));
+    for a in sorted {
+        if a.is_active && current.is_none() {
+            current = Some(a.name.clone());
+        } else {
+            rows.push(a.name.clone());
+        }
+    }
+    SwitchMenu { current, rows }
+}
 
 /// Outcome of a dispatch that may legitimately resolve to a no-op.
 ///
@@ -323,6 +388,7 @@ mod tests {
     use niri_ipc::{Activity, NoOpReason, Reply, Request, Response};
 
     use super::*;
+    use crate::cli::Order;
     use crate::error::{CliError, MalformedResponseSource};
     use crate::ipc::MockClient;
 
@@ -332,6 +398,17 @@ mod tests {
             name: name.into(),
             is_active,
             is_config_declared: true,
+            ..Default::default()
+        }
+    }
+
+    fn act_seq(id: u64, name: &str, is_active: bool, seq: u64) -> Activity {
+        Activity {
+            id,
+            name: name.into(),
+            is_active,
+            is_config_declared: true,
+            last_active_seq: seq,
             ..Default::default()
         }
     }
@@ -671,5 +748,125 @@ mod tests {
         ];
         let names = names_focused_first(&acts);
         assert_eq!(names, vec!["Work", "Personal", "Gaming"]);
+    }
+
+    // ---- names_for_switch ----
+
+    #[test]
+    fn names_for_switch_mru_excludes_active_into_current_and_orders_by_seq() {
+        // MRU: active Work (seq=2) → current; Personal (seq=1) is first row.
+        let acts = vec![
+            act_seq(1, "Work", true, 2),
+            act_seq(2, "Personal", false, 1),
+            act_seq(3, "Gaming", false, 0),
+        ];
+        let menu = names_for_switch(&acts, Order::Mru);
+        assert_eq!(menu.current, Some("Work".to_owned()));
+        // seq: Personal(1) > Gaming(0) → rows = [Personal, Gaming].
+        assert_eq!(menu.rows, vec!["Personal", "Gaming"]);
+    }
+
+    #[test]
+    fn names_for_switch_static_excludes_active_into_current_and_preserves_order() {
+        // Static: declaration order; active excluded into current.
+        let acts = vec![
+            act_seq(1, "Work", true, 2),
+            act_seq(2, "Personal", false, 1),
+            act_seq(3, "Gaming", false, 0),
+        ];
+        let menu = names_for_switch(&acts, Order::Static);
+        assert_eq!(menu.current, Some("Work".to_owned()));
+        // Declaration order minus active → [Personal, Gaming].
+        assert_eq!(menu.rows, vec!["Personal", "Gaming"]);
+    }
+
+    #[test]
+    fn names_for_switch_mru_seq_zero_ties_keep_declaration_order() {
+        // Stable sort: when both non-active activities have seq=0,
+        // they must retain declaration order (Alpha before Beta).
+        let acts = vec![
+            act_seq(1, "Work", true, 1),
+            act_seq(2, "Alpha", false, 0),
+            act_seq(3, "Beta", false, 0),
+        ];
+        let menu = names_for_switch(&acts, Order::Mru);
+        assert_eq!(menu.current, Some("Work".to_owned()));
+        assert_eq!(
+            menu.rows,
+            vec!["Alpha", "Beta"],
+            "seq=0 ties must retain declaration order (stable sort)",
+        );
+    }
+
+    #[test]
+    fn names_for_switch_single_activity_yields_empty_rows() {
+        // Only one activity and it is active → rows empty, current = Some.
+        let acts = vec![act_seq(1, "Work", true, 1)];
+        let menu = names_for_switch(&acts, Order::Mru);
+        assert_eq!(menu.current, Some("Work".to_owned()));
+        assert!(menu.rows.is_empty(), "single active activity → no rows");
+    }
+
+    #[test]
+    fn names_for_switch_empty_activities_yields_none_current_and_empty_rows() {
+        let menu = names_for_switch(&[], Order::Mru);
+        assert_eq!(menu.current, None);
+        assert!(menu.rows.is_empty());
+    }
+
+    #[test]
+    fn names_for_switch_all_inactive_yields_none_current_and_all_in_rows() {
+        // Degenerate compositor state: no activity is marked active.
+        // current must be None; all names appear in rows in the order
+        // dictated by the policy (MRU here → sorted by seq desc).
+        let acts = vec![
+            act_seq(1, "Work", false, 2),
+            act_seq(2, "Personal", false, 1),
+            act_seq(3, "Gaming", false, 0),
+        ];
+        let menu = names_for_switch(&acts, Order::Mru);
+        assert_eq!(
+            menu.current, None,
+            "no active activity → current must be None"
+        );
+        // MRU: Work(seq=2) > Personal(seq=1) > Gaming(seq=0).
+        assert_eq!(menu.rows, vec!["Work", "Personal", "Gaming"]);
+    }
+
+    #[test]
+    fn names_for_switch_all_inactive_static_order_all_in_rows_declaration_order() {
+        // Same degenerate state but with Static order: declaration order
+        // preserved, all in rows (none active to pull into current).
+        let acts = vec![act_seq(1, "Alpha", false, 2), act_seq(2, "Beta", false, 1)];
+        let menu = names_for_switch(&acts, Order::Static);
+        assert_eq!(menu.current, None);
+        assert_eq!(menu.rows, vec!["Alpha", "Beta"]);
+    }
+
+    #[test]
+    fn names_for_switch_two_active_first_wins_into_current_second_in_rows() {
+        // Anomalous compositor state: two activities are both marked active.
+        // The first active entry (by sort order) wins into `current`;
+        // the second appears in `rows` at its sorted position.
+        // MRU: Work(seq=5, active) → current; Personal(seq=3, active) → rows;
+        // Gaming(seq=1, inactive) → rows after Personal.
+        let acts = vec![
+            act_seq(1, "Work", true, 5),
+            act_seq(2, "Personal", true, 3),
+            act_seq(3, "Gaming", false, 1),
+        ];
+        let menu = names_for_switch(&acts, Order::Mru);
+        assert_eq!(
+            menu.current,
+            Some("Work".to_owned()),
+            "first active (highest seq after MRU sort) wins into current",
+        );
+        // Personal(active, seq=3) appears in rows because current is already set;
+        // Gaming(inactive, seq=1) follows.
+        assert_eq!(
+            menu.rows,
+            vec!["Personal", "Gaming"],
+            "second active entry falls through into rows",
+        );
     }
 }

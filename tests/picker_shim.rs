@@ -218,13 +218,15 @@ fn fuzzel_stdin_payload_reaches_shim() {
         .assert()
         .code(0);
 
-    // The one-shot listener sends Work (focused) + Personal.
-    // `names_focused_first` hoists Work to position 0.
+    // The one-shot listener sends Work (active, seq=2) + Personal (seq=1).
+    // `names_for_switch` (MRU default) excludes the active "Work" into
+    // `current`; only "Personal" appears in `rows` (and therefore in
+    // the picker's stdin payload).
     let payload = fs::read_to_string(&capture)
         .expect("shim must have written stdin capture file (file missing)");
     assert_eq!(
-        payload, "Work\nPersonal\n",
-        "stdin payload must list activity names, focused first, one per line with trailing newline; got: {payload:?}",
+        payload, "Personal\n",
+        "stdin payload must list only the non-active activity names, one per line with trailing newline; got: {payload:?}",
     );
 }
 
@@ -262,9 +264,12 @@ fn fuzzel_prompt_arg_is_switch_prompt() {
         args.contains("--prompt"),
         "--prompt flag must be present in fuzzel args: {args:?}",
     );
+    // The one-shot listener sends Work (active, seq=2) + Personal (seq=1).
+    // The switch picker builds a context-aware prompt including the active
+    // activity's name.
     assert!(
-        args.contains("Switch to activity:"),
-        "prompt value must be 'Switch to activity:' in fuzzel args: {args:?}",
+        args.contains("Switch to activity (current: Work):"),
+        "prompt value must be 'Switch to activity (current: Work):' in fuzzel args: {args:?}",
     );
 }
 
@@ -328,6 +333,43 @@ fn run_picker_empty_activities_warns_and_exits_zero() {
         !sentinel.exists(),
         "fuzzel shim must NOT be invoked when the activity list is empty \
          (sentinel file {:?} was created — the empty-list short-circuit regressed)",
+        sentinel,
+    );
+}
+
+#[test]
+fn run_picker_single_activity_warns_and_exits_zero() {
+    // End-to-end pin of the single-activity UX: the one-shot listener
+    // replies with a single active activity; `run_picker` must
+    // short-circuit before spawning the picker (sentinel file asserts
+    // fuzzel is never invoked). Exit 0 + stderr naming the single-activity
+    // cause — distinct from the empty-list message.
+    let shim = ShimDir::new("single-activity");
+    let sentinel = shim.as_path().join("shim-invoked.sentinel");
+    // Sentinel + drain discipline: the shim creates `$SHIM_INVOKED` on
+    // entry and drains stdin with `cat >/dev/null` before exiting so the
+    // binary's stdin write cannot produce EPIPE even if the shim is
+    // unexpectedly reached.
+    shim.install_fuzzel(
+        ": > \"$SHIM_INVOKED\"\ncat >/dev/null\nprintf 'jiji-activities BUG: picker spawned for single-activity\\n' >&2\nexit 99\n",
+    );
+    let sock = spawn_one_shot_activities_listener_single("single-activity");
+
+    Command::cargo_bin(BIN)
+        .unwrap()
+        .arg("switch")
+        .env_clear()
+        .env("PATH", shim.as_path())
+        .env("JIJI_SOCKET", &sock)
+        .env("SHIM_INVOKED", &sentinel)
+        .assert()
+        .code(0)
+        .stderr(contains("only the active activity exists"));
+
+    assert!(
+        !sentinel.exists(),
+        "fuzzel shim must NOT be invoked when only one (active) activity exists \
+         (sentinel file {:?} was created — the single-activity short-circuit regressed)",
         sentinel,
     );
 }
@@ -864,6 +906,44 @@ fn rename_picker_prompt_arg_is_rename_prompt() {
         args.contains("Rename activity:"),
         "prompt value must be 'Rename activity:' in rename fuzzel args: {args:?}",
     );
+}
+
+/// Sibling of [`spawn_one_shot_activities_listener`] that replies with a
+/// single-activity `Activities` payload (one activity, marked active).
+/// Used by the single-activity short-circuit integration test.
+fn spawn_one_shot_activities_listener_single(tag: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "jiji-activities-shim-sock-single-{}-{}-{}.sock",
+        std::process::id(),
+        n,
+        tag,
+    ));
+    let _ = fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).expect("bind one-shot socket");
+    let path_clone = path.clone();
+    thread::spawn(move || {
+        if let Ok((mut sock, _)) = listener.accept() {
+            let read_clone = sock.try_clone().expect("clone socket");
+            let mut reader = BufReader::new(read_clone);
+            let mut req = String::new();
+            let _ = reader.read_line(&mut req);
+            // One activity: "Work" (active).
+            let reply = "{\"Ok\":{\"Activities\":[\
+                 {\"id\":1,\"name\":\"Work\",\"is_config_declared\":true,\"is_active\":true,\"is_urgent\":false,\"last_active_seq\":1}\
+                 ]}}\n";
+            let _ = sock.write_all(reply.as_bytes());
+        }
+        let _ = fs::remove_file(&path_clone);
+    });
+    for _ in 0..50 {
+        if path.exists() {
+            break;
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    path
 }
 
 /// Sibling of [`spawn_one_shot_activities_listener`] that replies with an

@@ -1,10 +1,22 @@
-//! `switch-previous` subcommand: switch to the previously-active
-//! activity (toggle behaviour).
+//! `switch-previous` subcommand: switch to a previously-active
+//! activity by depth in the recency list.
 //!
-//! Dispatches `Action::SwitchActivityPrevious { depth: 1 }` over IPC and
-//! expects `Response::Handled`. No name argument; no picker. The compositor
-//! maintains the activity recency list internally — the CLI is a one-shot
-//! trigger that switches to the previously-active activity (depth 1).
+//! Dispatches `Action::SwitchActivityPrevious { depth }` over IPC and
+//! expects `Response::Handled`. The `depth` value (default: 1) controls
+//! how many steps back in the compositor's activity recency list to step:
+//! `depth=1` is the immediately-previous activity (toggle behaviour),
+//! `depth=2` is one further back, and so on.
+//!
+//! Two edge cases are handled entirely compositor-side and never surface
+//! as errors here:
+//! - `depth=0` is a no-op — the compositor switches to the currently-active
+//!   activity (identity switch). `Response::Handled` is returned as usual.
+//! - Out-of-range depth (larger than the number of entries in the recency
+//!   list) is clamped compositor-side to the oldest-activated activity in
+//!   the list. The CLI forwards `depth` verbatim; clamping is transparent.
+//!
+//! No name argument; no picker. The compositor maintains the activity
+//! recency list internally.
 //!
 //! ## Error model
 //!
@@ -31,14 +43,21 @@ use niri_ipc::{Action, Request};
 use crate::ipc::NiriClient;
 use crate::ipc_helpers::send_expect_handled;
 
-/// Issues `Request::Action(Action::SwitchActivityPrevious { depth: 1 })`.
+/// Issues `Request::Action(Action::SwitchActivityPrevious { depth })`.
+///
+/// `depth` is forwarded verbatim to the compositor, which resolves it
+/// against its internal recency list. `depth=1` is the toggle behaviour
+/// (immediately-previous activity); higher values step further back.
+/// `depth=0` is a no-op (switches to the currently-active activity).
+/// Out-of-range depth is clamped compositor-side to the oldest-activated
+/// activity — never an error.
 ///
 /// **Contract:** exactly one IPC round-trip; `Response::Handled` ⇒
 /// `Ok(())`; everything else routes through
 /// [`send_expect_handled`] with `activity_name: None`. See module
 /// docs for the full error matrix.
-pub(crate) fn run(client: &mut dyn NiriClient) -> Result<()> {
-    let req = Request::Action(Action::SwitchActivityPrevious { depth: 1 });
+pub(crate) fn run(client: &mut dyn NiriClient, depth: u32) -> Result<()> {
+    let req = Request::Action(Action::SwitchActivityPrevious { depth });
     send_expect_handled(client, req, None).context("switching to previous activity")
 }
 
@@ -50,19 +69,34 @@ mod tests {
     use crate::error::{CliError, MalformedResponseSource};
     use crate::ipc::MockClient;
 
+    fn previous_req_depth(depth: u32) -> Request {
+        Request::Action(Action::SwitchActivityPrevious { depth })
+    }
+
     fn previous_req() -> Request {
-        Request::Action(Action::SwitchActivityPrevious { depth: 1 })
+        previous_req_depth(1)
     }
 
     #[test]
-    fn switch_previous_dispatches_action_with_no_args() {
+    fn switch_previous_default_depth_is_one() {
         // Pin the request shape: Action::SwitchActivityPrevious { depth: 1 }
         // for the toggle-to-previous semantics. MockClient's queue-equality
         // already enforces this, but a dedicated test pins the contract at
         // a glance.
         let mut client = MockClient::new();
         client.expect(previous_req(), Reply::Ok(Response::Handled));
-        run(&mut client).expect("happy path");
+        run(&mut client, 1).expect("happy path");
+        client.assert_consumed_in_order();
+    }
+
+    #[test]
+    fn switch_previous_depth_n_forwards_depth_on_wire() {
+        // Non-default depth: the helper must forward the caller's value
+        // to the compositor verbatim. A hard-coded depth:1 regression
+        // would be caught by MockClient's request equality check.
+        let mut client = MockClient::new();
+        client.expect(previous_req_depth(3), Reply::Ok(Response::Handled));
+        run(&mut client, 3).expect("depth=3 happy path");
         client.assert_consumed_in_order();
     }
 
@@ -70,7 +104,7 @@ mod tests {
     fn switch_previous_handled_is_ok() {
         let mut client = MockClient::new();
         client.expect(previous_req(), Reply::Ok(Response::Handled));
-        run(&mut client).expect("Response::Handled must succeed");
+        run(&mut client, 1).expect("Response::Handled must succeed");
         client.assert_consumed_in_order();
     }
 
@@ -78,7 +112,7 @@ mod tests {
     fn switch_previous_wrong_variant_is_malformed() {
         let mut client = MockClient::new();
         client.expect(previous_req(), Reply::Ok(Response::Version("v".into())));
-        let err = run(&mut client).expect_err("wrong variant must fail");
+        let err = run(&mut client, 1).expect_err("wrong variant must fail");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())
@@ -105,7 +139,7 @@ mod tests {
         // ActivityNotFound("") would be wrong. Pin the carrier.
         let mut client = MockClient::new();
         client.expect(previous_req(), Err("activity not found".to_owned()));
-        let err = run(&mut client).expect_err("not-found must surface");
+        let err = run(&mut client, 1).expect_err("not-found must surface");
         let cli_err = err
             .chain()
             .find_map(|e| e.downcast_ref::<CliError>())
@@ -129,7 +163,7 @@ mod tests {
         // leaf — proving .context() did not shadow the typed Display.
         let mut client = MockClient::new();
         client.expect(previous_req(), Err("some failure".to_owned()));
-        let err = run(&mut client).expect_err("must fail");
+        let err = run(&mut client, 1).expect_err("must fail");
         let formatted = format!("{err:#}");
         assert!(
             formatted.contains("switching to previous activity"),
