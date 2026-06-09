@@ -4,7 +4,7 @@ Operational guidance for Claude Code (claude.ai/code) when working in the jiji-a
 
 ## What this is
 
-`jiji-activities` is the user-facing CLI for KDE-style activities on the **jiji** Wayland compositor (hard-fork of niri; was `niri-activities` before the 2026-05-19 rename). It is the Phase 3 deliverable of the activities workstream — the design lives in `docs/design.md` and is jointly owned with the compositor-side DD at `~/projects/desktop/de/jiji/docs/activities/design.md`.
+`jiji-activities` is the user-facing CLI for KDE-style activities on the **jiji** Wayland compositor (hard-fork of niri; was `niri-activities` before the 2026-05-19 rename). The design lives in `docs/design.md` and is jointly owned with the compositor-side design doc in the jiji-wm workspace.
 
 The crate is a thin Rust binary (anyhow + clap-derive + `niri-ipc`) that wraps the jiji compositor's `Action::*Activity*` IPC variants. The `niri-ipc` crate name will rename to `jiji-ipc` in the compositor source-rename sub-phase. Pickers (fuzzel single-select, rofi multi-select) are external runtime deps.
 
@@ -67,7 +67,7 @@ Or bump `# hash:` in the chezmoi script and `chezmoi apply` to do the last two s
 
 ## Active design doc
 
-`docs/design.md` is the implementer-grade DD owning Phase 3 of the activities workstream. The most-recent sub-phase outcomes are recorded as `**Reviewed:**` annotations under each Phase header; Phase 3.9 (shell completions) closed at `d16a08d` / `6d0c6a9`. The workspace `CLAUDE.md` at `~/projects/desktop/de/jiji/CLAUDE.md` tracks which sub-phase is active across sessions.
+`docs/design.md` is the implementer-grade DD owning Phase 3 of the activities workstream. The most-recent sub-phase outcomes are recorded as `**Reviewed:**` annotations under each Phase header; Phase 3.9 (shell completions) closed at `d16a08d` / `6d0c6a9`. The workspace tracks which sub-phase is active across sessions.
 
 ## Git
 
@@ -76,6 +76,7 @@ Or bump `# hash:` in the chezmoi script and `chezmoi apply` to do the last two s
 - Pre-commit and commit-msg hooks enforce: no design-doc references in subject or body (no `Phase`, sub-phase / sub-step / `§X.X` / `Box N` / `Appendix X` / `DD` / `design.md` / `Reviewed: YYYY-MM-DD`). Commits that legitimately edit only `docs/design.md` are exempted.
 - Never push without explicit human request.
 
-## Loop integration
+## Workspace
 
-The jiji-activities loop lives in `~/projects/desktop/de/jiji/.claude/` (the niri workspace) — agents `cli-architect` / `cli-implementer` / `cli-fixer` / `cli-scribe`, slash commands `/cli:land-subphase` / `/cli:next-subphase` / `/cli:implement` / `/cli:apply-review` / `/cli:scribe-review`. Direct-implementation work (no loop) is fine for small scopes; the loop is for sub-phases that warrant the full architect → implementer → review → fixer → scribe round-trip.
+This repo is developed as part of the jiji-wm workspace, which carries the
+cross-repo process and design docs. The owning design doc is `docs/design.md`.
