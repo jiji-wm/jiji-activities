@@ -61,14 +61,17 @@ cargo build --release
 cargo install --path . --locked
 ```
 
-`cargo install jiji-activities` (with no `--path` or `--git`) does **not** work
-in this release: the crate is `publish = false` and depends on an unpublished
-`niri-ipc`. Once Phase D lands `gajdusek/jiji` on GitHub with the
-`feature/activities` branch pushed, `Cargo.toml` will switch to a pinned
-`niri-ipc = { git = "...", rev = "..." }` line (the crate is still called
-`niri-ipc` until the compositor source-rename sub-phase renames it to
-`jiji-ipc`) and `cargo install --git` will become the supported install path.
-This is a known v0.1.0 limitation, not a permanent shape.
+`cargo install jiji-activities` (with no `--path` or `--git`) does **not** work:
+the crate is `publish = false` and depends on the unpublished `jiji-ipc` crate
+from the [jiji compositor](https://github.com/jiji-wm/jiji), pinned by git
+revision. Install from git instead:
+
+```sh
+cargo install --git https://github.com/jiji-wm/jiji-activities --locked
+```
+
+(The IPC dependency is still spelled `niri-ipc` in `Cargo.toml`, bridged to the
+`jiji-ipc` package, until the source identifier is migrated to `jiji_ipc`.)
 
 ## Usage
 
@@ -283,8 +286,8 @@ cargo test --test smoke -- --ignored --test-threads=1
 - A running niri compositor with its IPC socket reachable via
   `$NIRI_SOCKET`. Tests with the precondition unmet log a `smoke: SKIP`
   breadcrumb to stderr and pass without action.
-- `niri` on `$PATH` (used as a side-effect verifier; **must be the gajdusek
-  fork build** — upstream `niri msg activities` exits non-zero and the entire
+- `niri` on `$PATH` (used as a side-effect verifier; **must be a jiji
+  compositor build** — upstream `niri msg activities` exits non-zero and the entire
   smoke run skips with a `niri msg activities failed (...)` breadcrumb).
 
 **Side-effect warning.** Smoke tests create runtime activities under a
@@ -324,4 +327,4 @@ Things to know for v0.1.0:
 
 ## License
 
-MIT — see `LICENSE`.
+GPL-3.0-or-later — see `LICENSE`. (jiji-activities links the `jiji-ipc` crate from the GPL-licensed jiji compositor.)
