@@ -553,6 +553,7 @@ mod tests {
     fn focus_workspace_req(ws_id: u64) -> Request {
         Request::Action(Action::FocusWorkspace {
             reference: WorkspaceReferenceArg::Id(ws_id),
+            activity: None,
         })
     }
 

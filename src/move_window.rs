@@ -4029,6 +4029,7 @@ mod tests {
         client.expect(
             Request::Action(Action::FocusWorkspace {
                 reference: WorkspaceReferenceArg::Id(20),
+                activity: None,
             }),
             Reply::Ok(Response::Handled),
         );
@@ -4078,6 +4079,7 @@ mod tests {
         client.expect(
             Request::Action(Action::FocusWorkspace {
                 reference: WorkspaceReferenceArg::Id(20),
+                activity: None,
             }),
             Reply::Ok(Response::Handled),
         );
@@ -4152,6 +4154,7 @@ mod tests {
         client.expect(
             Request::Action(Action::FocusWorkspace {
                 reference: WorkspaceReferenceArg::Id(20),
+                activity: None,
             }),
             Reply::Ok(Response::Handled),
         );
@@ -4210,6 +4213,7 @@ mod tests {
         client.expect(
             Request::Action(Action::FocusWorkspace {
                 reference: WorkspaceReferenceArg::Id(20),
+                activity: None,
             }),
             Reply::Ok(Response::Handled),
         );
@@ -4270,6 +4274,7 @@ mod tests {
         client.expect(
             Request::Action(Action::FocusWorkspace {
                 reference: WorkspaceReferenceArg::Id(20),
+                activity: None,
             }),
             Reply::Ok(Response::Handled),
         );

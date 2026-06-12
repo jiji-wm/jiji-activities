@@ -28,12 +28,19 @@
 //!
 //! ## Wire shape pins
 //!
-//! - `Action::FocusWorkspace { reference: WorkspaceReferenceArg::Id(_) }`
-//!   — always `Id(_)`, never `Index(_)` or `Name(_)`. Same focus-drift
-//!   rationale as `MoveWindowToWorkspace`: resolving by index or name
-//!   would risk targeting a different workspace if focus or workspace
-//!   ordering changed between the snapshot read and the compositor
-//!   processing the action.
+//! - `Action::FocusWorkspace { reference: WorkspaceReferenceArg::Id(_),
+//!   activity: None }` — `reference` is always `Id(_)`, never `Index(_)`
+//!   or `Name(_)`. Same focus-drift rationale as `MoveWindowToWorkspace`:
+//!   resolving by index or name would risk targeting a different
+//!   workspace if focus or workspace ordering changed between the
+//!   snapshot read and the compositor processing the action. `activity`
+//!   is always `None`: it only narrows index/name lookups to a single
+//!   activity, but an `Id(_)` reference is already globally unambiguous,
+//!   so activity scoping would be a no-op here. (In
+//!   [`dispatch_follow_activity_and_workspace`] the active activity is
+//!   changed by a preceding `SwitchActivity`, not by scoping this
+//!   lookup — switching the active activity and narrowing a lookup are
+//!   distinct operations.)
 //! - `Action::FocusWindow { id: u64 }` — single-field action.
 //! - `Action::SwitchActivity { activity: ActivityReferenceArg::Name(_) }`
 //!   — the activity-name carrier is what the picker returned, so a
@@ -141,6 +148,7 @@ pub(crate) fn dispatch_follow_workspace(
 ) -> Result<()> {
     let focus_req = Request::Action(Action::FocusWorkspace {
         reference: WorkspaceReferenceArg::Id(workspace_id),
+        activity: None,
     });
     send_expect_handled(client, focus_req, None).context("focusing target workspace")?;
 
@@ -186,6 +194,7 @@ pub(crate) fn dispatch_follow_workspace_and_window(
 ) -> Result<()> {
     let focus_ws_req = Request::Action(Action::FocusWorkspace {
         reference: WorkspaceReferenceArg::Id(workspace_id),
+        activity: None,
     });
     send_expect_handled(client, focus_ws_req, None).context("focusing target workspace")?;
 
@@ -246,6 +255,7 @@ pub(crate) fn dispatch_follow_activity_and_workspace(
 
     let focus_ws_req = Request::Action(Action::FocusWorkspace {
         reference: WorkspaceReferenceArg::Id(workspace_id),
+        activity: None,
     });
     send_expect_handled(client, focus_ws_req, None).context("focusing target workspace")?;
 
@@ -268,6 +278,7 @@ mod tests {
     fn focus_workspace_req(ws_id: u64) -> Request {
         Request::Action(Action::FocusWorkspace {
             reference: WorkspaceReferenceArg::Id(ws_id),
+            activity: None,
         })
     }
 
