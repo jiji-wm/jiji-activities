@@ -45,7 +45,7 @@ pub(crate) enum Order {
 #[command(
     name = "jiji-activities",
     version,
-    about = "KDE-style Activities for the niri Wayland compositor."
+    about = "KDE-style Activities for the jiji Wayland compositor."
 )]
 pub(crate) struct Cli {
     #[command(subcommand)]

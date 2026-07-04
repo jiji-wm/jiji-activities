@@ -1,6 +1,6 @@
 # jiji-activities
 
-A user-facing CLI for KDE-style **Activities** on the **jiji** Wayland compositor — a hard-fork of [niri](https://github.com/niri-wm/niri) that adds the activities feature. See [`~/projects/desktop/de/jiji/docs/jiji-fork.md`](../../jiji/docs/jiji-fork.md) for the fork strategy.
+A user-facing CLI for KDE-style **Activities** on the **jiji** Wayland compositor. Jiji is a hard fork of [niri](https://github.com/niri-wm/niri) that adds the activities feature.
 
 > **Rename note (2026-05-19).** This crate was renamed from `niri-activities` to `jiji-activities` as part of the hard-fork branding. The compositor binary it talks to is still called `niri` on disk (its source-level rename to `jiji` is a follow-up sub-phase); the IPC crate is still called `niri-ipc`. So this CLI talks to `$NIRI_SOCKET` and depends on `niri-ipc` for now; both will rename in the compositor source-rename sub-phase.
 
@@ -51,9 +51,9 @@ unambiguous.
 This release builds from source only. The `niri-ipc` dependency is a local
 `path = ` reference into a checkout of the jiji compositor (which carries
 the activities-related IPC variants that don't exist upstream).
-Concretely, the path is `../../jiji/jiji/niri-ipc` relative to this
-repo; the workspace layout that produces that path is documented in the parent
-jiji workspace's `CLAUDE.md`.
+Concretely, the path is `../jiji/jiji-ipc` relative to this repo — i.e. a
+clone of the [jiji compositor](https://github.com/jiji-wm/jiji) checked out
+as a sibling directory next to this repo.
 
 ```sh
 # From a jiji workspace with the jiji compositor checked out alongside this repo.
@@ -163,6 +163,23 @@ Removes the focused workspace from every activity it currently belongs to and
 assigns it exclusively to the named one. Picker cancellation exits 0 with no
 IPC mutation.
 
+### `move-window-here` — pull a window to a workspace in the current activity
+
+```sh
+jiji-activities move-window-here                 # picker (fuzzel)
+jiji-activities move-window-here --follow        # follow the window after the move
+jiji-activities move-window-here --overview      # follow and reveal in overview
+jiji-activities move-window-here --window 42     # move window id 42 instead of the focused one
+```
+
+Always picker-driven (there is no named-arg form): fuzzel opens with the
+workspaces of the *current* activity and the chosen window is moved to the
+selected workspace. By default the focused window is moved; `--window <id>`
+moves a specific window instead. `--follow` moves focus along with the
+window; `--overview` implies `--follow` and additionally reveals the
+destination in the compositor's overview. Picker cancellation exits 0 with no
+IPC mutation.
+
 ### `assign-workspace` — multi-select activity membership
 
 ```sh
@@ -204,6 +221,18 @@ config-declared activities**: edit `niri.conf` and reload to do that
 a config-declared activity surfaces the compositor's refusal verbatim and exits
 65.
 
+### `rename` — rename an activity
+
+```sh
+jiji-activities rename NewName --activity Work   # rename Work to NewName
+jiji-activities rename NewName                   # picker (fuzzel) chooses the target
+```
+
+Renames an activity. The positional argument is the *new* name; the target
+activity is selected with `--activity <name>` (non-interactive) or, when the
+flag is omitted, via a fuzzel picker. Picker cancellation exits 0 with no IPC
+mutation.
+
 ### `save` — persist a runtime activity to `niri.conf`
 
 ```sh
@@ -238,6 +267,16 @@ upstream IPC variant for moving the focused window to a named activity is
 pending in the niri fork; once it lands, the wrapper will be written. Use
 `move-workspace` if moving the whole workspace is acceptable; otherwise, this
 operation is not yet available.
+
+### `completions <shell>` — emit a shell completion script
+
+```sh
+jiji-activities completions fish > ~/.config/fish/completions/jiji-activities.fish
+```
+
+Prints a completion script for the given shell (`bash`, `zsh`, `fish`, …) to
+stdout; the fish output is additionally augmented with dynamic activity-name
+completion.
 
 ## Exit codes
 
