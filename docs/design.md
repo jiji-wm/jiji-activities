@@ -1,8 +1,8 @@
 # `jiji-activities` design — Phase 3 of activities
 
-> **Rename note (2026-05-19).** This DD was authored as `niri-activities`; it was renamed to `jiji-activities` on 2026-05-19 as part of the soft-fork-to-hard-fork upgrade (see `~/projects/desktop/de/jiji/docs/jiji-fork.md`). Source text was bulk-renamed; historical `Reviewed:` annotations preserve their original wording (incl. references to `niri/gajdusek/src/...` source paths that no longer exist — those refer to commit-time state in the pre-rename fork directory layout). The compositor source rename is a follow-up sub-phase; references to `niri-ipc` (the crate name), `niri msg`, `$NIRI_SOCKET`, and the `gajdusek/niri` repo URL in this DD are correct against the current pre-compositor-rename state and will be updated when that follow-up lands.
+> **Rename note (2026-05-19).** This DD was authored as `niri-activities`; it was renamed to `jiji-activities` on 2026-05-19 as part of the soft-fork-to-hard-fork upgrade (part of the fork-wide rename). Source text was bulk-renamed; historical `Reviewed:` annotations preserve their original wording (incl. references to `niri/gajdusek/src/...` source paths that no longer exist — those refer to commit-time state in the pre-rename fork directory layout). The compositor source rename is a follow-up sub-phase; references to `niri-ipc` (the crate name), `niri msg`, `$NIRI_SOCKET`, and the `gajdusek/niri` repo URL in this DD are correct against the current pre-compositor-rename state and will be updated when that follow-up lands.
 
-Implementer-grade design for the user-facing CLI of KDE-style Activities on the jiji compositor. Owns Phase 3 of the activities workstream; takes over from §8 of the compositor DD (`~/projects/desktop/de/jiji/docs/activities/design.md`), which now redirects here.
+Implementer-grade design for the user-facing CLI of KDE-style Activities on the jiji compositor. Owns Phase 3 of the activities workstream; takes over from §8 of the compositor DD (the compositor activities design doc (workspace overlay, not in this repo)), which now redirects here.
 
 This DD is the source of truth for everything user-facing: subcommand surface, error model, exit codes, IPC strategy, picker integration, output formats, test strategy. The compositor DD remains the source of truth for IPC types and compositor-side semantics.
 
@@ -20,7 +20,7 @@ Out of scope for v1, parked for v2: daemon mode, D-Bus interface, save-to-config
 
 | Concern | Lives in | DD |
 |---|---|---|
-| Activities data model, IPC types, compositor layout machinery | fork at `~/projects/desktop/de/jiji/jiji/` | `~/projects/desktop/de/jiji/docs/activities/design.md` |
+| Activities data model, IPC types, compositor layout machinery | the jiji compositor repo | the compositor activities design doc (workspace overlay, not in this repo) |
 | User-facing CLI surface, error model, picker integration | this repo | this file |
 
 The compositor DD exposes `Request::Activities`, `Action::SwitchActivity`, `Action::CreateActivity`, etc. via the fork's `niri-ipc` crate. This DD consumes those types; it never invents them. When the compositor DD lands a new action, this DD opens a sub-phase that wraps it.
@@ -41,7 +41,7 @@ Lifted from compositor DD §8.2; refined here per the error/exit-code spec in §
 
 ### `jiji-activities move-window [<name>]`
 - **Explicit window flag.** `--window <u64>` selects an explicit window id instead of the focused window; threads through `decide_window_id_for_dispatch` as the explicit-id-wins branch. Suppresses the `--follow`-no-capture stderr fallback when set. Landed in `f948599`.
-- Composes existing primitives — there is no `Action::MoveWindowToActivity` and there never will be. The compositor DD §4.3 (line 511 in `~/projects/desktop/de/jiji/docs/activities/design.md`) carries an explicit non-inclusion comment: in the workspace-as-atom model, activity membership is a workspace-level property, so the external tool must materialise "window → activity" out of "window → workspace → activity". The CLI resolves the destination activity's trailing-empty workspace on the focused output and dispatches `Action::MoveWindowToWorkspace { reference: WorkspaceReferenceArg::Id(...), window_id: None, focus: ... }` against it. Operates on focused window.
+- Composes existing primitives — there is no `Action::MoveWindowToActivity` and there never will be. The compositor DD §4.3 (in the compositor activities design doc, not in this repo) carries an explicit non-inclusion comment: in the workspace-as-atom model, activity membership is a workspace-level property, so the external tool must materialise "window → activity" out of "window → workspace → activity". The CLI resolves the destination activity's trailing-empty workspace on the focused output and dispatches `Action::MoveWindowToWorkspace { reference: WorkspaceReferenceArg::Id(...), window_id: None, focus: ... }` against it. Operates on focused window.
 - Picker variant when no arg.
 - **Destination-workspace resolution.** One `Request::Workspaces` query suffices for the happy path: filter by `activities.contains(target_activity_id) && output == focused_output`, pick max-idx where `active_window_id.is_none()`. That's the trailing-empty workspace the compositor maintains under §5.4 of the compositor DD — **but only for the current activity on a connected output**; non-current activities have no auto-materialised trailing-empty on the focused output. The focused output is read from the same `Workspaces` reply (entry with `is_focused: true`), saving one round-trip vs. a separate `Request::FocusedOutput`.
 - **Non-current-activity fallback.** When the filter returns empty (target activity has no workspace on the focused output), the architect spec for Phase 3.6 box 2 settles the fallback shape. Likely candidate: `MoveWindowToWorkspaceDown` (creates a fresh empty under the active activity), then `MoveWorkspaceToActivity { workspace: Some(Id(...)), activity: Name(target), focus: false }` migrates that workspace into the target. Two IPC calls instead of one, but reuses existing variants only.
@@ -423,7 +423,7 @@ Post-v0.1.0 daily-driver bug surfaced by the human after using `Mod+Shift+M` aga
 
 **Implementer-grade spec lives in the workspace repo at:**
 
-> `~/projects/desktop/de/jiji/docs/superpowers/plans/2026-05-18-jiji-activities-picker-fixes.md`
+> the workspace planning notes for jiji activities picker fixes (2026-05-18; not in this repo)
 
 The plan is TDD-shaped (each task: failing test → implementation → commit) with exact code snippets, exact commit messages, and rollback instructions. The cli-architect's spec for this sub-phase is the plan — no independent re-derivation needed. The cli-implementer reads the plan and executes task-by-task; the cli-fixer applies review findings squash-style per the existing per-task commit boundary.
 
@@ -462,7 +462,7 @@ This sub-phase closes both with Stage 2 label annotations.
 
 **Implementer-grade spec lives at:**
 
-> `~/projects/desktop/de/jiji/docs/superpowers/plans/2026-05-18-jiji-activities-picker-fixes.md` — **Tasks 2b and 2c** (appended to the plan post-Phase-3.6b; the rest of the plan is Phase 3.6b history).
+> the workspace planning notes for jiji activities picker fixes (2026-05-18; not in this repo) — **Tasks 2b and 2c** (appended to the plan post-Phase-3.6b; the rest of the plan is Phase 3.6b history).
 
 **Scope:**
 
@@ -487,7 +487,7 @@ This sub-phase closes both with Stage 2 label annotations.
 
 Phase 3.6c's manual verification (2026-05-18) confirmed a system-level lie at the IPC boundary: even with the picker's eager `(current)` annotation routing to `AlreadyCurrent`, a race window exists where the focused window changes between picker snapshot and dispatch, and the compositor's silent `Reply::Ok(Response::Handled)` for move-to-self makes jiji-activities print a misleading "moved focused window to workspace N..." message. The compositor side is adding a typed `Response::NoOp(NoOpReason::AlreadyOnTarget { workspace_id })` reply variant (compositor DD Phase 2.10, Box A); this sub-phase teaches jiji-activities to consume it.
 
-**Spec lives at:** `~/projects/desktop/de/jiji/docs/superpowers/specs/2026-05-18-noop-move-signaling-design.md` — section 5 (CLI-side changes) and section 6 (sequencing). The spec covers all three sub-phases (compositor Box A → this sub-phase → compositor Box C); this DD entry documents the middle slice.
+**Spec lives at:** the workspace planning notes for noop move signaling design (2026-05-18; not in this repo) — section 5 (CLI-side changes) and section 6 (sequencing). The spec covers all three sub-phases (compositor Box A → this sub-phase → compositor Box C); this DD entry documents the middle slice.
 
 **Scope:**
 
@@ -496,7 +496,7 @@ Phase 3.6c's manual verification (2026-05-18) confirmed a system-level lie at th
 - [x] Task 3 — Three unit tests in `move_window.rs::tests`: (a) `dispatch_stage2_with_new_handles_response_no_op_already_on_target` — MockClient returns `Response::NoOp(AlreadyOnTarget { workspace_id })`; assert breadcrumb emitted, `Ok(())` returned, no other IPC; (b) `dispatch_stage2_literal_only_handles_response_no_op_already_on_target` — symmetric; (c) `send_expect_handled_or_no_op_unexpected_variant_returns_malformed_response` — pin the helper's error path against reply-variant drift. Landed in `1a9e94e` (fixer pass added 3 additional regression tests: wire-payload divergence, Server-arm mapping, known-no-op smoke test).
 - [x] Task 4 — DD update: this section's `Reviewed: YYYY-MM-DD (<sha>, ...)` line filled in by cli-scribe after Task 1–3 land. Landed in this commit.
 
-**Dependency:** **Phase 3.6c.5 cannot start until compositor DD Phase 2.10 Box A is reviewed-and-landed** in `~/projects/desktop/de/jiji/jiji/`. Box A adds `Response::NoOp(NoOpReason)` to niri-ipc — without that, this sub-phase has nothing to consume (`NoOpReason` won't be in scope). The architect's spec must cite the Box A fork SHA before producing implementer guidance.
+**Dependency:** **Phase 3.6c.5 cannot start until compositor DD Phase 2.10 Box A is reviewed-and-landed** in the jiji compositor repo. Box A adds `Response::NoOp(NoOpReason)` to niri-ipc — without that, this sub-phase has nothing to consume (`NoOpReason` won't be in scope). The architect's spec must cite the Box A fork SHA before producing implementer guidance.
 
 **Out of scope:**
 - Compositor handler emission of `Response::NoOp` (lives in compositor DD Phase 2.10 Box C; lands AFTER this sub-phase).
@@ -728,7 +728,7 @@ Actions the `Stage2Opts` / `FollowMode` type-design observation parked in Append
 
 ### Phase 3.12 — `rename` verb (launcher command-expansion prerequisite)
 
-**Phase A** of the jiji-do command-expansion design (`~/projects/desktop/de/jiji/docs/superpowers/specs/2026-06-03-jiji-do-command-expansion-design.md`). Adds a `rename` subcommand wrapping `Action::RenameActivity`, so jiji-do's future `rename-activity` passthrough (its Stage 7 Phase C) delegates to a real jiji-activities verb rather than jiji-do calling the compositor action directly — keeping every activity operation behind the single delegate. **No ratification gate**: it threads one new action through the established action-subcommand machinery (Phase 3.6), against an IPC variant that already exists (`Action::RenameActivity { activity: ActivityReferenceArg, name: String }`); no new IPC variant, no rev bump.
+**Phase A** of the jiji-do command-expansion design (the workspace planning notes for jiji do command expansion design (2026-06-03; not in this repo)). Adds a `rename` subcommand wrapping `Action::RenameActivity`, so jiji-do's future `rename-activity` passthrough (its Stage 7 Phase C) delegates to a real jiji-activities verb rather than jiji-do calling the compositor action directly — keeping every activity operation behind the single delegate. **No ratification gate**: it threads one new action through the established action-subcommand machinery (Phase 3.6), against an IPC variant that already exists (`Action::RenameActivity { activity: ActivityReferenceArg, name: String }`); no new IPC variant, no rev bump.
 
 **CLI shape (resolved during planning).** `rename <new-name> [--activity <ref>]`. The positional is the **new** freeform name (required). `--activity <ref>` selects the target activity; **omitted → single-select fuzzel picker** over the activity inventory (reuse the `switch` picker path). This shape is chosen over the design doc's `rename <activity> <new-name>` because an optional-first-then-required positional pair does not disambiguate cleanly in clap; a single required positional + an optional target flag is unambiguous and keeps picker-on-omit. Error model: a named `--activity` miss maps to `CliError::ActivityNotFound` (exit 66), consistent with every other named-activity verb.
 
@@ -747,7 +747,7 @@ Actions the `Stage2Opts` / `FollowMode` type-design observation parked in Append
 
 ### Phase 3.13 — Activity MRU picker + ordering flags
 
-**Stage 2a** of the activity-MRU-ordering design (`~/projects/desktop/de/jiji/docs/superpowers/specs/2026-05-28-activity-mru-ordering-design.md` §6.1–6.3; recipe in `~/projects/desktop/de/jiji/docs/superpowers/plans/2026-05-28-activity-mru-ordering.md` Task 2). Stage 1 (compositor recency model + IPC field/action) has already landed: `niri_ipc::Activity` carries `last_active_seq: u64` (opaque, monotonic, higher = more recent, `0` = not activated this session; active holds the unique max), and `Action::SwitchActivityPrevious { depth: u32 }` exists with a legacy `{}` → `depth=1` serde round-trip. This phase makes the CLI **consume** that field: the `switch` picker defaults to MRU and excludes/marks the active activity; `list` and `switch-previous` gain ordering knobs. **No new IPC variant, no rev bump** (the path dep already exposes the field). **No new verbs** — only flags — so `FISH_SINGLE_ARG_VERBS` is unchanged.
+**Stage 2a** of the activity-MRU-ordering design (the workspace planning notes for activity mru ordering design (2026-05-28; not in this repo) §6.1–6.3; recipe in the workspace planning notes for activity mru ordering (2026-05-28; not in this repo) Task 2). Stage 1 (compositor recency model + IPC field/action) has already landed: `niri_ipc::Activity` carries `last_active_seq: u64` (opaque, monotonic, higher = more recent, `0` = not activated this session; active holds the unique max), and `Action::SwitchActivityPrevious { depth: u32 }` exists with a legacy `{}` → `depth=1` serde round-trip. This phase makes the CLI **consume** that field: the `switch` picker defaults to MRU and excludes/marks the active activity; `list` and `switch-previous` gain ordering knobs. **No new IPC variant, no rev bump** (the path dep already exposes the field). **No new verbs** — only flags — so `FISH_SINGLE_ARG_VERBS` is unchanged.
 
 **Cross-call-site ordering decision (resolved during planning).** The spec mandates the MRU/exclude-active reshape for the **`switch` picker only** (§6.1). The other two `names_focused_first` call sites — `rename` (choose which activity to rename) and `move-workspace` (choose the destination activity) — are **target-selection** pickers where the active activity *is* a legitimate choice, and hoisting it to the front as the default highlight is the correct UX. They therefore **keep active-first ordering** and do **not** adopt MRU or active-exclusion. `names_focused_first` is replaced by **two** distinct helpers rather than overloaded: the new order-aware `names_for_switch` (switch only, returns `SwitchMenu`), and a retained `names_focused_first` (or equivalent) for the two target-selection pickers. This keeps each picker's semantics explicit at the type level rather than threading an `Order`/`exclude_active` flag through call sites that should never vary.
 

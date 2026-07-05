@@ -1,8 +1,6 @@
 # jiji-activities
 
-A user-facing CLI for KDE-style **Activities** on the **jiji** Wayland compositor. Jiji is a hard fork of [niri](https://github.com/niri-wm/niri) that adds the activities feature.
-
-> **Rename note (2026-05-19).** This crate was renamed from `niri-activities` to `jiji-activities` as part of the hard-fork branding. The compositor binary it talks to is still called `niri` on disk (its source-level rename to `jiji` is a follow-up sub-phase); the IPC crate is still called `niri-ipc`. So this CLI talks to `$NIRI_SOCKET` and depends on `niri-ipc` for now; both will rename in the compositor source-rename sub-phase.
+A user-facing CLI for KDE-style **Activities** on the [jiji](https://github.com/jiji-wm/jiji) Wayland compositor.
 
 ## Status
 
@@ -21,8 +19,8 @@ project) without the heaviness of separate user sessions.
 
 ## Runtime dependencies
 
-Beyond a running niri compositor (which exposes the IPC socket at
-`$NIRI_SOCKET`), two external picker binaries must be on `$PATH`. Each is used
+Beyond a running jiji compositor (which exposes the IPC socket at
+`$JIJI_SOCKET`), two external picker binaries must be on `$PATH`. Each is used
 by a distinct subset of subcommands:
 
 | Binary   | Used by                                       | Why                              |
@@ -61,22 +59,17 @@ cargo build --release
 cargo install --path . --locked
 ```
 
-`cargo install jiji-activities` (with no `--path` or `--git`) does **not** work:
-the crate is `publish = false` and depends on the unpublished `jiji-ipc` crate
-from the [jiji compositor](https://github.com/jiji-wm/jiji), pinned by git
-revision. Install from git instead:
-
-```sh
-cargo install --git https://github.com/jiji-wm/jiji-activities --locked
-```
-
-(The IPC dependency is still spelled `niri-ipc` in `Cargo.toml`, bridged to the
-`jiji-ipc` package, until the source identifier is migrated to `jiji_ipc`.)
+Neither `cargo install jiji-activities` nor `cargo install --git` works on its
+own: the crate is `publish = false` and depends on the unpublished `jiji-ipc`
+crate through the local path reference above, so the sibling compositor
+checkout must exist. (The IPC dependency is spelled `niri-ipc` in `Cargo.toml`,
+bridged to the `jiji-ipc` package, until the source identifier is migrated to
+`jiji_ipc`.)
 
 ## Usage
 
-All subcommands speak directly to the niri compositor over the IPC socket
-`$NIRI_SOCKET`. Subcommands that take an optional activity name open a picker
+All subcommands speak directly to the jiji compositor over the IPC socket
+`$JIJI_SOCKET`. Subcommands that take an optional activity name open a picker
 when the name is omitted; picker cancellation is treated as a successful
 no-op and exits 0.
 
@@ -91,7 +84,7 @@ jiji-activities list --format name,kind,focused
 `--json` and `--format` are mutually exclusive (clap-enforced). The plain
 format prints one row per activity with a leading `*` on the focused row, a
 fixed-width name column, the kind (`(config)` for activities declared in
-`niri.conf`, `(runtime)` for ones created via `create` or `save`), and a
+the jiji config, `(runtime)` for ones created via `create` or `save`), and a
 trailing workspace/window count:
 
 ```text
@@ -216,7 +209,7 @@ jiji-activities remove scratch
 ```
 
 Removes a runtime activity. The compositor **refuses to remove
-config-declared activities**: edit `niri.conf` and reload to do that
+config-declared activities**: edit the jiji config and reload to do that
 (config is the source of truth for declared activities). Attempting to remove
 a config-declared activity surfaces the compositor's refusal verbatim and exits
 65.
@@ -233,19 +226,19 @@ activity is selected with `--activity <name>` (non-interactive) or, when the
 flag is omitted, via a fuzzel picker. Picker cancellation exits 0 with no IPC
 mutation.
 
-### `save` — persist a runtime activity to `niri.conf`
+### `save` — persist a runtime activity to the config file
 
 ```sh
 jiji-activities save scratch
 ```
 
-Appends an `activity "scratch"` node to your niri config file (`$NIRI_CONFIG`
-if set, otherwise the platform default — on Linux, `~/.config/niri/config.kdl`) and
+Appends an `activity "scratch"` node to your jiji config file (`$JIJI_CONFIG`
+if set, otherwise the platform default — on Linux, `~/.config/jiji/config.kdl`) and
 triggers a config reload over IPC. The edit goes through the `kdl` crate's
 KDL v1 parser, which preserves the surrounding formatting, comments, and
 whitespace — only the new node is inserted.
 
-The reload is automatic: niri picks up the new declaration without a manual
+The reload is automatic: jiji picks up the new declaration without a manual
 intervention. If the IPC reload fails (compositor parse error, dead socket),
 the on-disk edit is still in place; rerun `save` or fix the upstream issue and
 reload manually.
@@ -253,7 +246,7 @@ reload manually.
 **Caveat for dotfiles managers (chezmoi, yadm, GNU Stow, etc.):** `save` edits
 the live config file directly, not the source-tracked copy in your dotfiles
 repository. You must re-import the change with your dotfiles tool (`chezmoi
-re-add ~/.config/niri/config.kdl` or equivalent) for it to survive the next
+re-add ~/.config/jiji/config.kdl` or equivalent) for it to survive the next
 config sync.
 
 ### `move-window` — not yet implemented
@@ -264,7 +257,7 @@ jiji-activities move-window <name>   # exits 70 with NotImplemented
 
 Currently returns `subcommand not yet implemented: move-window` (exit 70). The
 upstream IPC variant for moving the focused window to a named activity is
-pending in the niri fork; once it lands, the wrapper will be written. Use
+pending in the compositor; once it lands, the wrapper will be written. Use
 `move-workspace` if moving the whole workspace is acceptable; otherwise, this
 operation is not yet available.
 
@@ -292,12 +285,12 @@ act.
 |   64 | Argument-parse failure: unknown subcommand, missing arg, invalid `--format` spec.        |
 |   65 | Compositor returned an unexpected reply (wrong variant, decode error, server error).     |
 |   66 | Named activity not found.                                                                |
-|   69 | `$NIRI_SOCKET` unreachable (stderr `"niri socket unavailable:"`) OR external picker (`fuzzel` / `rofi`) missing from `$PATH` (stderr `"picker unavailable:"`). |
+|   69 | `$JIJI_SOCKET` unreachable (stderr `"jiji socket unavailable:"`) OR external picker (`fuzzel` / `rofi`) missing from `$PATH` (stderr `"picker unavailable:"`). |
 |   70 | Subcommand not yet implemented (currently: `move-window`).                                                                                                      |
 |   73 | `create`/`save` compositor refusal (stderr `"cannot create activity:"`) OR config-file edit failed (stderr `"config edit failed:"`).                            |
 
 Stderr always names the failure mode with a stable prefix (`jiji-activities:
-picker unavailable: ...`, `jiji-activities: niri socket unavailable: ...`,
+picker unavailable: ...`, `jiji-activities: jiji socket unavailable: ...`,
 `jiji-activities: config edit failed: ...`, etc.) so consumers can pattern-match
 the surface without parsing the trailing detail.
 
@@ -307,8 +300,8 @@ The default `cargo test` lane (`tests/cli.rs`, `tests/picker_shim.rs`,
 `tests/rofi_shim.rs`) covers every subcommand against in-process mocks and
 tempdir picker shims — no live compositor required. A separate `--ignored`
 test layer (`tests/smoke.rs`) exercises the same subcommands against a real
-running niri, asserting *side effects* (post-IPC state observable via
-`niri msg --json`) rather than just exit codes.
+running jiji, asserting *side effects* (post-IPC state observable via
+`jiji msg --json`) rather than just exit codes.
 
 Run it manually after any change that touches IPC wiring or output
 formatting:
@@ -322,12 +315,12 @@ cargo test --test smoke -- --ignored --test-threads=1
 
 **Prerequisites:**
 
-- A running niri compositor with its IPC socket reachable via
-  `$NIRI_SOCKET`. Tests with the precondition unmet log a `smoke: SKIP`
+- A running jiji compositor with its IPC socket reachable via
+  `$JIJI_SOCKET`. Tests with the precondition unmet log a `smoke: SKIP`
   breadcrumb to stderr and pass without action.
-- `niri` on `$PATH` (used as a side-effect verifier; **must be a jiji
-  compositor build** — upstream `niri msg activities` exits non-zero and the entire
-  smoke run skips with a `niri msg activities failed (...)` breadcrumb).
+- `jiji` on `$PATH` (used as a side-effect verifier via `jiji msg --json`;
+  when it is missing or `jiji msg activities` fails, the entire smoke run
+  skips with a breadcrumb instead of failing).
 
 **Side-effect warning.** Smoke tests create runtime activities under a
 `__nact_smoke_<test>_<pid>_<nanos>` prefix and best-effort-remove them at
@@ -345,7 +338,7 @@ session restart also clears them.
 
 The `save` subcommand and picker-driven variants are deliberately **not**
 covered by the smoke layer — `save` would mutate the operator's real
-`~/.config/niri/config.kdl`, and picker variants require an interactive
+`~/.config/jiji/config.kdl`, and picker variants require an interactive
 fuzzel / rofi binary. Cover them by exercising the binary by hand.
 
 ## Caveats
@@ -361,7 +354,7 @@ Things to know for v0.1.0:
   from crates.io or via `cargo install --git` alone. Build from a workspace
   checkout (see the **Install** section).
 - **`save` does not integrate with dotfiles managers.** The edit lands on the
-  live config file; if you track `~/.config/niri/config.kdl` in chezmoi / yadm
+  live config file; if you track `~/.config/jiji/config.kdl` in chezmoi / yadm
   / GNU Stow, you must re-import the change manually.
 
 ## License
