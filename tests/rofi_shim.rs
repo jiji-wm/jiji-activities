@@ -32,8 +32,17 @@ const BIN: &str = "jiji-activities";
 /// `cargo test` jobs disjoint. Mirror of `ShimDir` in
 /// `picker_shim.rs`; the spec calls for a clean duplicate rather than a
 /// shared infra extraction.
+/// Serializes the tests in this binary. Each test execs a freshly
+/// written shim script from its spawned CLI child; a sibling test's
+/// concurrently forked child can transiently inherit the script's
+/// write fd (fork copies it before exec closes CLOEXEC fds), turning
+/// that exec into ETXTBSY ("Text file busy"). Holding this lock for
+/// the shim dir's lifetime keeps write and exec windows disjoint.
+static SERIALIZE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct RofiShimDir {
     path: PathBuf,
+    _serial: std::sync::MutexGuard<'static, ()>,
 }
 
 impl RofiShimDir {
@@ -46,8 +55,14 @@ impl RofiShimDir {
             n,
             tag,
         ));
+        let serial = SERIALIZE_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         fs::create_dir_all(&path).expect("create rofi shim tempdir");
-        RofiShimDir { path }
+        RofiShimDir {
+            path,
+            _serial: serial,
+        }
     }
 
     /// Writes an executable `sh` script named `bin` inside this
@@ -202,7 +217,7 @@ fn rofi_cancel_exits_0() {
     // never resolves (the listener thread just dies on its remove_file
     // cleanup).
     let shim = RofiShimDir::new("cancel");
-    shim.install_script("rofi", "exit 1\n");
+    shim.install_script("rofi", "while IFS= read -r _line; do :; done\nexit 1\n");
     let sock = spawn_one_shot_assign_listener("cancel");
 
     Command::cargo_bin(BIN)
@@ -224,7 +239,10 @@ fn rofi_select_dispatches_set_and_exits_0() {
     // "Personal"; the listener's third connection receives it and
     // replies Handled → exit 0.
     let shim = RofiShimDir::new("select");
-    shim.install_script("rofi", "printf '[x] Personal\\n'\nexit 0\n");
+    shim.install_script(
+        "rofi",
+        "while IFS= read -r _line; do :; done\nprintf '[x] Personal\\n'\nexit 0\n",
+    );
     let (sock, captured) = spawn_one_shot_assign_listener_capturing("select");
 
     Command::cargo_bin(BIN)
@@ -260,8 +278,14 @@ fn rofi_only_one_chains_and_dispatches() {
     // activity Name "Personal" against the listener's third connection
     // → exit 0.
     let shim = RofiShimDir::new("chain");
-    shim.install_script("rofi", "printf '« Only one… »\\n'\nexit 0\n");
-    shim.install_script("fuzzel", "printf 'Personal\\n'\nexit 0\n");
+    shim.install_script(
+        "rofi",
+        "while IFS= read -r _line; do :; done\nprintf '« Only one… »\\n'\nexit 0\n",
+    );
+    shim.install_script(
+        "fuzzel",
+        "while IFS= read -r _line; do :; done\nprintf 'Personal\\n'\nexit 0\n",
+    );
     let (sock, captured) = spawn_one_shot_assign_listener_capturing("chain");
 
     Command::cargo_bin(BIN)

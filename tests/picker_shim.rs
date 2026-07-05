@@ -37,8 +37,17 @@ const BIN: &str = "jiji-activities";
 /// Per-test unique tempdir under `/tmp`. PID + counter keeps concurrent
 /// `cargo test` jobs disjoint. Avoids pulling in `tempfile` as a
 /// dev-dep — the directory is created and removed on `Drop`.
+/// Serializes the tests in this binary. Each test execs a freshly
+/// written shim script from its spawned CLI child; a sibling test's
+/// concurrently forked child can transiently inherit the script's
+/// write fd (fork copies it before exec closes CLOEXEC fds), turning
+/// that exec into ETXTBSY ("Text file busy"). Holding this lock for
+/// the shim dir's lifetime keeps write and exec windows disjoint.
+static SERIALIZE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct ShimDir {
     path: PathBuf,
+    _serial: std::sync::MutexGuard<'static, ()>,
 }
 
 impl ShimDir {
@@ -51,8 +60,14 @@ impl ShimDir {
             n,
             tag,
         ));
+        let serial = SERIALIZE_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         fs::create_dir_all(&path).expect("create shim tempdir");
-        ShimDir { path }
+        ShimDir {
+            path,
+            _serial: serial,
+        }
     }
 
     /// Writes an executable `sh` script named `fuzzel` inside this
@@ -172,7 +187,7 @@ fn fuzzel_select_then_second_ipc_fails_exits_69() {
     // dead. The exit-code contract is what's pinned: select + dead
     // second IPC → 69.
     let shim = ShimDir::new("select");
-    shim.install_fuzzel("printf 'Work\\n'\nexit 0\n");
+    shim.install_fuzzel("while IFS= read -r _line; do :; done\nprintf 'Work\\n'\nexit 0\n");
     let sock = spawn_one_shot_activities_listener("select");
 
     Command::cargo_bin(BIN)
@@ -415,7 +430,7 @@ fn move_workspace_picker_select_then_second_ipc_fails_exits_69() {
     // The exit-code contract is what's pinned: select + dead second
     // IPC → 69.
     let shim = ShimDir::new("mw-select");
-    shim.install_fuzzel("printf 'Work\\n'\nexit 0\n");
+    shim.install_fuzzel("while IFS= read -r _line; do :; done\nprintf 'Work\\n'\nexit 0\n");
     let sock = spawn_one_shot_activities_listener("mw-select");
 
     Command::cargo_bin(BIN)
@@ -556,6 +571,7 @@ if [ "$counter" = "0" ]; then
 else
     behaviour="$SHIM_STAGE2_RESPONSE"
 fi
+while IFS= read -r _line; do :; done
 case "$behaviour" in
     cancel)
         exit 1
@@ -867,7 +883,7 @@ fn rename_picker_select_then_second_ipc_fails_exits_69() {
     // reaches rename::run (regression to exit 0 would mean no second IPC
     // call fired).
     let shim = ShimDir::new("rename-select");
-    shim.install_fuzzel("printf 'Work\\n'\nexit 0\n");
+    shim.install_fuzzel("while IFS= read -r _line; do :; done\nprintf 'Work\\n'\nexit 0\n");
     let sock = spawn_one_shot_activities_listener("rename-select");
 
     Command::cargo_bin(BIN)
