@@ -358,7 +358,7 @@ fn save_no_socket_exits_69() {
     // Pins the binary-boundary wiring: `save <name>` dispatches through
     // save::run (not the NotImplemented stub), which performs a
     // filesystem write FIRST, then crosses the IPC factory for the
-    // LoadConfigFile reload. With $NIRI_CONFIG pointing at a writable
+    // LoadConfigFile reload. With $JIJI_CONFIG pointing at a writable
     // tempdir and $JIJI_SOCKET unset, the fs-edit step succeeds and
     // the reload IPC call fails on the dead socket → exit 69. A
     // regression to exit 70 would mean save fell back to
@@ -371,7 +371,7 @@ fn save_no_socket_exits_69() {
     Command::cargo_bin(BIN)
         .unwrap()
         .args(["save", "Foo"])
-        .env("NIRI_CONFIG", &cfg)
+        .env("JIJI_CONFIG", &cfg)
         .env_remove("JIJI_SOCKET")
         .assert()
         .code(69)

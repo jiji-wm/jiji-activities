@@ -24,7 +24,7 @@
 //! failure. It shares exit code 69 (`EX_UNAVAILABLE`) with
 //! [`CliError::SocketUnavailable`]; the two are disambiguated for the
 //! user by the `Display` prefix (`picker unavailable:` vs
-//! `niri socket unavailable:`). The stderr message names `fuzzel` so
+//! `jiji socket unavailable:`). The stderr message names `fuzzel` so
 //! the user knows which dep failed.
 
 use std::io::Write;
@@ -109,7 +109,7 @@ pub(crate) const PICKER_MISSING_MESSAGE: &str =
 /// **Why this is exposed at module scope:** the production caller
 /// (`cli::cmd_switch`) needs to verify availability *before* issuing
 /// any IPC round-trips, so a missing-fuzzel install surfaces with the
-/// picker-naming stderr message rather than "niri socket unavailable."
+/// picker-naming stderr message rather than "jiji socket unavailable."
 /// `pick_one` re-runs the same check internally so it stays correct
 /// when invoked from other call sites in the future.
 pub(crate) fn ensure_available() -> Result<(), CliError> {
@@ -141,7 +141,7 @@ pub(crate) fn ensure_available() -> Result<(), CliError> {
 pub(crate) fn pick_one(prompt: &str, items: &[String]) -> Result<PickerOutcome, CliError> {
     // Belt-and-suspenders: `cmd_switch` is expected to call
     // `ensure_available()` first so the missing-fuzzel error surfaces
-    // before any IPC round-trip (otherwise the user gets "niri socket
+    // before any IPC round-trip (otherwise the user gets "jiji socket
     // unavailable" when the real cause is a missing dep). Repeating the
     // check here keeps `pick_one` correct in isolation.
     ensure_available()?;

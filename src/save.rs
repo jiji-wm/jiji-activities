@@ -73,7 +73,7 @@ use niri_ipc::{Action, Request, Response};
 use crate::error::{CliError, MalformedResponseSource};
 use crate::ipc::{IpcError, NiriClient};
 
-const NIRI_CONFIG_ENV: &str = "NIRI_CONFIG";
+const JIJI_CONFIG_ENV: &str = "JIJI_CONFIG";
 const TMP_SUFFIX: &str = ".jiji-activities.tmp";
 
 /// Outcome of [`append_activity_if_absent`].
@@ -100,27 +100,27 @@ pub(crate) enum AppendOutcome {
 /// the full filesystem path without touching real environment state.
 pub(crate) trait ConfigPathResolver {
     /// Returns the absolute path to the niri user config file the CLI
-    /// should edit. Mirrors niri's own resolution: `$NIRI_CONFIG` first,
-    /// then `ProjectDirs::from("", "", "niri").config_dir() / config.kdl`.
+    /// should edit. Mirrors jiji's own resolution: `$JIJI_CONFIG` first,
+    /// then `ProjectDirs::from("", "", "jiji").config_dir() / config.kdl`.
     fn resolve(&self) -> std::result::Result<PathBuf, CliError>;
 }
 
-/// Production [`ConfigPathResolver`]: `$NIRI_CONFIG` → `ProjectDirs`
+/// Production [`ConfigPathResolver`]: `$JIJI_CONFIG` → `ProjectDirs`
 /// fallback. Mirrors niri's own config-path resolution order: env
 /// override first, platform config dir second.
 pub(crate) struct RealConfigPaths;
 
 impl ConfigPathResolver for RealConfigPaths {
     fn resolve(&self) -> std::result::Result<PathBuf, CliError> {
-        if let Some(env) = std::env::var_os(NIRI_CONFIG_ENV)
+        if let Some(env) = std::env::var_os(JIJI_CONFIG_ENV)
             && !env.is_empty()
         {
             return Ok(PathBuf::from(env));
         }
-        let Some(dirs) = ProjectDirs::from("", "", "niri") else {
+        let Some(dirs) = ProjectDirs::from("", "", "jiji") else {
             return Err(CliError::ConfigEdit(io::Error::new(
                 io::ErrorKind::NotFound,
-                "could not determine niri config path: $HOME is unset and $NIRI_CONFIG is not set. Set either to proceed.",
+                "could not determine jiji config path: $HOME is unset and $JIJI_CONFIG is not set. Set either to proceed.",
             )));
         };
         Ok(dirs.config_dir().join("config.kdl"))
@@ -446,7 +446,7 @@ mod tests {
     use crate::error::{CliError, MalformedResponseSource};
     use crate::ipc::MockClient;
 
-    // `$NIRI_CONFIG` is process-global; tests that mutate it must run
+    // `$JIJI_CONFIG` is process-global; tests that mutate it must run
     // serialized.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -909,24 +909,24 @@ mod tests {
     #[test]
     fn real_config_paths_niri_config_set_returns_that_path() {
         let _lock = ENV_LOCK.lock().expect("env lock not poisoned");
-        // SAFETY: ENV_LOCK serializes all NIRI_CONFIG mutations in
+        // SAFETY: ENV_LOCK serializes all JIJI_CONFIG mutations in
         // this test module.
-        unsafe { std::env::set_var(NIRI_CONFIG_ENV, "/tmp/my-custom.kdl") };
+        unsafe { std::env::set_var(JIJI_CONFIG_ENV, "/tmp/my-custom.kdl") };
         let result = RealConfigPaths.resolve();
-        unsafe { std::env::remove_var(NIRI_CONFIG_ENV) };
-        let path = result.expect("NIRI_CONFIG set must resolve to that path");
+        unsafe { std::env::remove_var(JIJI_CONFIG_ENV) };
+        let path = result.expect("JIJI_CONFIG set must resolve to that path");
         assert_eq!(path, PathBuf::from("/tmp/my-custom.kdl"));
     }
 
     #[test]
     fn real_config_paths_niri_config_empty_falls_through_to_project_dirs() {
-        // (T3a) Empty `$NIRI_CONFIG` must be treated as unset and
+        // (T3a) Empty `$JIJI_CONFIG` must be treated as unset and
         // fall through to the ProjectDirs branch.
         let _lock = ENV_LOCK.lock().expect("env lock not poisoned");
-        // SAFETY: ENV_LOCK serializes NIRI_CONFIG mutations.
-        unsafe { std::env::set_var(NIRI_CONFIG_ENV, "") };
+        // SAFETY: ENV_LOCK serializes JIJI_CONFIG mutations.
+        unsafe { std::env::set_var(JIJI_CONFIG_ENV, "") };
         let result = RealConfigPaths.resolve();
-        unsafe { std::env::remove_var(NIRI_CONFIG_ENV) };
+        unsafe { std::env::remove_var(JIJI_CONFIG_ENV) };
         // Whether ProjectDirs succeeds or not depends on the host's
         // $HOME. Either outcome is valid here; what matters is that
         // we did NOT return "/this/path" (i.e. the empty string was
@@ -936,7 +936,7 @@ mod tests {
                 assert_ne!(
                     path,
                     PathBuf::from(""),
-                    "empty NIRI_CONFIG must not produce an empty path",
+                    "empty JIJI_CONFIG must not produce an empty path",
                 );
                 assert!(
                     path.ends_with("config.kdl"),
@@ -952,17 +952,17 @@ mod tests {
 
     #[test]
     fn real_config_paths_niri_config_unset_uses_project_dirs() {
-        // (T3b) When `$NIRI_CONFIG` is unset, resolve must try
+        // (T3b) When `$JIJI_CONFIG` is unset, resolve must try
         // ProjectDirs and either succeed with a `config.kdl` path or
         // return ConfigEdit(NotFound) on a host without $HOME.
         let _lock = ENV_LOCK.lock().expect("env lock not poisoned");
-        // SAFETY: ENV_LOCK serializes NIRI_CONFIG mutations.
-        let had_env = std::env::var_os(NIRI_CONFIG_ENV);
-        unsafe { std::env::remove_var(NIRI_CONFIG_ENV) };
+        // SAFETY: ENV_LOCK serializes JIJI_CONFIG mutations.
+        let had_env = std::env::var_os(JIJI_CONFIG_ENV);
+        unsafe { std::env::remove_var(JIJI_CONFIG_ENV) };
         let result = RealConfigPaths.resolve();
         // Restore if it was set.
         if let Some(v) = had_env {
-            unsafe { std::env::set_var(NIRI_CONFIG_ENV, v) };
+            unsafe { std::env::set_var(JIJI_CONFIG_ENV, v) };
         }
         match result {
             Ok(path) => {

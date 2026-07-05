@@ -59,7 +59,7 @@ fn require_live_niri() -> Option<String> {
     // "unrecognized subcommand 'activities'" — surfacing this as a SKIP
     // (rather than a hard failure inside an individual test) gives the
     // operator a single clear diagnostic.
-    let probe = StdCommand::new("niri")
+    let probe = StdCommand::new("jiji")
         .args(["msg", "--json", "activities"])
         .env("JIJI_SOCKET", &socket)
         .output();
@@ -86,7 +86,7 @@ fn require_live_niri() -> Option<String> {
 /// any failure — these are smoke tests, so a broken precondition is
 /// a hard fail (after `require_live_niri` has gated the test).
 fn niri_msg(socket: &str, args: &[&str]) -> Value {
-    let out = StdCommand::new("niri")
+    let out = StdCommand::new("jiji")
         .arg("msg")
         .arg("--json")
         .args(args)

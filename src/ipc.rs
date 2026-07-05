@@ -40,7 +40,7 @@ use niri_ipc::{Reply, Request, Response};
 
 use crate::error::{CliError, MalformedResponseSource};
 
-/// Single round-trip over the niri socket: write a `Request`, read a
+/// Single round-trip over the jiji socket: write a `Request`, read a
 /// `Response`. Implementations are synchronous and consume `&mut
 /// self` so a future stateful client (e.g. a connection pool) can
 /// fit the same trait without changing call sites.

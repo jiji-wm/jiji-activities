@@ -315,7 +315,7 @@ fn cmd_switch(name: Option<String>, order: Order) -> Result<()> {
             // Verify `fuzzel` is on $PATH BEFORE any IPC round-trip so a
             // missing-dep failure surfaces with a fuzzel-naming stderr
             // message ("fuzzel: not on $PATH (...)") rather than
-            // the generic "niri socket unavailable" the IPC layer would
+            // the generic "jiji socket unavailable" the IPC layer would
             // produce on a disconnected socket. `run_picker` would also
             // hit this via `pick_one`'s internal re-check, but only
             // after the Activities IPC call — which is the wrong order
@@ -357,7 +357,7 @@ fn cmd_move_window(
             // Verify `fuzzel` is on $PATH BEFORE any IPC round-trip so a
             // missing-dep failure surfaces with a fuzzel-naming stderr
             // message ("fuzzel: not on $PATH (...)") rather than the
-            // generic "niri socket unavailable" the IPC layer would
+            // generic "jiji socket unavailable" the IPC layer would
             // produce on a disconnected socket.
             picker::ensure_available().context("verifying move-window picker availability")?;
             let mut client = ipc::make_client();
@@ -412,7 +412,7 @@ fn cmd_move_workspace(
             // Verify `fuzzel` is on $PATH BEFORE any IPC round-trip so a
             // missing-dep failure surfaces with a fuzzel-naming stderr
             // message ("fuzzel: not on $PATH (...)") rather than the
-            // generic "niri socket unavailable" the IPC layer would
+            // generic "jiji socket unavailable" the IPC layer would
             // produce on a disconnected socket.
             picker::ensure_available().context("verifying move-workspace picker availability")?;
             let mut client = ipc::make_client();
@@ -425,7 +425,7 @@ fn cmd_move_workspace(
 fn cmd_assign_workspace(follow_mode: FollowMode, workspace: Option<u64>) -> Result<()> {
     // Verify `rofi` is on $PATH BEFORE any IPC round-trip so a
     // missing-dep failure surfaces with a rofi-naming stderr message
-    // rather than the generic "niri socket unavailable" the IPC layer
+    // rather than the generic "jiji socket unavailable" the IPC layer
     // would produce on a disconnected socket.
     picker::multi_select::ensure_available()
         .context("verifying assign-workspace picker availability")?;
@@ -470,7 +470,7 @@ fn cmd_rename(name: String, activity: Option<String>) -> Result<()> {
         None => {
             // Picker path: verify fuzzel is available BEFORE any IPC
             // round-trip so a missing-dep failure surfaces with a
-            // fuzzel-naming stderr message rather than "niri socket
+            // fuzzel-naming stderr message rather than "jiji socket
             // unavailable" (the IPC layer's error on a dead socket).
             picker::ensure_available().context("verifying rename picker availability")?;
             let mut client = ipc::make_client();
