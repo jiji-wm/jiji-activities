@@ -78,5 +78,5 @@ Or bump `# hash:` in the chezmoi script and `chezmoi apply` to do the last two s
 
 ## Workspace
 
-This repo is developed as part of the jiji-wm workspace, which carries the
-cross-repo process and design docs. The owning design doc is `docs/design.md`.
+This repo is developed as part of the [jiji-workspace](https://github.com/jiji-wm/jiji-workspace), which carries
+the cross-repo process and design docs. The owning design doc is `docs/design.md`.

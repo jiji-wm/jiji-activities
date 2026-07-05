@@ -59,6 +59,10 @@ cargo build --release
 cargo install --path . --locked
 ```
 
+The easiest way to get that layout is the [jiji-workspace repo](https://github.com/jiji-wm/jiji-workspace):
+its `scripts/clone.sh` clones every ecosystem repo as siblings (and
+enables their git hooks).
+
 Neither `cargo install jiji-activities` nor `cargo install --git` works on its
 own: the crate is `publish = false` and depends on the unpublished `jiji-ipc`
 crate through the local path reference above, so the sibling compositor
