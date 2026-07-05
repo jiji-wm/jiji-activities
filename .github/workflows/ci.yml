@@ -13,8 +13,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: jiji-activities
+      # jiji-ipc is a path dependency on a sibling clone of the compositor
+      # repo, so CI must recreate the ../jiji layout the crate builds against.
+      - uses: actions/checkout@v4
+        with:
+          repository: jiji-wm/jiji
+          path: jiji
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: jiji-activities
       - run: cargo build --all-targets --verbose
+        working-directory: jiji-activities
       - run: cargo test --verbose
+        working-directory: jiji-activities
       - run: cargo clippy --all-targets
+        working-directory: jiji-activities
