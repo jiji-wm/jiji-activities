@@ -740,6 +740,64 @@ fn move_window_named_arg_skips_picker() {
 }
 
 #[test]
+fn move_window_named_arg_needs_no_fuzzel_on_path() {
+    // Counterfactual this pins against: an availability gate applied
+    // unconditionally (dropping the `should_follow()` condition) on the
+    // named-arg path would make this exit 69 ("picker unavailable")
+    // instead of 0, because $PATH here resolves nothing named `fuzzel`
+    // at all — not even a booby-trapped shim. The sibling test above
+    // installs a shim, so it stays green even under that regression;
+    // this test only fails when the gate is actually unconditional.
+    let shim = ShimDir::new("mw-named-no-fuzzel");
+    // Deliberately install nothing: the shim dir is empty and becomes
+    // $PATH, so any picker-availability check that fires on this path
+    // would fail to resolve `fuzzel` at all.
+    let sock = spawn_two_shot_listener_for_move_window(
+        "mw-named-no-fuzzel",
+        MOVE_WINDOW_ACTIVITIES_REPLY,
+        MOVE_WINDOW_WORKSPACES_REPLY,
+    );
+
+    Command::cargo_bin(BIN)
+        .unwrap()
+        .args(["move-window", "Personal"])
+        .env_clear()
+        .env("PATH", shim.as_path())
+        .env("JIJI_SOCKET", &sock)
+        .assert()
+        // Same zero-case as the sibling test: no workspaces in
+        // 'Personal' on the focused output.
+        .code(0)
+        .stderr(contains("activity 'Personal' has no workspaces"));
+}
+
+#[test]
+fn move_window_follow_arg_needs_fuzzel_on_path() {
+    // Positive-direction sibling of `move_window_named_arg_needs_no_fuzzel_on_path`:
+    // `move-window Personal --follow` must gate on the follow picker
+    // BEFORE any IPC round-trip. Counterfactual this pins against: an
+    // inverted or dropped `should_follow()` guard would either skip the
+    // gate entirely (falling through to the IPC round-trip against an
+    // unset socket, a different failure shape) or apply it to the
+    // non-follow path instead — either way this test stops seeing exit
+    // 69 with the fuzzel-naming message.
+    let shim = ShimDir::new("mw-follow-no-fuzzel");
+    // Deliberately install nothing: the shim dir is empty, so any
+    // picker-availability check that fires on this path fails to
+    // resolve `fuzzel` at all.
+
+    Command::cargo_bin(BIN)
+        .unwrap()
+        .args(["move-window", "Personal", "--follow"])
+        .env_clear()
+        .env("PATH", shim.as_path())
+        .env_remove("JIJI_SOCKET")
+        .assert()
+        .code(69)
+        .stderr(contains("picker unavailable").and(contains("fuzzel")));
+}
+
+#[test]
 fn move_window_stage1_prompt_arg_is_activity_prompt() {
     // Pins that stage 1 passes `--prompt "Move window to activity:"`.
     let shim = ShimDir::new("mw-args-stage1");

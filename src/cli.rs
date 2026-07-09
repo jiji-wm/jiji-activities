@@ -12,6 +12,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use crate::assign_workspace;
 use crate::completions;
 use crate::create;
+use crate::error::CliError;
 use crate::ipc;
 use crate::list::{self, ListOpts};
 use crate::move_window;
@@ -248,6 +249,52 @@ fn resolve_follow_overview(follow: bool, overview: bool) -> FollowMode {
     }
 }
 
+/// Verifies a picker is on `$PATH` before any IPC round-trip.
+///
+/// This is the single statement of the ordering rule that governs every
+/// picker-reaching `cmd_*` dispatch: the availability check must run
+/// **before** `ipc::make_client()` (or any request), so a missing picker
+/// binary surfaces with a picker-naming stderr message (e.g. "fuzzel: not
+/// on $PATH") rather than the generic "jiji socket unavailable" the IPC
+/// layer produces on a dead socket. `pick_one` and `prompt_name` re-check
+/// availability internally, but only after the Activities IPC call has
+/// already gone out — the wrong order for diagnostics, which is why every
+/// picker-reaching dispatch arm calls this helper first.
+///
+/// `ensure` is a plain fn pointer so this one helper serves both
+/// `picker::ensure_available` (fuzzel) and
+/// `picker::multi_select::ensure_available` (rofi) without duplicating
+/// the rule. `context_label` becomes the `anyhow::Context` string
+/// rendered verbatim in the per-verb stderr chain.
+fn ensure_picker_before_ipc(
+    ensure: fn() -> Result<(), CliError>,
+    context_label: &'static str,
+) -> Result<()> {
+    ensure().context(context_label)
+}
+
+/// Verifies the fuzzel-backed follow picker is on `$PATH`, but only when
+/// [`FollowMode::should_follow`] is true.
+///
+/// On named-arg (non-interactive) paths a picker is needed only when
+/// `--follow`/`--overview` will spawn the post-move follow picker
+/// afterward, so this gate fires exclusively for
+/// [`FollowMode::Follow`]/[`FollowMode::FollowAndOverview`]. Plain
+/// named-arg invocations (`FollowMode::None`) stay picker-free — no
+/// fuzzel required on `$PATH`. This also covers `assign-workspace`,
+/// whose main picker is rofi: the follow stage it spawns afterward is
+/// always fuzzel single-select, so this helper (not the rofi one) is the
+/// correct gate there too.
+fn ensure_follow_picker_before_ipc(
+    follow_mode: FollowMode,
+    context_label: &'static str,
+) -> Result<()> {
+    if follow_mode.should_follow() {
+        ensure_picker_before_ipc(picker::ensure_available, context_label)?;
+    }
+    Ok(())
+}
+
 /// Routes the parsed [`Cli`] to the appropriate stub.
 ///
 /// Returns [`anyhow::Result`] so future IPC layers can `?`-propagate
@@ -312,15 +359,10 @@ fn cmd_switch(name: Option<String>, order: Order) -> Result<()> {
             switch::run(client.as_mut(), &n)
         }
         None => {
-            // Verify `fuzzel` is on $PATH BEFORE any IPC round-trip so a
-            // missing-dep failure surfaces with a fuzzel-naming stderr
-            // message ("fuzzel: not on $PATH (...)") rather than
-            // the generic "jiji socket unavailable" the IPC layer would
-            // produce on a disconnected socket. `run_picker` would also
-            // hit this via `pick_one`'s internal re-check, but only
-            // after the Activities IPC call — which is the wrong order
-            // for diagnostics.
-            picker::ensure_available().context("verifying switch picker availability")?;
+            ensure_picker_before_ipc(
+                picker::ensure_available,
+                "verifying switch picker availability",
+            )?;
             let mut client = ipc::make_client();
             switch::run_picker(client.as_mut(), order, picker::pick_one)
                 .context("running switch picker")
@@ -340,26 +382,18 @@ fn cmd_move_window(
 ) -> Result<()> {
     match name {
         Some(n) => {
-            // When `--follow` is set the named-arg form also spawns a
-            // fuzzel-backed follow picker after the move, so the
-            // picker-availability check must fire pre-IPC even on the
-            // non-interactive path. Skipping when follow is None
-            // preserves the "no fuzzel required for plain named-arg"
-            // ergonomic.
-            if follow_mode.should_follow() {
-                picker::ensure_available()
-                    .context("verifying move-window follow picker availability")?;
-            }
+            ensure_follow_picker_before_ipc(
+                follow_mode,
+                "verifying move-window follow picker availability",
+            )?;
             let mut client = ipc::make_client();
             move_window::run(client.as_mut(), &n, picker::pick_one, follow_mode, window)
         }
         None => {
-            // Verify `fuzzel` is on $PATH BEFORE any IPC round-trip so a
-            // missing-dep failure surfaces with a fuzzel-naming stderr
-            // message ("fuzzel: not on $PATH (...)") rather than the
-            // generic "jiji socket unavailable" the IPC layer would
-            // produce on a disconnected socket.
-            picker::ensure_available().context("verifying move-window picker availability")?;
+            ensure_picker_before_ipc(
+                picker::ensure_available,
+                "verifying move-window picker availability",
+            )?;
             let mut client = ipc::make_client();
             move_window::run_picker(
                 client.as_mut(),
@@ -374,10 +408,10 @@ fn cmd_move_window(
 }
 
 fn cmd_move_window_here(follow_mode: FollowMode, window: Option<u64>) -> Result<()> {
-    // Verify `fuzzel` is on $PATH BEFORE any IPC round-trip — same
-    // rationale as cmd_move_window's no-arg branch. `move-window-here`
-    // has no named-arg form; it is always picker-driven.
-    picker::ensure_available().context("verifying move-window-here picker availability")?;
+    ensure_picker_before_ipc(
+        picker::ensure_available,
+        "verifying move-window-here picker availability",
+    )?;
     let mut client = ipc::make_client();
     move_window::run_here_picker(client.as_mut(), picker::pick_one, follow_mode, window)
         .context("running move-window-here picker")
@@ -390,15 +424,10 @@ fn cmd_move_workspace(
 ) -> Result<()> {
     match name {
         Some(n) => {
-            // Same rationale as `cmd_move_window`'s named-arg branch:
-            // when `--follow` is set we will spawn a fuzzel-backed follow
-            // picker after the move, so the picker-availability check
-            // must fire pre-IPC. The plain named-arg form (no `--follow`)
-            // remains fuzzel-free.
-            if follow_mode.should_follow() {
-                picker::ensure_available()
-                    .context("verifying move-workspace follow picker availability")?;
-            }
+            ensure_follow_picker_before_ipc(
+                follow_mode,
+                "verifying move-workspace follow picker availability",
+            )?;
             let mut client = ipc::make_client();
             move_workspace::run(
                 client.as_mut(),
@@ -409,12 +438,10 @@ fn cmd_move_workspace(
             )
         }
         None => {
-            // Verify `fuzzel` is on $PATH BEFORE any IPC round-trip so a
-            // missing-dep failure surfaces with a fuzzel-naming stderr
-            // message ("fuzzel: not on $PATH (...)") rather than the
-            // generic "jiji socket unavailable" the IPC layer would
-            // produce on a disconnected socket.
-            picker::ensure_available().context("verifying move-workspace picker availability")?;
+            ensure_picker_before_ipc(
+                picker::ensure_available,
+                "verifying move-workspace picker availability",
+            )?;
             let mut client = ipc::make_client();
             move_workspace::run_picker(client.as_mut(), picker::pick_one, follow_mode, workspace)
                 .context("running move-workspace picker")
@@ -423,23 +450,14 @@ fn cmd_move_workspace(
 }
 
 fn cmd_assign_workspace(follow_mode: FollowMode, workspace: Option<u64>) -> Result<()> {
-    // Verify `rofi` is on $PATH BEFORE any IPC round-trip so a
-    // missing-dep failure surfaces with a rofi-naming stderr message
-    // rather than the generic "jiji socket unavailable" the IPC layer
-    // would produce on a disconnected socket.
-    picker::multi_select::ensure_available()
-        .context("verifying assign-workspace picker availability")?;
-    // When `--follow` is set the post-save follow picker uses fuzzel
-    // (single-select); rofi handles the assignment picker but the
-    // follow stage is always single-select. Pre-verify so a missing
-    // fuzzel surfaces with the picker-naming stderr message rather
-    // than as a transport-layer failure after the save has already
-    // landed. Skipped when follow is None to preserve the
-    // "no fuzzel required" ergonomic for the plain assign path.
-    if follow_mode.should_follow() {
-        picker::ensure_available()
-            .context("verifying assign-workspace follow picker availability")?;
-    }
+    ensure_picker_before_ipc(
+        picker::multi_select::ensure_available,
+        "verifying assign-workspace picker availability",
+    )?;
+    ensure_follow_picker_before_ipc(
+        follow_mode,
+        "verifying assign-workspace follow picker availability",
+    )?;
     let mut client = ipc::make_client();
     assign_workspace::run(client.as_mut(), picker::pick_one, follow_mode, workspace)
         .context("running assign-workspace picker")
@@ -468,11 +486,10 @@ fn cmd_rename(name: String, activity: Option<String>) -> Result<()> {
             )
         }
         None => {
-            // Picker path: verify fuzzel is available BEFORE any IPC
-            // round-trip so a missing-dep failure surfaces with a
-            // fuzzel-naming stderr message rather than "jiji socket
-            // unavailable" (the IPC layer's error on a dead socket).
-            picker::ensure_available().context("verifying rename picker availability")?;
+            ensure_picker_before_ipc(
+                picker::ensure_available,
+                "verifying rename picker availability",
+            )?;
             let mut client = ipc::make_client();
             rename::run_picker(client.as_mut(), &name, picker::pick_one)
                 .context("running rename picker")
