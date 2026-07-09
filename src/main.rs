@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn is_stdout_pipe_closed_does_not_match_other_cli_errors() {
-        let err: anyhow::Error = CliError::NotImplemented("test").into();
+        let err: anyhow::Error = CliError::Usage("test".to_owned()).into();
         assert!(
             !is_stdout_pipe_closed(&err),
             "unrelated CliError must not be suppressed",

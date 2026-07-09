@@ -14,7 +14,6 @@
 //! | `ActivityNotFound`   |   66 | named activity does not exist            |
 //! | `SocketUnavailable`  |   69 | `$JIJI_SOCKET` unreachable / IPC failed  |
 //! | `PickerUnavailable`  |   69 | external picker missing / spawn failed   |
-//! | `NotImplemented`     |   70 | subcommand stub not yet wired            |
 //! | `CantCreate`         |   73 | `create`/`save` could not produce target |
 //! | `ConfigEdit`         |   73 | filesystem edit of niri config failed    |
 //! | `OutputPipeClosed`   |    0 | stdout write hit EPIPE (e.g. `| head`); suppressed to exit 0 |
@@ -67,14 +66,6 @@ impl fmt::Display for MalformedResponseSource {
 /// Carriers are kept minimal and typed so the variants are a stable
 /// contract — adding a new failure mode is a deliberate decision, not
 /// a drive-by `anyhow::bail!`.
-//
-// `dead_code` is allowed because the typed contract is established
-// here ahead of the call sites that produce each variant. The IPC
-// client, picker, and list-output work will consume the remaining
-// variants; removing this allowance early would force premature
-// placeholders. Remove this attribute once every variant has at least
-// one production call site.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum CliError {
     /// User-facing argument-parse failure. Triggered when clap rejects
@@ -112,11 +103,6 @@ pub(crate) enum CliError {
     /// the user-visible distinction is the `Display` prefix
     /// (`picker unavailable:` vs `jiji socket unavailable:`).
     PickerUnavailable(std::io::Error),
-
-    /// Subcommand stub has not been wired to its IPC call yet.
-    /// Carries the subcommand name so the stderr message names the
-    /// gap. Exit code 70 (`EX_SOFTWARE`).
-    NotImplemented(&'static str),
 
     /// `create` or `save` could not produce the requested activity
     /// (name collision, compositor refused). Exit code 73
@@ -161,7 +147,6 @@ impl CliError {
             CliError::ActivityNotFound(_) => 66,
             CliError::SocketUnavailable(_) => 69,
             CliError::PickerUnavailable(_) => 69,
-            CliError::NotImplemented(_) => 70,
             CliError::CantCreate(_) => 73,
             CliError::ConfigEdit(_) => 73,
             // Suppressed to 0 by main() before exit_code() is consulted.
@@ -178,7 +163,6 @@ impl fmt::Display for CliError {
             CliError::ActivityNotFound(name) => write!(f, "no such activity: {name}"),
             CliError::SocketUnavailable(io) => write!(f, "jiji socket unavailable: {io}"),
             CliError::PickerUnavailable(io) => write!(f, "picker unavailable: {io}"),
-            CliError::NotImplemented(name) => write!(f, "subcommand not yet implemented: {name}"),
             CliError::CantCreate(msg) => write!(f, "cannot create activity: {msg}"),
             CliError::ConfigEdit(io) => write!(f, "config edit failed: {io}"),
             CliError::OutputPipeClosed => write!(f, "stdout pipe closed"),
@@ -200,7 +184,6 @@ impl std::error::Error for CliError {
             ) => None,
             CliError::Usage(_)
             | CliError::ActivityNotFound(_)
-            | CliError::NotImplemented(_)
             | CliError::CantCreate(_)
             | CliError::OutputPipeClosed => None,
         }
@@ -295,11 +278,6 @@ mod tests {
             format!("{err}").starts_with("picker unavailable:"),
             "Display must use the picker-unavailable prefix",
         );
-    }
-
-    #[test]
-    fn not_implemented_is_70() {
-        assert_eq!(CliError::NotImplemented("switch").exit_code(), 70);
     }
 
     #[test]

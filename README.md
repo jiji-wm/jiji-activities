@@ -4,10 +4,8 @@ A user-facing CLI for KDE-style **Activities** on the [jiji](https://github.com/
 
 ## Status
 
-**v0.1.0 tagged (`cb8b573`).** Implementation complete except for the
-`move-window` subcommand, which is blocked on an IPC variant that has not yet
-been implemented in the jiji compositor (the variant is on the roadmap but
-unimplemented). Every other subcommand is wired and covered by tests.
+**v0.1.0 tagged (`cb8b573`).** Implementation complete. Every subcommand is
+wired and covered by tests.
 
 ## Concept
 
@@ -253,17 +251,32 @@ repository. You must re-import the change with your dotfiles tool (`chezmoi
 re-add ~/.config/jiji/config.kdl` or equivalent) for it to survive the next
 config sync.
 
-### `move-window` — not yet implemented
+### `move-window` — move the focused window to a workspace in an activity
 
 ```sh
-jiji-activities move-window <name>   # exits 70 with NotImplemented
+jiji-activities move-window Personal              # non-interactive: auto-target the trailing-empty workspace
+jiji-activities move-window Personal --follow      # follow the window after the move (spawns a follow picker)
+jiji-activities move-window Personal --overview    # follow and reveal in overview
+jiji-activities move-window Personal --window 42   # move window id 42 instead of the focused one
+jiji-activities move-window                        # no-arg: two-stage picker (fuzzel), activity then workspace
 ```
 
-Currently returns `subcommand not yet implemented: move-window` (exit 70). The
-upstream IPC variant for moving the focused window to a named activity is
-pending in the compositor; once it lands, the wrapper will be written. Use
-`move-workspace` if moving the whole workspace is acceptable; otherwise, this
-operation is not yet available.
+With a named activity, the move is non-interactive: the CLI filters that
+activity's workspaces down to the focused output and moves the window to the
+trailing-empty one there, with no picker involved. If the activity has no
+workspaces on the focused output, or none of them are empty, it prints a
+diagnostic to stderr and exits 0 without moving anything (create a workspace,
+or fall back to the no-arg form to pick one explicitly). With no name, a
+two-stage fuzzel picker first chooses the target activity — including a
+`« New activity »` sentinel that prompts for a name and creates it — then
+opens a second picker over that activity's workspaces (plus a
+`« New workspace »` sentinel when applicable). By default the focused window
+is moved; `--window <id>` moves a specific window instead. `--follow` moves
+focus along with the window and, on both the named and no-arg forms, spawns a
+follow picker after a successful move letting you opt into focusing the
+destination; `--overview` implies `--follow` and additionally reveals the
+destination in the compositor's overview. Picker cancellation (at any stage,
+including the follow picker) exits 0 with no further IPC mutation.
 
 ### `completions <shell>` — emit a shell completion script
 
@@ -290,7 +303,7 @@ act.
 |   65 | Compositor returned an unexpected reply (wrong variant, decode error, server error).     |
 |   66 | Named activity not found.                                                                |
 |   69 | `$JIJI_SOCKET` unreachable (stderr `"jiji socket unavailable:"`) OR external picker (`fuzzel` / `rofi`) missing from `$PATH` (stderr `"picker unavailable:"`). |
-|   70 | Subcommand not yet implemented (currently: `move-window`).                                                                                                      |
+|   70 | Reserved (`EX_SOFTWARE`) — no subcommand currently exits 70.                                                                                                    |
 |   73 | `create`/`save` compositor refusal (stderr `"cannot create activity:"`) OR config-file edit failed (stderr `"config edit failed:"`).                            |
 
 Stderr always names the failure mode with a stable prefix (`jiji-activities:
@@ -352,7 +365,6 @@ Things to know for v0.1.0:
 - **Picker UX is proof-of-concept quality.** The fuzzel / rofi invocations are
   serviceable but unstyled — no theming, no per-activity icons, no preview
   pane. They will be refined post-v0.1.0.
-- **`move-window` is not implemented yet** (see the subcommand section above).
 - **Source-only install.** Until the `niri-ipc` dependency switches from a
   local `path = ` reference to a pinned git rev, this crate cannot be installed
   from crates.io or via `cargo install --git` alone. Build from a workspace

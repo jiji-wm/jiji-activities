@@ -152,10 +152,10 @@ fn unknown_subcommand_exits_64() {
 #[test]
 fn switch_named_no_socket_exits_69() {
     // Pins the binary-boundary wiring: `switch <name>` dispatches
-    // through switch::run (not the NotImplemented stub), which hits the
+    // through switch::run (not the retired stub), which hits the
     // IPC factory. With $JIJI_SOCKET unset the factory returns
     // SocketUnavailable (exit 69) — proving the named path is wired end-
-    // to-end rather than returning NotImplemented (exit 70).
+    // to-end rather than the retired stub-era exit 70.
     Command::cargo_bin(BIN)
         .unwrap()
         .args(["switch", "Work"])
@@ -208,7 +208,7 @@ fn assign_workspace_no_socket_exits_69() {
     //    short-circuits to `PickerUnavailable`.
     //
     // Both share exit code 69. A regression to exit 70 would mean
-    // assign-workspace silently fell back to the NotImplemented stub.
+    // assign-workspace silently fell back to the retired stub-era behavior.
     Command::cargo_bin(BIN)
         .unwrap()
         .arg("assign-workspace")
@@ -220,11 +220,11 @@ fn assign_workspace_no_socket_exits_69() {
 #[test]
 fn switch_previous_no_socket_exits_69() {
     // Pins the binary-boundary wiring: `switch-previous` dispatches
-    // through switch_previous::run (not the NotImplemented stub), which
+    // through switch_previous::run (not the retired stub), which
     // hits the IPC factory. With $JIJI_SOCKET unset the factory returns
     // SocketUnavailable (exit 69) — proving the wired path replaced the
     // stub. A regression to exit 70 would mean it fell back to
-    // NotImplemented.
+    // the retired stub-era behavior.
     Command::cargo_bin(BIN)
         .unwrap()
         .args(["switch-previous"])
@@ -286,9 +286,10 @@ fn move_window_here_no_socket_exits_69() {
 #[test]
 fn move_workspace_named_no_socket_exits_69() {
     // Pins the binary-boundary wiring: `move-workspace <name>`
-    // dispatches through move_workspace::run (not NotImplemented),
-    // hitting the IPC factory. With $JIJI_SOCKET unset the factory
-    // returns SocketUnavailable (exit 69).
+    // dispatches through move_workspace::run (not the retired
+    // stub-era NotImplemented), hitting the IPC factory. With
+    // $JIJI_SOCKET unset the factory returns SocketUnavailable
+    // (exit 69).
     Command::cargo_bin(BIN)
         .unwrap()
         .args(["move-workspace", "Work"])
@@ -324,11 +325,11 @@ fn move_workspace_no_arg_no_socket_exits_69() {
 #[test]
 fn create_no_socket_exits_69() {
     // Pins the binary-boundary wiring: `create <name>` dispatches
-    // through create::run (not the NotImplemented stub), which hits the
+    // through create::run (not the retired stub), which hits the
     // IPC factory. With $JIJI_SOCKET unset the factory returns
     // SocketUnavailable (exit 69) — proving the wired path replaced the
     // stub. A regression to exit 70 would mean it fell back to
-    // NotImplemented.
+    // the retired stub-era behavior.
     Command::cargo_bin(BIN)
         .unwrap()
         .args(["create", "Foo"])
@@ -340,11 +341,11 @@ fn create_no_socket_exits_69() {
 #[test]
 fn remove_no_socket_exits_69() {
     // Pins the binary-boundary wiring: `remove <name>` dispatches
-    // through remove::run (not the NotImplemented stub), which hits the
+    // through remove::run (not the retired stub), which hits the
     // IPC factory. With $JIJI_SOCKET unset the factory returns
     // SocketUnavailable (exit 69) — proving the wired path replaced the
     // stub. A regression to exit 70 would mean it fell back to
-    // NotImplemented.
+    // the retired stub-era behavior.
     Command::cargo_bin(BIN)
         .unwrap()
         .args(["remove", "Foo"])
@@ -356,13 +357,13 @@ fn remove_no_socket_exits_69() {
 #[test]
 fn save_no_socket_exits_69() {
     // Pins the binary-boundary wiring: `save <name>` dispatches through
-    // save::run (not the NotImplemented stub), which performs a
+    // save::run (not the retired stub), which performs a
     // filesystem write FIRST, then crosses the IPC factory for the
     // LoadConfigFile reload. With $JIJI_CONFIG pointing at a writable
     // tempdir and $JIJI_SOCKET unset, the fs-edit step succeeds and
     // the reload IPC call fails on the dead socket → exit 69. A
     // regression to exit 70 would mean save fell back to
-    // NotImplemented; a regression to exit 73 would mean the fs-edit
+    // the retired stub-era behavior; a regression to exit 73 would mean the fs-edit
     // erroneously preceded the empty-socket short-circuit (or the IPC
     // step never ran).
     let tmp = tempfile::tempdir().expect("tempdir");
