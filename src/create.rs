@@ -45,12 +45,15 @@ use crate::error::{CliError, MalformedResponseSource};
 use crate::ipc::{IpcError, NiriClient};
 use crate::ipc_helpers::variant_name;
 
-/// Creates a new runtime activity named `name`.
-///
-/// **Contract:** issues exactly one `CreateActivity` IPC request and
-/// expects `Response::Handled`. See module docs for the full error
+/// Dispatches `Action::CreateActivity { name }` and maps the compositor's
+/// wire-error matrix to `CliError`. See module docs for the full error
 /// matrix.
-pub(crate) fn run(client: &mut dyn NiriClient, name: &str) -> Result<()> {
+///
+/// Shared core for [`run`] (the standalone `create` verb) and
+/// [`crate::move_window::create_activity_via_ipc`] (a step of the
+/// move-window picker's stage-1 new-activity pipeline). Callers attach
+/// their own `.context(...)` label — this function does not.
+pub(crate) fn dispatch(client: &mut dyn NiriClient, name: &str) -> Result<()> {
     let req = Request::Action(Action::CreateActivity {
         name: name.to_owned(),
     });
@@ -74,7 +77,16 @@ pub(crate) fn run(client: &mut dyn NiriClient, name: &str) -> Result<()> {
         }
         Err(other) => Err(CliError::from(other).into()),
     };
-    result.context("creating activity")
+    result
+}
+
+/// Creates a new runtime activity named `name`.
+///
+/// **Contract:** issues exactly one `CreateActivity` IPC request and
+/// expects `Response::Handled`. See module docs for the full error
+/// matrix.
+pub(crate) fn run(client: &mut dyn NiriClient, name: &str) -> Result<()> {
+    dispatch(client, name).context("creating activity")
 }
 
 #[cfg(test)]

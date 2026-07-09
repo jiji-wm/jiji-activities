@@ -105,15 +105,15 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use niri_ipc::{Action, Activity, NoOpReason, Request, Response, Workspace, WorkspaceReferenceArg};
+use niri_ipc::{Action, Activity, NoOpReason, Request, Workspace, WorkspaceReferenceArg};
 
 use crate::cli::FollowMode;
 use crate::error::{CliError, MalformedResponseSource};
 use crate::follow::{self, dispatch_follow_workspace, dispatch_follow_workspace_and_window};
-use crate::ipc::{IpcError, NiriClient};
+use crate::ipc::NiriClient;
 use crate::ipc_helpers::{
     HandledOutcome, focused_window_id, focused_workspace, send_expect_activities,
-    send_expect_handled_or_no_op, send_expect_workspaces, variant_name,
+    send_expect_handled_or_no_op, send_expect_workspaces,
 };
 use crate::picker::{NameOutcome, PickerOutcome};
 
@@ -733,49 +733,34 @@ where
     }
 }
 
-/// Dispatches `Action::CreateActivity { name }` and maps the compositor's
-/// wire-error matrix verbatim to the same `CliError` variants used by
-/// [`crate::create::run`]:
+/// Dispatches `Action::CreateActivity { name }` via [`crate::create::dispatch`],
+/// the shared core also used by [`crate::create::run`]:
 ///
-/// - `CreateActivityError::DuplicateName` display → [`CliError::CantCreate`].
-/// - `CreateActivityError::EmptyName` display → [`CliError::Usage`].
-/// - other `IpcError::Server(_)` → [`MalformedResponseSource::Server`].
+/// - `IpcError::Server("activity name already exists")` → [`CliError::CantCreate`].
+/// - `IpcError::Server("activity name must not be empty")` → [`CliError::Usage`].
+/// - any other `IpcError::Server(_)` → [`MalformedResponseSource::Server`]; any
+///   non-`Server` `IpcError` (transport, decode) → its usual [`CliError::from`]
+///   mapping.
 ///
-/// **Why not [`crate::create::run`]:** the stage-1 new-activity flow
-/// is a multi-IPC pipeline (CreateActivity → re-fetch Activities →
-/// dispatch_stage2_*), so this is a step of that pipeline rather than a
-/// terminal verb invocation. Open-coding the dispatch here keeps the
-/// pipeline's error-context layer (`"creating activity from move-window
-/// picker"`) attachable without misroute-by-strings between
-/// `creating activity` (the standalone verb's context) and the picker's
-/// context.
+/// The mapping is now *structurally* shared with `create::run` — one
+/// function, not two verbatim copies — so this wrapper's only remaining
+/// contribution is the pipeline's own context label.
+///
+/// **Why not `create::run`** (which bakes in the standalone verb's context
+/// label): the stage-1 new-activity flow is a multi-IPC pipeline
+/// (CreateActivity → re-fetch Activities → dispatch_stage2_*), so this is a
+/// step of that pipeline rather than a terminal verb invocation. Calling
+/// [`crate::create::dispatch`] directly and attaching this pipeline's own
+/// `.context("creating activity from move-window picker")` avoids
+/// misroute-by-strings between `creating activity` (the standalone verb's
+/// context) and the picker's context.
 ///
 /// **Synthetic-string discipline.** The `"creating activity from
 /// move-window picker"` context label is a CLI-internal string — it is
 /// not on the wire. Same audit-skip discipline as
 /// [`crate::ipc_helpers::focused_workspace`]'s `"no focused workspace"`.
 fn create_activity_via_ipc(client: &mut dyn NiriClient, name: &str) -> Result<()> {
-    let req = Request::Action(Action::CreateActivity {
-        name: name.to_owned(),
-    });
-    let result: anyhow::Result<()> = match client.send(req) {
-        Ok(Response::Handled) => Ok(()),
-        Ok(other) => Err(
-            CliError::MalformedResponse(MalformedResponseSource::WrongVariant {
-                expected: "Response::Handled",
-                got: variant_name(&other).into(),
-            })
-            .into(),
-        ),
-        Err(IpcError::Server(msg)) if msg == "activity name already exists" => {
-            Err(CliError::CantCreate(format!("activity \"{name}\" already exists")).into())
-        }
-        Err(IpcError::Server(msg)) if msg == "activity name must not be empty" => {
-            Err(CliError::Usage("activity name must not be empty".to_owned()).into())
-        }
-        Err(other) => Err(CliError::from(other).into()),
-    };
-    result.context("creating activity from move-window picker")
+    crate::create::dispatch(client, name).context("creating activity from move-window picker")
 }
 
 /// Single-stage picker form for `move-window-here`.
@@ -3754,108 +3739,21 @@ mod tests {
     }
 
     // ---- create_activity_via_ipc wire-error matrix -------------------------
+    //
+    // The wire-error matrix itself (DuplicateName / EmptyName / suffix-drift
+    // / capitalization-drift strict-equality) is pinned once, against the
+    // shared core, by `create.rs`'s own tests
+    // (`create_name_already_exists_maps_to_cant_create_73`,
+    // `create_name_must_not_be_empty_maps_to_usage_64`,
+    // `create_name_already_exists_with_suffix_routes_to_malformed`,
+    // `create_name_must_not_be_empty_capitalized_routes_to_malformed`).
+    // This wrapper's own contribution — the context label surviving the
+    // `.context()` wrap — is what the remaining test below pins.
 
     fn create_activity_req(name: &str) -> Request {
         Request::Action(Action::CreateActivity {
             name: name.to_owned(),
         })
-    }
-
-    #[test]
-    fn create_activity_via_ipc_name_already_exists_maps_to_cant_create() {
-        let mut client = MockClient::new();
-        client.expect(
-            create_activity_req("Work"),
-            Err("activity name already exists".to_owned()),
-        );
-        let err = create_activity_via_ipc(&mut client, "Work").expect_err("collision must fail");
-        let cli_err = err
-            .chain()
-            .find_map(|e| e.downcast_ref::<CliError>())
-            .expect("CliError must be in chain");
-        match cli_err {
-            CliError::CantCreate(msg) => {
-                assert!(
-                    msg.contains("already exists"),
-                    "message must mention cause; got: {msg}"
-                );
-            }
-            other => panic!("expected CantCreate, got {other:?}"),
-        }
-        assert_eq!(cli_err.exit_code(), 73);
-        client.assert_consumed_in_order();
-    }
-
-    #[test]
-    fn create_activity_via_ipc_name_must_not_be_empty_maps_to_usage() {
-        let mut client = MockClient::new();
-        client.expect(
-            create_activity_req("   "),
-            Err("activity name must not be empty".to_owned()),
-        );
-        let err = create_activity_via_ipc(&mut client, "   ").expect_err("empty-name must fail");
-        let cli_err = err
-            .chain()
-            .find_map(|e| e.downcast_ref::<CliError>())
-            .expect("CliError must be in chain");
-        match cli_err {
-            CliError::Usage(msg) => {
-                assert_eq!(msg, "activity name must not be empty");
-            }
-            other => panic!("expected Usage, got {other:?}"),
-        }
-        assert_eq!(cli_err.exit_code(), 64);
-        client.assert_consumed_in_order();
-    }
-
-    #[test]
-    fn create_activity_via_ipc_name_already_exists_suffixed_routes_to_malformed_response_server() {
-        // Pins strict-equality on the DuplicateName wire-string match.
-        // A suffixed variant ("activity name already exists: Work") — which
-        // the compositor could produce after a Display change — must NOT route
-        // to CantCreate; it must fall through to MalformedResponse(Server).
-        let mut client = MockClient::new();
-        client.expect(
-            create_activity_req("Work"),
-            Err("activity name already exists: Work".to_owned()),
-        );
-        let err = create_activity_via_ipc(&mut client, "Work")
-            .expect_err("suffixed string must not match CantCreate");
-        let cli_err = err
-            .chain()
-            .find_map(|e| e.downcast_ref::<CliError>())
-            .expect("CliError must be in chain");
-        match cli_err {
-            CliError::MalformedResponse(MalformedResponseSource::Server(_)) => {}
-            other => panic!("expected MalformedResponse(Server), not CantCreate; got {other:?}"),
-        }
-        assert_eq!(cli_err.exit_code(), 65);
-        client.assert_consumed_in_order();
-    }
-
-    #[test]
-    fn create_activity_via_ipc_name_must_not_be_empty_capitalized_routes_to_malformed_response_server()
-     {
-        // Pins strict-equality on the EmptyName wire-string match.
-        // A capitalized variant ("Activity name must not be empty") must NOT
-        // route to Usage — it must fall through to MalformedResponse(Server).
-        let mut client = MockClient::new();
-        client.expect(
-            create_activity_req("   "),
-            Err("Activity name must not be empty".to_owned()),
-        );
-        let err = create_activity_via_ipc(&mut client, "   ")
-            .expect_err("capitalized string must not match Usage");
-        let cli_err = err
-            .chain()
-            .find_map(|e| e.downcast_ref::<CliError>())
-            .expect("CliError must be in chain");
-        match cli_err {
-            CliError::MalformedResponse(MalformedResponseSource::Server(_)) => {}
-            other => panic!("expected MalformedResponse(Server), not Usage; got {other:?}"),
-        }
-        assert_eq!(cli_err.exit_code(), 65);
-        client.assert_consumed_in_order();
     }
 
     #[test]
